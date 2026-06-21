@@ -1,0 +1,7 @@
+# Build artifacts
+*.o
+kernel.elf
+kernel.bin
+
+# macOS
+.DS_Store
