@@ -1,45 +1,47 @@
 # talk-os
 
-A minimal x86_64 operating system that boots into 64-bit long mode and prints
-"Hello, World!" to the screen. Written in C and assembly, built and run on macOS.
+A from-scratch x86_64 operating system that boots straight into a **minimal AI
+terminal**: type a question on the keyboard, and the kernel sends it to the
+Anthropic Claude API **directly over HTTPS** and prints the reply. No graphics,
+no audio — just a keyboard, a text console, a network stack, and TLS. Built and
+run on macOS via QEMU.
+
+## Layout
+
+| Directory | What it is |
+|-----------|------------|
+| **`os/`** | The bare-metal OS. Boot + drivers (serial, PCI, PS/2 keyboard, e1000 NIC) + lwIP networking + mbedTLS + the AI terminal. **Build and run from here.** |
 
 ## How it works
 
-1. **`boot.asm`** contains a [Multiboot v1](https://www.gnu.org/software/grub/manual/multiboot/multiboot.html)
-   header. QEMU's built-in loader recognises it and starts the kernel in 32-bit
-   protected mode — no GRUB or disk image needed.
-2. The 32-bit entry code checks that the CPU supports long mode, identity-maps
-   the first 1 GiB of memory with 2 MiB pages, enables PAE + paging + long mode,
-   loads a 64-bit GDT, and far-jumps into 64-bit code.
-3. The 64-bit stub calls **`kernel_main`** in **`kernel.c`**, which writes
-   directly to the VGA text buffer at physical address `0xB8000`.
+The kernel does TLS itself — mbedTLS (vendored) wired through lwIP's `altcp_tls`
+layer — so it talks to `api.anthropic.com:443` with no host proxy:
 
-## Requirements (macOS)
-
-Install the toolchain with Homebrew:
-
-```sh
-make toolchain      # brew install nasm x86_64-elf-gcc qemu
+```
+keyboard ──▶ kernel terminal ──▶ DNS ──▶ TLS 1.2 (mbedTLS) ──▶ api.anthropic.com
+                    ▲                                                  │
+                    └──────────────── reply text ──────────────────────┘
 ```
 
-`x86_64-elf-gcc` is an ELF cross-compiler; the system clang/ld on macOS produce
-Mach-O binaries, which can't be used for a bare-metal ELF kernel.
-
-## Build & run
+## Quick start
 
 ```sh
-make            # produces kernel.bin
-make run        # boots kernel.bin in QEMU
+cd os
+make toolchain                       # once: nasm, x86_64-elf-gcc, qemu
+make KEY=sk-ant-... run              # build with your API key + boot in QEMU
 ```
 
-A QEMU window opens showing the greeting. Close the window (or `Ctrl-C` the
-terminal) to quit.
+Type a question at the `you>` prompt and press Enter. At boot it also runs one
+self-test request so you can see the HTTPS round-trip on the serial log.
 
-## Files
+Without a key (`make run`), the kernel still completes the TLS handshake and the
+API returns `401` — which proves HTTPS works, just without an answer.
 
-| File         | Purpose                                            |
-|--------------|----------------------------------------------------|
-| `boot.asm`   | Multiboot header, 32-bit setup, long-mode trampoline |
-| `kernel.c`   | 64-bit kernel entry; writes to VGA text buffer     |
-| `linker.ld`  | Places the kernel at 1 MiB, header first           |
-| `Makefile`   | Build, run, and toolchain targets                  |
+## ⚠️ Security caveat
+
+This is a hobby OS. TLS certificate verification is **disabled**
+(`MBEDTLS_SSL_VERIFY_NONE`): traffic is encrypted but **not authenticated**, so
+it is vulnerable to man-in-the-middle. Entropy comes from a simple hardware poll
+(RDRAND/TSC), not a vetted CSPRNG. Don't send anything sensitive.
+
+See `os/README.md` for the driver model, the TLS build, and details.

@@ -3,5 +3,15 @@
 kernel.elf
 kernel.bin
 
+# Packet capture from `make run-pcap`
+net.pcap
+
 # macOS
 .DS_Store
+
+# Appliance (Python)
+appliance/.venv/
+appliance/.env
+appliance/visual_check.png
+__pycache__/
+*.pyc
