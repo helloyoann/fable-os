@@ -8,6 +8,7 @@
 
 #include "kbd.h"
 #include "driver.h"
+#include "device.h"
 #include "kernel.h"
 #include "io.h"
 
@@ -79,16 +80,36 @@ int kbd_readline(char *buf, int cap) {
     return len;
 }
 
-static int kbd_init(void) {
-    /* Drain any stale byte left in the controller's output buffer. */
+static void kbd_drain(void) {
     while (inb(PS2_STATUS) & PS2_OBF) (void)inb(PS2_DATA);
+}
+
+static const driver_t kbd_driver;
+
+static int kbd_init(void) {
+    kbd_drain();                       /* clear any stale byte */
     kprintf("kbd: PS/2 keyboard ready\n");
+
+    device_t *d = device_create("kbd0", DEV_CLASS_INPUT);
+    device_add_resource(d, RES_IOPORT, PS2_DATA, 1);
+    device_add_resource(d, RES_IRQ, 1, 1);
+    device_register(d);
+    device_bind_driver(d, (driver_t *)&kbd_driver);
+    device_set_state(d, DEV_STATE_ACTIVE);
     return 0;
 }
+
+/* Power management: nothing to persist; on resume just clear stale input so a
+ * key held across the transition doesn't leak in. Demonstrates the lifecycle. */
+static int kbd_suspend(device_t *d) { (void)d; shift_down = 0; return 0; }
+static int kbd_resume(device_t *d)  { (void)d; kbd_drain(); return 0; }
 
 static const driver_t kbd_driver = {
     .name = "kbd",
     .level = DRV_LEVEL_DEVICE,
+    .cls = DEV_CLASS_INPUT,
     .init = kbd_init,
+    .suspend = kbd_suspend,
+    .resume = kbd_resume,
 };
 REGISTER_DRIVER(kbd_driver);

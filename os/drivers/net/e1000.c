@@ -11,6 +11,9 @@
 #include "io.h"
 #include "pci.h"
 #include "driver.h"
+#include "device.h"
+
+static const driver_t e1000_driver;
 
 /* ---- e1000 register offsets ---- */
 #define REG_CTRL   0x0000
@@ -153,6 +156,11 @@ int e1000_init(void) {
     reg_write(REG_TIPG, 0x0060200A);
     reg_write(REG_TCTL, TCTL_EN | TCTL_PSP | (0x0F << 4) | (0x40 << 12));
 
+    device_t *d = device_create("eth0", DEV_CLASS_NETWORK);
+    device_add_resource(d, RES_MMIO, bar0, 0x20000);
+    device_register(d);
+    device_bind_driver(d, (driver_t *)&e1000_driver);
+    device_set_state(d, DEV_STATE_ACTIVE);
     return 0;
 }
 
@@ -195,6 +203,7 @@ int e1000_receive(void *buf, uint16_t *len) {
 static const driver_t e1000_driver = {
     .name = "e1000",
     .level = DRV_LEVEL_DEVICE,
+    .cls = DEV_CLASS_NETWORK,
     .init = e1000_init,
 };
 REGISTER_DRIVER(e1000_driver);

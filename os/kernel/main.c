@@ -13,6 +13,15 @@ void kernel_main(void) {
     time_init();
     drivers_init();           /* serial, pci, nic, keyboard */
 
+    /* Device model self-test: list the discovered device tree, then exercise
+     * the driver power lifecycle (suspend everything capable, then resume). */
+    kputs("\n--- device tree ---\n");
+    driver_report();
+    kputs("--- power cycle: suspend all, then resume all ---\n");
+    drivers_suspend_all();
+    drivers_resume_all();
+    kputs("-------------------\n");
+
     if (net_init() != 0) {
         kputs("\n[net init failed — halting]\n");
         for (;;) __asm__ volatile("hlt");

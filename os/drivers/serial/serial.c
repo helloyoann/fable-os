@@ -7,9 +7,12 @@
 
 #include "serial.h"
 #include "driver.h"
+#include "device.h"
 #include "io.h"
 
 #define COM1 0x3F8
+
+static const driver_t serial_driver;   /* forward decl for device binding */
 
 void serial_putc(char c) {
     while (!(inb(COM1 + 5) & 0x20)) { }   /* wait for THR empty */
@@ -38,12 +41,20 @@ static int serial_init(void) {
     outb(COM1 + 2, 0xC7);   /* enable+clear FIFO, 14-byte threshold */
     outb(COM1 + 4, 0x0B);   /* DTR/RTS/OUT2 */
     serial_write("serial: COM1 up @ 115200\n");
+
+    device_t *d = device_create("serial0", DEV_CLASS_SERIAL);
+    device_add_resource(d, RES_IOPORT, COM1, 8);
+    device_add_resource(d, RES_IRQ, 4, 1);
+    device_register(d);
+    device_bind_driver(d, (driver_t *)&serial_driver);
+    device_set_state(d, DEV_STATE_ACTIVE);
     return 0;
 }
 
 static const driver_t serial_driver = {
     .name = "serial",
     .level = DRV_LEVEL_EARLY,
+    .cls = DEV_CLASS_SERIAL,
     .init = serial_init,
 };
 REGISTER_DRIVER(serial_driver);
