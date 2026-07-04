@@ -30,6 +30,7 @@ LIBGCC  := $(shell $(CC) -print-libgcc-file-name)
 # Kernel + drivers. Add a driver by dropping a .c here (or under drivers/).
 KERNEL_SRCS := kernel/main.c kernel/drivers.c \
                core/kobject.c mm/heap.c device/device.c \
+               fs/vfs/vfs.c fs/native/ramfs.c fs/fs.c \
                lib/base.c lib/libc_shim.c \
                drivers/serial/serial.c drivers/pci/pci.c \
                drivers/input/kbd.c drivers/net/e1000.c net/net.c

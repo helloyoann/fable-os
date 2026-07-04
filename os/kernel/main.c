@@ -7,6 +7,43 @@
 #include "driver.h"
 #include "kbd.h"
 #include "net.h"
+#include "fs.h"
+#include "vfs.h"
+
+/* Exercise the VFS end-to-end: mount, mkdir, create/write/seek/read a file,
+ * stat it, and list a directory. Proves the whole path without a disk. */
+static void vfs_selftest(void) {
+    if (fs_init() != 0) { kputs("[fs init failed]\n"); return; }
+    kputs("\n--- filesystem self-test (ramfs at /) ---\n");
+
+    vfs_mkdir("/etc");
+    vfs_mkdir("/tmp");
+
+    const char *msg = "talk-os native filesystem online\n";
+    file_t *f = vfs_open("/etc/motd", O_CREAT | O_RDWR);
+    if (!f) { kputs("open /etc/motd failed\n"); return; }
+    vfs_write(f, msg, strlen(msg));
+
+    /* Seek back and read it into a buffer to prove read/write/seek. */
+    char buf[64];
+    vfs_seek(f, 0, SEEK_SET);
+    int64_t n = vfs_read(f, buf, sizeof buf - 1);
+    if (n > 0) buf[n] = '\0';
+    kprintf("read /etc/motd (%d bytes): %s", (int)n, buf);
+    vfs_close(f);
+
+    vfs_stat_t st;
+    if (vfs_stat("/etc/motd", &st) == VFS_OK)
+        kprintf("stat /etc/motd: type=%s size=%u mode=0x%x\n",
+                st.type == VNODE_DIR ? "dir" : "file",
+                (unsigned)st.size, (unsigned)st.mode);
+
+    kputs("ls / :");
+    char name[64];
+    for (uint32_t i = 0; vfs_readdir("/", i, name, sizeof name) == VFS_OK; i++)
+        kprintf(" %s", name);
+    kputs("\n-----------------------------------------\n");
+}
 
 void kernel_main(void) {
     console_init();
@@ -21,6 +58,8 @@ void kernel_main(void) {
     drivers_suspend_all();
     drivers_resume_all();
     kputs("-------------------\n");
+
+    vfs_selftest();
 
     if (net_init() != 0) {
         kputs("\n[net init failed — halting]\n");
