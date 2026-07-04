@@ -10,14 +10,19 @@ out — no graphics, no audio.
 | Subsystem | State |
 |---|---|
 | Boot → 64-bit long mode, 4 GiB identity map | ✅ done |
-| Driver framework (self-registering, level-ordered) | ✅ done |
+| Kernel object base (identity + refcounted lifetime) | ✅ done |
+| Kernel heap (coalescing free-list: kmalloc/kfree/krealloc, stats) | ✅ done |
+| Device model (id/class/resources/state) + registry | ✅ done |
+| Driver framework (self-registering, lifecycle: init/probe/suspend/resume) | ✅ done |
+| VFS + native RAM filesystem (files/dirs/mount/handles/seek) | ✅ done |
 | Serial console (debug log) | ✅ done |
-| PCI bus | ✅ done |
+| PCI bus (enumerated into the device model) | ✅ done |
 | VGA text console (80x25, scrolling, cursor) | ✅ done |
 | PS/2 keyboard (polled) | ✅ done |
 | Networking (e1000 + lwIP, DNS) | ✅ done |
 | TLS (mbedTLS 2.28 via lwIP altcp_tls) | ✅ done |
 | AI terminal — ask over HTTPS, print the reply | ✅ done |
+| Disk-backed filesystem (FAT32/ext2), ATA/block layer | ⬜ future (VFS ready) |
 | Certificate verification / CSPRNG entropy | ⬜ future (see caveat) |
 
 ## ⚠️ Security caveat
@@ -52,9 +57,14 @@ reply to the console, so the TLS path is verifiable even headlessly.
 
 ```
 boot/        boot.asm — multiboot, long mode, .bss zero, paging
-kernel/      main.c (terminal REPL + boot self-test), drivers.c (driver runner)
-lib/         base.c (VGA console/printf/alloc/time), libc_shim.c (libc +
-             snprintf + mbedtls_hardware_poll entropy)
+kernel/      main.c (terminal REPL + boot self-tests), drivers.c (driver manager)
+core/        kobject.c — kernel object base (identity + refcounted lifetime)
+mm/          heap.c — coalescing kernel heap (kmalloc/kfree/krealloc + stats)
+device/      device.c — generic device model + registry
+fs/          vfs/vfs.c (fs-independent VFS core), native/ramfs.c (native FS),
+             fs.c (subsystem bring-up + root mount)
+lib/         base.c (VGA console/printf/time), libc_shim.c (libc + snprintf +
+             mbedtls_hardware_poll entropy)
 drivers/
   serial/    COM1 UART debug console
   pci/       PCI config space + enumeration
@@ -65,9 +75,17 @@ port/        freestanding shims for lwIP/mbedTLS (string/stdlib/stdio/time/
              assert/ctype) + lwipopts.h
 lwip/        vendored lwIP 2.2.0 (core + ipv4 + altcp_tls mbedTLS port)
 mbedtls/     vendored mbedTLS 2.28.9 (library + headers)
-include/     shared headers + mbedtls_config.h
+include/     shared headers (kobject/heap/device/driver/vfs/fs + mbedtls_config)
 linker.ld    1 MiB load, driver_table section
 ```
+
+The kernel is organised as isolated subsystems behind stable headers
+(`kobject.h`, `heap.h`, `device.h`, `driver.h`, `vfs.h`): each has an
+architecture comment at the top of its header explaining purpose,
+responsibilities, public API, dependencies, and future extension points.
+Subsystems talk through those interfaces, not each other's internals — e.g.
+an on-disk filesystem later implements `vnode_ops_t` without touching the
+kernel API, and another allocator can replace `mm/heap.c` behind `heap.h`.
 
 ## The driver model
 
