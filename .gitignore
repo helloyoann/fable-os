@@ -6,6 +6,9 @@ kernel.bin
 # Packet capture from `make run-pcap`
 net.pcap
 
+# Scratch idea notes
+ideas/
+
 # macOS
 .DS_Store
 
