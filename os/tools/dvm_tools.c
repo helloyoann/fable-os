@@ -1,0 +1,1612 @@
+/* dvm_tools.c — the model writes a device driver, and this file runs it.
+ *
+ * PURPOSE
+ *   Everything before this file built the pieces: pci_list finds hardware
+ *   nobody drives (tools/dev_tools.c), the driver VM executes a bring-up
+ *   sequence that cannot crash the kernel (include/dvm.h), and a hand-written
+ *   AC'97 program proved the VM really does drive silicon (vm/programs/).
+ *   This file is the loop that joins them:
+ *
+ *       pci_list unclaimed_only=true   "nobody drives 00:05.0"
+ *       driver_targets                 "here is the exact sandbox 00:05.0 gets"
+ *       driver_assemble                "does my program even parse?"      (free)
+ *       driver_run                     "run it"        -> it failed, here is why
+ *       driver_run                     "run the fixed one"  -> the device is up
+ *
+ *   The model writes the driver. The kernel decides what the driver may touch,
+ *   runs it, and reports what actually happened — every value in that report
+ *   was read back out of the device microseconds earlier.
+ *
+ * THE TOOLS
+ *   driver_targets   which devices a program may be pointed at, and for each
+ *                    one the port/MMIO/PCI windows it would be granted, or the
+ *                    reason it is not targetable at all.
+ *   driver_assemble  syntax-check a program and get a numbered listing back.
+ *                    Touches no hardware, costs no attempt: this is where a
+ *                    model should burn its typos.
+ *   driver_run       assemble + execute against ONE NAMED DEVICE. TOOL_MUTATES:
+ *                    it writes to real device registers.
+ *   driver_trace     page through the access log of the last run, for when the
+ *                    tail that fitted in driver_run's answer was not enough.
+ *
+ * THE SANDBOX IS DERIVED, NEVER SUPPLIED
+ *   The model names a DEVICE ("pci00:05.0"), never an address. Everything the
+ *   program is allowed to touch is computed here, from that function's own
+ *   configuration space:
+ *
+ *     - each programmed BAR becomes one window: ports get [base, base+size),
+ *       memory BARs get the same as an MMIO window with read+write;
+ *     - `size` is not readable from a BAR (sizing needs config-space writes,
+ *       which this kernel refuses), so it is bounded three ways and the
+ *       smallest wins: the BAR's own natural alignment, a hard cap
+ *       (256 bytes of I/O, which is the PCI maximum, or 1 MiB of MMIO), and
+ *       the distance to the next BAR base found anywhere on the bus, so a
+ *       window can never swallow a neighbouring device's registers;
+ *     - the local APIC / IOAPIC / HPET block at 0xFEC00000-0xFEEFFFFF is
+ *       seeded into that neighbour list as a barrier, and a BAR that lands
+ *       inside it is refused outright;
+ *     - exactly one PCI function is opened for `pcicfg`, and config-space
+ *       WRITES do not exist in the ISA at all;
+ *     - the whole thing is then handed to dvm_policy_check(), so the VM's own
+ *       compiled-in deny list (PICs, PIT, PS/2, CMOS, COM1, 0xCF8, all memory
+ *       below the end of the kernel image) gets the last word. A device whose
+ *       BAR overlaps any of it is reported as untargetable rather than
+ *       silently trimmed.
+ *
+ * WHAT IS REFUSED BEFORE A SINGLE INSTRUCTION RUNS
+ *   - a device that is not PCI-backed: there is no BAR to derive a window from,
+ *     and the legacy ports those devices use are on the VM's deny list anyway;
+ *   - a device with a driver bound: two drivers on one device is a race, and
+ *     the resident driver would be the one to fall over;
+ *   - a device with PCI bus mastering already enabled. This one matters. The VM
+ *     polices every access the PROGRAM makes, but a bus-mastering device does
+ *     DMA on its own, and there is no IOMMU on this machine: a descriptor
+ *     address written into the wrong register would let the device scribble
+ *     over the kernel, and no amount of instruction checking would see it. So
+ *     bus mastering is neither enabled here nor tolerated, and DMA-capable
+ *     bring-up stays with a C caller that owns the buffers (see
+ *     vm/programs/ac97_boot.c, which is exactly that).
+ *
+ * THE RETRY LOOP
+ *   A first attempt is usually wrong, and the interesting question is what the
+ *   model gets to see afterwards. It gets: the trap name, the message the VM
+ *   wrote, the source LINE and its own text back, that instruction
+ *   disassembled, the final register file, and the tail of an access log this
+ *   file recorded by wrapping the I/O backend — every port, address, width and
+ *   value, in order, as they really happened. That is enough to revise a
+ *   program without guessing, and it is why the loop converges instead of
+ *   flailing.
+ *
+ *   It is bounded. DRV_ATTEMPT_BUDGET consecutive failed runs against one
+ *   target and the tool stops running programs there and says so; a run that
+ *   reaches `halt` clears the count. Without that a confused model owns the
+ *   machine for as many rounds as chat.c will give it, poking a device it does
+ *   not understand. dvm_tools_reset_attempts() clears the table, and nothing in
+ *   the kernel calls it yet — see FUTURE EXTENSION POINTS.
+ *
+ * UNTRUSTED INPUT
+ *   `source` is a program written by a language model and arrives as a raw,
+ *   non-NUL-terminated JSON span that may contain embedded NULs, 16 KB of
+ *   nothing, or no newlines at all. It is decoded with json.h into a fixed
+ *   buffer, passed to dvm_assemble() with an explicit length, and every
+ *   structural bound belongs to the assembler. Numeric arguments are range
+ *   checked here before they can become a budget. Nothing in this file
+ *   allocates except the 12 KB program image, which is kmalloc'd and freed on
+ *   every path.
+ *
+ * DEPENDENCIES
+ *   dvm.h (assemble/policy/run), pci.h (config space — reads only), device.h
+ *   (the registry that gives a device its NAME), json.h, trace.h, tool.h,
+ *   kernel.h for kmalloc and the console.
+ *
+ * FUTURE EXTENSION POINTS
+ *   - chat.c should call dvm_tools_reset_attempts() at the start of each
+ *     operator turn, so a new sentence gets a fresh budget while a runaway
+ *     model inside one turn still hits the wall. That is a one-line change in a
+ *     file this one does not own.
+ *   - A program that halts cleanly is a driver. Keeping the assembled image and
+ *     re-entering it on demand (dvm.h's entry-point hook, which does not exist
+ *     yet) is how a model-authored driver becomes resident rather than one-shot.
+ *   - DMA needs three things the ISA deliberately lacks: caller-owned buffers,
+ *     the bus-master bit, and a way to bound where a device may write. An IOMMU
+ *     would make the third possible; until then ac97_boot.c's shape (C owns the
+ *     memory, the VM owns the registers) is the honest answer.
+ *   - BAR sizes are inferred. A `pci_size_bar` operation that writes all-ones
+ *     and restores, under an explicit lock, would make the windows exact.
+ */
+
+#include "tool.h"
+#include "dvm.h"
+#include "device.h"
+#include "driver.h"
+#include "pci.h"
+#include "json.h"
+#include "trace.h"
+#include "kernel.h"
+
+#include <stdarg.h>
+#include <stdio.h>       /* vsnprintf, via port/stdio.h when freestanding */
+
+/* ---- bounds, all of them enforced ---- */
+#define DRV_NAME_MAX        40      /* longest device name we will look up   */
+#define DRV_SRC_MAX         DVM_SRC_MAX      /* the assembler's own ceiling  */
+#define DRV_ATTEMPT_BUDGET  5       /* consecutive failed runs per target    */
+#define DRV_TARGETS_TRACKED 8       /* targets whose attempts we remember    */
+#define DRV_LOG_MAX         256     /* device events kept from the last run  */
+#define DRV_BASES_MAX       128     /* BAR bases collected from the whole bus */
+#define DRV_ROW_MARGIN      200     /* result bytes held back for the footer */
+
+/* Window sizing. An I/O BAR is at most 256 bytes by the PCI spec; 1 MiB is a
+ * generous ceiling for a memory BAR that the neighbour clamp normally beats. */
+#define DRV_IO_CAP          0x100ull
+#define DRV_MMIO_CAP        0x100000ull
+#define DRV_MMIO_CAP_TIGHT  0x1000ull        /* used if the bus scan overflowed */
+
+/* Budgets handed to the VM. The model may raise the delay budget (a real
+ * bring-up waits) and the step budget (a poll loop counts), each up to a
+ * ceiling; nothing else is negotiable. */
+#define DRV_MAX_IO          1024u
+#define DRV_DELAY_DEF_US    250000u
+#define DRV_DELAY_MAX_MS    2000     /* == dvm.c's CEIL_DELAY_US             */
+#define DRV_STEPS_DEF       100000u
+#define DRV_STEPS_MAX       1000000u
+#define DRV_PRINTS          32u
+#define DRV_TRACE_IO_LINES  128u     /* console lines at trace=io            */
+#define DRV_TRACE_ALL_LINES 256u     /* ...and at trace=all                  */
+
+/* The platform block: IOAPIC, HPET, local APIC. No BAR belongs here, and a
+ * program that reached it would be reprogramming interrupt routing. */
+#define DRV_PLATFORM_LO     0xFEC00000ull
+#define DRV_PLATFORM_HI     0xFEF00000ull
+
+/* PCI base class 0x03 = display controller. On a machine whose only human
+ * interface is a console painted into video memory, this is not "a device" -
+ * it is the operator's eyes. See target_blocked(). */
+#define PCI_CLASS_DISPLAY   0x03u
+
+/* ====================================================================== */
+/* small helpers                                                          */
+/* ====================================================================== */
+
+/* These mirror tools/dev_tools.c. They are duplicated rather than shared
+ * because that file's copies are static to it, and a tool family is meant to
+ * be a self-contained .c that needs no edit anywhere else (see tool.h). */
+
+static int name_eq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    for (size_t i = 0; i <= DRV_NAME_MAX; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == '\0') return 1;
+    }
+    return 0;                       /* longer than any legal device name */
+}
+
+/* Emit the failure result *and* its trace line, discarding partial output so
+ * the model never reads half an answer followed by an error. */
+static int fail(tool_result_t *r, int err, const char *op, const char *args,
+                const char *fmt, ...) {
+    char msg[320];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+
+    r->is_error = 1;
+    r->len = 0;
+    if (r->buf && r->cap) r->buf[0] = '\0';
+    tool_result_printf(r, "error: %s", msg);
+    trace_err(err, op, "%s", args ? args : "");
+    return err;
+}
+
+static int parse_obj(const tool_call_t *c, json_value_t *obj) {
+    const char *p = "{}";
+    size_t      n = 2;
+    if (c && c->input && c->input_len) { p = c->input; n = c->input_len; }
+    if (json_parse(p, n, obj) != JSON_OK) return TOOL_EINVAL;
+    if (obj->type != JSON_OBJECT) return TOOL_EINVAL;
+    return TOOL_OK;
+}
+
+/* 1 = present and valid, 0 = absent, -1 = wrong type, -2 = out of range. */
+static int f_int(const json_value_t *o, const char *key,
+                 int64_t lo, int64_t hi, int64_t *out) {
+    json_value_t v;
+    int rc = json_get(o, key, &v);
+    if (rc == JSON_ENOENT) return 0;
+    if (rc != JSON_OK) return -1;
+    if (v.type == JSON_NULL) return 0;
+    if (v.type != JSON_NUMBER) return -1;
+    int64_t x;
+    if (json_int(&v, &x) != JSON_OK) return -2;
+    if (x < lo || x > hi) return -2;
+    *out = x;
+    return 1;
+}
+
+static int f_bool(const json_value_t *o, const char *key, int *out) {
+    json_value_t v;
+    int rc = json_get(o, key, &v);
+    if (rc == JSON_ENOENT) return 0;
+    if (rc != JSON_OK) return -1;
+    if (v.type == JSON_NULL) return 0;
+    if (v.type != JSON_BOOL) return -1;
+    if (json_bool(&v, out) != JSON_OK) return -1;
+    return 1;
+}
+
+static int f_str(const json_value_t *o, const char *key, char *dst, size_t cap,
+                 size_t *out_len) {
+    json_value_t v;
+    int rc = json_get(o, key, &v);
+    if (rc == JSON_ENOENT) return 0;
+    if (rc != JSON_OK) return -1;
+    if (v.type == JSON_NULL) return 0;
+    if (v.type != JSON_STRING) return -1;
+    rc = json_str(&v, dst, cap, out_len);
+    if (rc == JSON_ENOSPC) return -2;
+    if (rc != JSON_OK) return -1;
+    return 1;
+}
+
+static int room_low(const tool_result_t *r) {
+    return r->truncated || r->len + DRV_ROW_MARGIN >= r->cap;
+}
+
+/* Append to a fixed buffer, returning the new length and never running past
+ * cap. snprintf's "length it would have written" return is a trap when it is
+ * used as an offset, so it is clamped here once instead of at every call. */
+static int catf(char *buf, size_t cap, int used, const char *fmt, ...) {
+    if (!cap || used < 0 || (size_t)used + 1 >= cap) return used;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + used, cap - (size_t)used, fmt, ap);
+    va_end(ap);
+    if (n < 0) return used;
+    used += n;
+    if ((size_t)used >= cap) used = (int)cap - 1;
+    return used;
+}
+
+static int hexdig(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* ====================================================================== */
+/* the target: a NAME, resolved to one PCI function                       */
+/* ====================================================================== */
+
+typedef struct {
+    char      name[DRV_NAME_MAX + 1];   /* the registry name, e.g. pci00:05.0 */
+    uint8_t   bus, dev, fn;
+    device_t *node;
+    uint16_t  vendor, device;
+    uint8_t   cls, sub;
+    uint16_t  command;
+} target_t;
+
+typedef struct {
+    const char        *want;        /* by name...                            */
+    device_res_type_t  want_res;    /* ...or by the resource it owns         */
+    uint64_t           want_base;
+    device_t          *found;
+} devq_t;
+
+static void devq_cb(device_t *d, void *ctx) {
+    devq_t *q = (devq_t *)ctx;
+    if (q->found || !d) return;
+    if (q->want) {
+        if (name_eq(d->obj.name, q->want)) q->found = d;
+        return;
+    }
+    if (!d->driver) return;                 /* only a DRIVEN owner counts */
+    int n = d->nres;
+    if (n > DEV_MAX_RESOURCES) n = DEV_MAX_RESOURCES;
+    for (int i = 0; i < n; i++)
+        if (d->res[i].type == q->want_res && d->res[i].base == q->want_base) {
+            q->found = d;
+            return;
+        }
+}
+
+static device_t *dev_by_name(const char *name) {
+    devq_t q;
+    memset(&q, 0, sizeof q);
+    q.want = name;
+    device_foreach(devq_cb, &q);
+    return q.found;
+}
+
+/* The device with a bound driver that owns a resource at `base`, if any. This
+ * is how a PCI function is recognised as driven when the driver bound itself to
+ * a different node: pci.c publishes "pci00:03.0" driverless while the e1000
+ * driver owns "eth0" at the same MMIO address. Targeting that function would
+ * poke a live NIC's registers out from under the driver mid-conversation. */
+static device_t *dev_by_resource(device_res_type_t t, uint64_t base) {
+    if (!base) return NULL;
+    devq_t q;
+    memset(&q, 0, sizeof q);
+    q.want_res  = t;
+    q.want_base = base;
+    device_foreach(devq_cb, &q);
+    return q.found;
+}
+
+/* Parse "bb:dd.f" exactly as pci_list prints it. Consumes the whole string. */
+static int parse_addr(const char *s, uint8_t *bus, uint8_t *dev, uint8_t *fn) {
+    if (!s) return -1;
+    int i = 0, v, n;
+
+    for (n = 0, v = 0; n < 2 && hexdig(s[i]) >= 0; n++) v = v * 16 + hexdig(s[i++]);
+    if (n == 0 || s[i] != ':' || v > 255) return -1;
+    *bus = (uint8_t)v;
+    i++;
+
+    for (n = 0, v = 0; n < 2 && hexdig(s[i]) >= 0; n++) v = v * 16 + hexdig(s[i++]);
+    if (n == 0 || s[i] != '.' || v > 31) return -1;
+    *dev = (uint8_t)v;
+    i++;
+
+    v = hexdig(s[i]);
+    if (v < 0 || v > 7) return -1;
+    *fn = (uint8_t)v;
+    i++;
+    return s[i] == '\0' ? 0 : -1;
+}
+
+/* A device node published by pci.c is named "pci<bb>:<dd>.<f>". */
+static int node_pci_addr(const device_t *d, uint8_t *bus, uint8_t *dev, uint8_t *fn) {
+    const char *n = d ? d->obj.name : NULL;
+    if (!n || n[0] != 'p' || n[1] != 'c' || n[2] != 'i') return 0;
+    return parse_addr(n + 3, bus, dev, fn) == 0;
+}
+
+static void target_read_ids(target_t *t) {
+    uint32_t id  = pci_cfg_read32(t->bus, t->dev, t->fn, 0x00);
+    uint32_t cs  = pci_cfg_read32(t->bus, t->dev, t->fn, 0x08);
+    uint32_t cmd = pci_cfg_read32(t->bus, t->dev, t->fn, 0x04);
+    t->vendor  = (uint16_t)(id & 0xFFFF);
+    t->device  = (uint16_t)(id >> 16);
+    t->cls     = (uint8_t)(cs >> 24);
+    t->sub     = (uint8_t)(cs >> 16);
+    t->command = (uint16_t)(cmd & 0xFFFF);
+}
+
+/* Resolve a model-supplied name. Accepts the registry name ("pci00:05.0") or
+ * the bare address pci_list prints ("00:05.0"), but BOTH must resolve to a
+ * device the kernel has actually registered — the model cannot invent one.
+ * Returns 0, or -1 with `why` filled in. */
+static int resolve_target(const char *name, target_t *t, char *why, size_t cap) {
+    device_t *d = dev_by_name(name);
+
+    if (!d) {
+        uint8_t bus, dev, fn;
+        char    alt[16];
+        if (parse_addr(name, &bus, &dev, &fn) == 0) {
+            snprintf(alt, sizeof alt, "pci%02x:%02x.%x", bus, dev, fn);
+            d = dev_by_name(alt);
+        }
+    }
+    if (!d) {
+        snprintf(why, cap,
+                 "no device named \"%s\"; driver_targets lists the ones a program "
+                 "can be run against", name);
+        return -1;
+    }
+
+    memset(t, 0, sizeof *t);
+    snprintf(t->name, sizeof t->name, "%s", d->obj.name ? d->obj.name : "?");
+    t->node = d;
+
+    if (!node_pci_addr(d, &t->bus, &t->dev, &t->fn)) {
+        snprintf(why, cap,
+                 "\"%s\" is not a PCI device, so it has no BARs to derive a sandbox "
+                 "from; only PCI functions can be driven by a program", t->name);
+        return -1;
+    }
+    target_read_ids(t);
+    if (t->vendor == 0xFFFF || t->vendor == 0x0000) {
+        snprintf(why, cap,
+                 "%s reads back vendor 0x%04x - nothing is answering at that address",
+                 t->name, (unsigned)t->vendor);
+        return -1;
+    }
+    return 0;
+}
+
+/* ====================================================================== */
+/* BAR decoding and window derivation                                     */
+/* ====================================================================== */
+
+typedef struct {
+    uint32_t raw;
+    int      present;
+    int      is_io;
+    int      is64;
+    uint64_t base;
+} bar_t;
+
+static void decode_bar(uint8_t bus, uint8_t dev, uint8_t fn, int idx, bar_t *b) {
+    memset(b, 0, sizeof *b);
+    b->raw = pci_cfg_read32(bus, dev, fn, (uint8_t)(0x10 + idx * 4));
+    if (b->raw == 0 || b->raw == 0xFFFFFFFFu) return;
+    if (b->raw & 1) {
+        b->is_io   = 1;
+        b->base    = b->raw & ~0x3u;
+        b->present = b->base != 0;
+    } else {
+        b->is64 = ((b->raw >> 1) & 3) == 2;
+        b->base = b->raw & ~0xFu;
+        if (b->is64 && idx < 5) {
+            uint32_t hi = pci_cfg_read32(bus, dev, fn, (uint8_t)(0x10 + (idx + 1) * 4));
+            b->base |= ((uint64_t)hi) << 32;
+        }
+        b->present = b->base != 0;
+    }
+}
+
+/* Every BAR base on the machine, so one device's derived window can be stopped
+ * at the next device's registers. Rebuilt per tool call: nothing here writes
+ * config space, so this is a read-only photograph of the bus. */
+static uint64_t g_io_base[DRV_BASES_MAX];
+static int      g_n_io;
+static uint64_t g_mem_base[DRV_BASES_MAX];
+static int      g_n_mem;
+static int      g_bases_overflow;
+static int      g_bases_valid;
+
+static void push_base(uint64_t *tab, int *n, uint64_t v) {
+    for (int i = 0; i < *n; i++) if (tab[i] == v) return;
+    if (*n >= DRV_BASES_MAX) { g_bases_overflow = 1; return; }
+    tab[(*n)++] = v;
+}
+
+/* One scan per tool call: it is thousands of config reads, and a tool call is
+ * the only thing that can change what is on the bus (nothing here writes config
+ * space, and there is no hot-plug). */
+static void bases_invalidate(void) { g_bases_valid = 0; }
+
+static void scan_bar_bases(void) {
+    if (g_bases_valid) return;
+    g_bases_valid = 1;
+    g_n_io = g_n_mem = 0;
+    g_bases_overflow = 0;
+
+    for (int bus = 0; bus < 256; bus++)
+        for (int dev = 0; dev < 32; dev++)
+            for (int fn = 0; fn < 8; fn++) {
+                uint16_t vendor =
+                    (uint16_t)(pci_cfg_read32((uint8_t)bus, (uint8_t)dev,
+                                              (uint8_t)fn, 0x00) & 0xFFFF);
+                if (vendor == 0xFFFF || vendor == 0x0000) {
+                    if (fn == 0) break;          /* function 0 absent => no device */
+                    continue;
+                }
+                for (int i = 0; i < 6; i++) {
+                    bar_t b;
+                    decode_bar((uint8_t)bus, (uint8_t)dev, (uint8_t)fn, i, &b);
+                    if (b.present)
+                        push_base(b.is_io ? g_io_base : g_mem_base,
+                                  b.is_io ? &g_n_io   : &g_n_mem, b.base);
+                    if (b.is64) i++;
+                }
+            }
+}
+
+static uint64_t next_base_above(uint64_t base, int is_io) {
+    const uint64_t *tab = is_io ? g_io_base : g_mem_base;
+    int             n   = is_io ? g_n_io    : g_n_mem;
+    uint64_t        best = 0;
+
+    for (int i = 0; i < n; i++)
+        if (tab[i] > base && (!best || tab[i] < best)) best = tab[i];
+
+    /* The platform block behaves like the next device along. With windows
+     * bounded by their own natural alignment this clamp can never actually
+     * bind (an aligned block cannot cross a boundary aligned more coarsely
+     * than itself), and a BAR *inside* the block is refused outright in
+     * build_sandbox. It is here so that raising the cap, or ever sizing a
+     * window some other way, cannot quietly hand out the IOAPIC. */
+    if (!is_io && DRV_PLATFORM_LO > base && (!best || DRV_PLATFORM_LO < best))
+        best = DRV_PLATFORM_LO;
+    return best;
+}
+
+/* How much of a BAR to open. Smallest of: its natural alignment (a BAR is
+ * always aligned to its own size, so this is an upper bound on that size), the
+ * hard cap for its space, and the distance to the next base on the bus. */
+static uint64_t window_size(uint64_t base, int is_io) {
+    if (!base) return 0;
+    uint64_t size = base & (~base + 1);              /* lowest set bit */
+    uint64_t cap  = is_io ? DRV_IO_CAP
+                          : (g_bases_overflow ? DRV_MMIO_CAP_TIGHT : DRV_MMIO_CAP);
+    if (size > cap) size = cap;
+    uint64_t next = next_base_above(base, is_io);
+    if (next && next - base < size) size = next - base;
+    return size;
+}
+
+/* ====================================================================== */
+/* the sandbox                                                            */
+/* ====================================================================== */
+
+typedef struct {
+    dvm_policy_t pol;
+    uint64_t     args[7];        /* r0..r5 = BAR bases, r6 = bdf           */
+    int          nargs;
+    char         text[192];      /* "ports 0xd000-0xd0ff; mmio none; ..."  */
+    int          nwin;
+} sandbox_t;
+
+/* Why a target cannot be driven, or 0 if it can. `why` is written either way:
+ * on success it holds nothing, on failure a sentence for the model. */
+static int target_blocked(const target_t *t, char *why, size_t cap) {
+    /* The display adapter is the operator's console, and it is the ONE device
+     * on this machine that no address-based rule can protect.
+     *
+     * vm/dvm.c's compiled-in deny list keeps a program off the VGA text buffer
+     * at 0xB8000. But a display adapter's BARs are a SECOND decode path to the
+     * same character/attribute memory (on the QEMU stdvga this kernel boots,
+     * BAR0 is the VRAM linear aperture at 0xfd000000 and BAR2 offset 0x400 is
+     * the legacy CRTC/sequencer register block). Deriving a window from those
+     * BARs would hand out read-write access to the console at an address the
+     * deny list cannot recognise as the console, and no owner check catches it
+     * either: the kernel writes 0xB8000 directly, so the framebuffer has no
+     * device_t and dev_by_resource() finds nothing to object to.
+     *
+     * A program with that window can repaint the transcript - including
+     * painting a '[' in column zero and forging a line of kernel ground truth,
+     * which is the one property lib/trace.c exists to guarantee. Refusing the
+     * whole device class is the only rule that is true at every address it
+     * might appear at, and it is what makes this tool's promise ("a program can
+     * only reach the device you named - not ... the console") honest.
+     *
+     * Cost, stated plainly: an unclaimed GPU cannot be driven from here. That
+     * is the right trade while the console is the only human interface. A
+     * kernel that owns its framebuffer through a real driver, and can redraw
+     * the transcript after a program has scribbled on it, could revisit this. */
+    if (t->cls == PCI_CLASS_DISPLAY) {
+        snprintf(why, cap,
+                 "%s is a display controller (class %02x) and no display device is "
+                 "targetable: the display is the operator's console, and its BARs "
+                 "reach the same character memory the deny list protects at 0xb8000, "
+                 "so a program there could erase the record of what it did",
+                 t->name, (unsigned)t->cls);
+        return 1;
+    }
+
+    if (t->node && t->node->driver) {
+        snprintf(why, cap,
+                 "driver \"%s\" is already bound to %s; running a program against a "
+                 "claimed device would race the driver that owns it",
+                 t->node->driver->name ? t->node->driver->name : "?", t->name);
+        return 1;
+    }
+
+    /* ...and the same question asked of the hardware rather than the node. */
+    for (int i = 0; i < 6; i++) {
+        bar_t b;
+        decode_bar(t->bus, t->dev, t->fn, i, &b);
+        if (!b.present) { if (b.is64) i++; continue; }
+        device_t *owner = dev_by_resource(b.is_io ? RES_IOPORT : RES_MMIO, b.base);
+        if (owner) {
+            snprintf(why, cap,
+                     "%s BAR%d (0x%lx) is already driven by \"%s\" as device \"%s\"; "
+                     "a program there would race a live driver",
+                     t->name, i, (unsigned long)b.base,
+                     owner->driver && owner->driver->name ? owner->driver->name : "?",
+                     owner->obj.name ? owner->obj.name : "?");
+            return 1;
+        }
+        if (b.is64) i++;
+    }
+
+    if (t->command & 0x4) {
+        snprintf(why, cap,
+                 "%s has PCI bus mastering enabled: it can DMA into memory on its "
+                 "own, and the VM can only police what a program does through the "
+                 "CPU. There is no IOMMU here, so this device is not targetable",
+                 t->name);
+        return 1;
+    }
+    return 0;
+}
+
+/* Build the policy from the target's BARs. Returns 0, or -1 with `why` set. */
+static int build_sandbox(const target_t *t, sandbox_t *sb,
+                         uint64_t max_steps, uint64_t delay_us, dvm_trace_t trace,
+                         char *why, size_t cap) {
+    memset(sb, 0, sizeof *sb);
+    dvm_policy_init(&sb->pol);
+    sb->pol.max_steps           = max_steps;
+    sb->pol.max_io              = DRV_MAX_IO;
+    sb->pol.max_delay_us        = delay_us;
+    sb->pol.max_prints          = DRV_PRINTS;
+    sb->pol.trace               = trace;
+    sb->pol.max_trace           = (trace == DVM_TRACE_ALL) ? DRV_TRACE_ALL_LINES
+                                                           : DRV_TRACE_IO_LINES;
+
+    scan_bar_bases();
+
+    char ports[96], mmio[96];
+    int  np = 0, nm = 0;
+    ports[0] = mmio[0] = '\0';
+
+    for (int i = 0; i < 6; i++) {
+        bar_t b;
+        decode_bar(t->bus, t->dev, t->fn, i, &b);
+        if (!b.present) { if (b.is64) i++; continue; }
+
+        if (!b.is_io && b.base >= DRV_PLATFORM_LO && b.base < DRV_PLATFORM_HI) {
+            snprintf(why, cap,
+                     "%s BAR%d sits at 0x%lx, inside the interrupt-controller block "
+                     "(0x%lx-0x%lx). Nothing may be granted there",
+                     t->name, i, (unsigned long)b.base,
+                     (unsigned long)DRV_PLATFORM_LO, (unsigned long)DRV_PLATFORM_HI - 1);
+            return -1;
+        }
+
+        /* x86 I/O space is 16 bits wide however many bits the BAR register
+         * holds. A base above that decodes nowhere, and truncating it to fit
+         * would open a window somewhere else entirely. */
+        if (b.is_io && b.base > 0xFFFFull) {
+            snprintf(why, cap,
+                     "%s BAR%d claims I/O at 0x%lx, which is outside the 64 KiB "
+                     "x86 I/O space; this device is not addressable",
+                     t->name, i, (unsigned long)b.base);
+            return -1;
+        }
+
+        uint64_t size = window_size(b.base, b.is_io);
+        if (!size) { if (b.is64) i++; continue; }
+
+        if (b.is_io) {
+            if (b.base + size - 1 > 0xFFFFull) size = 0x10000ull - b.base;
+            if (dvm_policy_allow_ports(&sb->pol, (uint16_t)b.base,
+                                       (uint16_t)(b.base + size - 1)) != 0) {
+                snprintf(why, cap, "%s has more I/O windows than the sandbox can hold",
+                         t->name);
+                return -1;
+            }
+            np = catf(ports, sizeof ports, np, "%s0x%lx-0x%lx",
+                      np ? "," : "", (unsigned long)b.base,
+                      (unsigned long)(b.base + size - 1));
+        } else {
+            if (dvm_policy_allow_mmio(&sb->pol, b.base, size, DVM_MMIO_RW) != 0) {
+                snprintf(why, cap, "%s has more memory windows than the sandbox can hold",
+                         t->name);
+                return -1;
+            }
+            nm = catf(mmio, sizeof mmio, nm, "%s0x%lx+0x%lx",
+                      nm ? "," : "", (unsigned long)b.base, (unsigned long)size);
+        }
+        if (i < 6) sb->args[i] = b.base;
+        sb->nwin++;
+        if (b.is64) i++;
+    }
+
+    if (!sb->nwin) {
+        snprintf(why, cap,
+                 "%s has no programmed BAR: there are no registers to reach, so "
+                 "there is nothing a driver program could do with it", t->name);
+        return -1;
+    }
+
+    dvm_policy_allow_pci(&sb->pol, t->bus, t->dev, t->fn);
+    sb->args[6] = (uint64_t)(((uint32_t)t->bus << 8) | ((uint32_t)t->dev << 3) | t->fn);
+    sb->nargs   = 7;
+
+    snprintf(sb->text, sizeof sb->text, "ports %s; mmio %s; pci %02x:%02x.%x",
+             np ? ports : "none", nm ? mmio : "none", t->bus, t->dev, t->fn);
+
+    /* The VM's deny list gets the last word: a BAR overlapping COM1 or the PIT
+     * makes the whole device untargetable, and it says so in its own words. */
+    char pmsg[DVM_MSG_MAX];
+    if (dvm_policy_check(&sb->pol, pmsg, sizeof pmsg) != DVM_OK) {
+        snprintf(why, cap, "the sandbox %s would need is not permitted: %s",
+                 t->name, pmsg);
+        return -1;
+    }
+    return 0;
+}
+
+/* ====================================================================== */
+/* the recording I/O backend                                              */
+/* ====================================================================== */
+
+/* Everything the program did to the device, in order, as it happened. dvm.c
+ * prints its own trace to the console for the operator; this log exists so the
+ * MODEL can read back what its program actually caused, which is the input to
+ * the next attempt. */
+
+typedef enum { A_PW, A_PR, A_MW, A_MR, A_PCI, A_DLY } akind_t;
+
+typedef struct {
+    uint8_t  kind;
+    uint8_t  width;
+    uint64_t addr;      /* port, MMIO address, or (bdf << 8) | offset */
+    uint32_t val;
+} acc_t;
+
+static acc_t    g_log[DRV_LOG_MAX];      /* ring: the LAST DRV_LOG_MAX events */
+static uint32_t g_log_n;                 /* entries held (<= DRV_LOG_MAX)     */
+static uint64_t g_log_total;             /* events that happened              */
+
+static const dvm_io_t *g_inner;
+static dvm_io_t        g_recorder;
+
+static void log_acc(akind_t k, uint64_t addr, uint8_t width, uint32_t val) {
+    uint32_t slot = (uint32_t)(g_log_total % DRV_LOG_MAX);
+    g_log[slot].kind  = (uint8_t)k;
+    g_log[slot].width = width;
+    g_log[slot].addr  = addr;
+    g_log[slot].val   = val;
+    g_log_total++;
+    if (g_log_n < DRV_LOG_MAX) g_log_n++;
+}
+
+/* Global index (1-based, as the model sees it) of held entry `i`. */
+static uint64_t log_index(uint32_t i) { return g_log_total - g_log_n + i + 1; }
+
+static const acc_t *log_at(uint32_t i) {
+    if (i >= g_log_n) return NULL;
+    uint64_t first = g_log_total - g_log_n;
+    return &g_log[(uint32_t)((first + i) % DRV_LOG_MAX)];
+}
+
+/* Writes are logged before they are issued and reads after, so the log always
+ * contains the access that was in flight if a device ever wedges the machine. */
+static void rec_port_write(void *ctx, uint16_t port, uint8_t width, uint32_t val) {
+    (void)ctx;
+    log_acc(A_PW, port, width, val);
+    g_inner->port_write(g_inner->ctx, port, width, val);
+}
+static uint32_t rec_port_read(void *ctx, uint16_t port, uint8_t width) {
+    (void)ctx;
+    uint32_t v = g_inner->port_read(g_inner->ctx, port, width);
+    log_acc(A_PR, port, width, v);
+    return v;
+}
+static void rec_mmio_write(void *ctx, uint64_t addr, uint8_t width, uint32_t val) {
+    (void)ctx;
+    log_acc(A_MW, addr, width, val);
+    g_inner->mmio_write(g_inner->ctx, addr, width, val);
+}
+static uint32_t rec_mmio_read(void *ctx, uint64_t addr, uint8_t width) {
+    (void)ctx;
+    uint32_t v = g_inner->mmio_read(g_inner->ctx, addr, width);
+    log_acc(A_MR, addr, width, v);
+    return v;
+}
+static uint32_t rec_pci_read32(void *ctx, uint8_t bus, uint8_t dev, uint8_t fn,
+                               uint8_t off) {
+    (void)ctx;
+    uint32_t v = g_inner->pci_read32(g_inner->ctx, bus, dev, fn, off);
+    log_acc(A_PCI, ((uint64_t)(((uint32_t)bus << 8) | ((uint32_t)dev << 3) | fn) << 8)
+                   | off, 4, v);
+    return v;
+}
+static void rec_delay_us(void *ctx, uint32_t us) {
+    (void)ctx;
+    log_acc(A_DLY, 0, 0, us);
+    g_inner->delay_us(g_inner->ctx, us);
+}
+
+/* Wrap `io`, hook for hook. A hook the real backend does not have must stay
+ * NULL: dvm.c turns a missing hook into DVM_TRAP_NOIO, and a recorder that
+ * filled it in would make a program believe an access happened. */
+static const dvm_io_t *recorder_bind(const dvm_io_t *io) {
+    g_log_n = 0;
+    g_log_total = 0;
+    memset(&g_recorder, 0, sizeof g_recorder);
+    if (!io) return NULL;
+    g_inner = io;
+    if (io->port_write) g_recorder.port_write = rec_port_write;
+    if (io->port_read)  g_recorder.port_read  = rec_port_read;
+    if (io->mmio_write) g_recorder.mmio_write = rec_mmio_write;
+    if (io->mmio_read)  g_recorder.mmio_read  = rec_mmio_read;
+    if (io->pci_read32) g_recorder.pci_read32 = rec_pci_read32;
+    if (io->delay_us)   g_recorder.delay_us   = rec_delay_us;
+    return &g_recorder;
+}
+
+/* The backend a run executes against. dvm_io_hardware() is NULL on a host
+ * build, where there are no in/out instructions; tests substitute a synthetic
+ * device through dvm_tools_set_io(). */
+static const dvm_io_t *g_io_override;
+
+void dvm_tools_set_io(const dvm_io_t *io) { g_io_override = io; }
+
+static const dvm_io_t *hardware_io(void) {
+    return g_io_override ? g_io_override : dvm_io_hardware();
+}
+
+/* ====================================================================== */
+/* the attempt budget                                                     */
+/* ====================================================================== */
+
+static struct {
+    char     name[DRV_NAME_MAX + 1];
+    unsigned fails;
+} g_attempt[DRV_TARGETS_TRACKED];
+
+/* Forget every target's failure count. Not reachable by the model: it is the
+ * kernel's to call (see FUTURE EXTENSION POINTS) and the tests'. */
+void dvm_tools_reset_attempts(void) {
+    memset(g_attempt, 0, sizeof g_attempt);
+}
+
+static unsigned attempts_used(const char *name) {
+    for (int i = 0; i < DRV_TARGETS_TRACKED; i++)
+        if (g_attempt[i].name[0] && name_eq(g_attempt[i].name, name))
+            return g_attempt[i].fails;
+    return 0;
+}
+
+static void attempts_record(const char *name, int ok) {
+    int slot = -1, empty = -1, weakest = 0;
+
+    for (int i = 0; i < DRV_TARGETS_TRACKED; i++) {
+        if (g_attempt[i].name[0] && name_eq(g_attempt[i].name, name)) { slot = i; break; }
+        if (empty < 0 && !g_attempt[i].name[0]) empty = i;
+        if (g_attempt[i].fails < g_attempt[weakest].fails) weakest = i;
+    }
+
+    if (slot < 0) {
+        /* The table is 8 entries and a ninth target has to evict somebody. It
+         * must NOT be whichever target happens to sit in slot 0: attempts_used()
+         * reports 0 for a name the table has forgotten, so evicting a target
+         * that is close to its budget would hand its budget back, and naming
+         * eight other devices once each would be a reset the model can perform
+         * on itself. Evict the LEAST-failed entry instead, so the targets a
+         * runaway conversation is actually burning are the ones that survive. */
+        slot = (empty >= 0) ? empty : weakest;
+        /* And start the new occupant from zero: inheriting the evicted entry's
+         * count would refuse a device on its first failure (or, the other way
+         * round, silently reattribute a still-broken target's history). */
+        g_attempt[slot].fails = 0;
+        snprintf(g_attempt[slot].name, sizeof g_attempt[slot].name, "%s", name);
+    }
+
+    g_attempt[slot].fails = ok ? 0 : g_attempt[slot].fails + 1;
+}
+
+/* ====================================================================== */
+/* the last run, kept for driver_trace                                    */
+/* ====================================================================== */
+
+static struct {
+    int          valid;
+    char         target[DRV_NAME_MAX + 1];
+    char         sandbox[192];
+    char         insn[80];              /* the stopping instruction, disassembled */
+    char         srcline[112];          /* the model's own text for that line     */
+    uint32_t     ninsn;
+    unsigned     attempt;
+    dvm_result_t res;
+} g_last;
+
+/* The decoded program text. Static because 16 KB does not belong on a 64 KiB
+ * kernel stack shared with lwIP and mbedTLS. */
+static char   g_src[DRV_SRC_MAX + 1];
+static size_t g_srclen;
+
+/* Copy source line `line` (1-based) into dst, printable and bounded. This is
+ * how the model gets its own text back next to the trap. */
+static void source_line(uint32_t line, char *dst, size_t cap) {
+    dst[0] = '\0';
+    if (!line || !cap) return;
+
+    size_t i = 0;
+    uint32_t cur = 1;
+    while (i < g_srclen && cur < line) {
+        if (g_src[i] == '\n') cur++;
+        i++;
+    }
+    if (cur != line) return;
+
+    while (i < g_srclen && (g_src[i] == ' ' || g_src[i] == '\t')) i++;
+
+    size_t o = 0;
+    while (i < g_srclen && g_src[i] != '\n' && o + 1 < cap) {
+        unsigned char c = (unsigned char)g_src[i++];
+        dst[o++] = (c < 0x20 || c > 0x7E) ? ' ' : (char)c;
+    }
+    while (o && dst[o - 1] == ' ') o--;
+    dst[o] = '\0';
+}
+
+/* ====================================================================== */
+/* result formatting                                                      */
+/* ====================================================================== */
+
+static unsigned wbits(uint8_t w) { return w == 1 ? 8u : w == 2 ? 16u : 32u; }
+
+static void put_acc(tool_result_t *r, uint64_t idx, const acc_t *a) {
+    switch ((akind_t)a->kind) {
+        case A_PW:
+            tool_result_printf(r, "  %lu out%u 0x%04lx <= 0x%lx\n",
+                               (unsigned long)idx, wbits(a->width),
+                               (unsigned long)a->addr, (unsigned long)a->val);
+            break;
+        case A_PR:
+            tool_result_printf(r, "  %lu in%u 0x%04lx => 0x%lx\n",
+                               (unsigned long)idx, wbits(a->width),
+                               (unsigned long)a->addr, (unsigned long)a->val);
+            break;
+        case A_MW:
+            tool_result_printf(r, "  %lu st%u 0x%lx <= 0x%lx\n",
+                               (unsigned long)idx, wbits(a->width),
+                               (unsigned long)a->addr, (unsigned long)a->val);
+            break;
+        case A_MR:
+            tool_result_printf(r, "  %lu ld%u 0x%lx => 0x%lx\n",
+                               (unsigned long)idx, wbits(a->width),
+                               (unsigned long)a->addr, (unsigned long)a->val);
+            break;
+        case A_PCI:
+            tool_result_printf(r, "  %lu pcicfg %02lx:%02lx.%lx off 0x%02lx => 0x%08lx\n",
+                               (unsigned long)idx,
+                               (unsigned long)((a->addr >> 16) & 0xFF),
+                               (unsigned long)((a->addr >> 11) & 0x1F),
+                               (unsigned long)((a->addr >> 8) & 0x7),
+                               (unsigned long)(a->addr & 0xFF),
+                               (unsigned long)a->val);
+            break;
+        default:
+            tool_result_printf(r, "  %lu delay %lu us\n",
+                               (unsigned long)idx, (unsigned long)a->val);
+            break;
+    }
+}
+
+static void put_registers(tool_result_t *r, const dvm_result_t *res) {
+    int any = 0;
+    tool_result_printf(r, "regs:");
+    for (int i = 0; i < DVM_NREGS; i++) {
+        if (!res->reg[i]) continue;
+        tool_result_printf(r, " r%d=0x%lx", i, (unsigned long)res->reg[i]);
+        any = 1;
+    }
+    tool_result_printf(r, any ? " (others 0)\n" : " all zero\n");
+}
+
+static void put_counters(tool_result_t *r, const dvm_result_t *res) {
+    tool_result_printf(r,
+        "ran %lu steps, %lu accesses (port rd %lu wr %lu, mmio rd %lu wr %lu, "
+        "pci %lu), %lu us delay, %lu prints\n",
+        (unsigned long)res->steps, (unsigned long)res->io_ops,
+        (unsigned long)res->n_port_rd, (unsigned long)res->n_port_wr,
+        (unsigned long)res->n_mmio_rd, (unsigned long)res->n_mmio_wr,
+        (unsigned long)res->n_pci_rd, (unsigned long)res->delay_us,
+        (unsigned long)res->prints);
+}
+
+/* The tail of the log: the last thing that happened is what explains a trap. */
+static void put_log_tail(tool_result_t *r) {
+    if (!g_log_n) {
+        tool_result_printf(r, "no device accesses were made\n");
+        return;
+    }
+    uint32_t shown = 0;
+    uint32_t first = 0;
+    /* Count backwards from the end for as many rows as the budget allows. */
+    for (uint32_t i = g_log_n; i > 0; i--) {
+        if (r->len + DRV_ROW_MARGIN + (shown + 1) * 40 >= r->cap) break;
+        first = i - 1;
+        shown++;
+    }
+    if (!shown) return;
+
+    if (shown < g_log_n)
+        tool_result_printf(r, "last %lu of %lu device events "
+                              "(driver_trace has the rest):\n",
+                           (unsigned long)shown, (unsigned long)g_log_total);
+    else
+        tool_result_printf(r, "%lu device events:\n", (unsigned long)g_log_total);
+
+    for (uint32_t i = first; i < g_log_n; i++) {
+        const acc_t *a = log_at(i);
+        if (!a) break;
+        put_acc(r, log_index(i), a);
+    }
+}
+
+/* ====================================================================== */
+/* driver_targets                                                         */
+/* ====================================================================== */
+
+typedef struct {
+    tool_result_t *r;
+    int  limit;
+    int  include_unusable;
+    int  want_usable;         /* this pass prints usable rows / unusable rows */
+    int  matched, shown, usable, stopped;
+} tlist_t;
+
+static void target_row(device_t *d, void *ctx) {
+    tlist_t *s = (tlist_t *)ctx;
+    if (!d) return;
+
+    target_t t;
+    memset(&t, 0, sizeof t);
+    snprintf(t.name, sizeof t.name, "%s", d->obj.name ? d->obj.name : "?");
+    t.node = d;
+    if (!node_pci_addr(d, &t.bus, &t.dev, &t.fn)) return;   /* not a PCI function */
+    target_read_ids(&t);
+    if (t.vendor == 0xFFFF || t.vendor == 0x0000) return;
+
+    char why[DVM_MSG_MAX + 96];
+    why[0] = '\0';
+
+    sandbox_t sb;
+    int ok = !target_blocked(&t, why, sizeof why) &&
+             build_sandbox(&t, &sb, DRV_STEPS_DEF, DRV_DELAY_DEF_US,
+                           DVM_TRACE_IO, why, sizeof why) == 0;
+
+    /* Counting happens on the usable pass only, so a two-pass listing still
+     * reports each function once. */
+    if (s->want_usable) {
+        s->matched++;
+        if (ok) s->usable++;
+    }
+    if (ok != s->want_usable) return;
+    if (!ok && !s->include_unusable) return;
+    if (s->stopped || s->shown >= s->limit || room_low(s->r)) { s->stopped = 1; return; }
+
+    tool_result_printf(s->r, "target=%s %02x:%02x.%x %04x:%04x class=%02x:%02x\n",
+                       t.name, t.bus, t.dev, t.fn,
+                       (unsigned)t.vendor, (unsigned)t.device,
+                       (unsigned)t.cls, (unsigned)t.sub);
+    if (ok) {
+        tool_result_printf(s->r, "  usable: yes  sandbox: %s\n", sb.text);
+        tool_result_printf(s->r, "  preloaded:");
+        for (int i = 0; i < 6; i++)
+            if (sb.args[i])
+                tool_result_printf(s->r, " r%d=0x%lx", i, (unsigned long)sb.args[i]);
+        tool_result_printf(s->r, " r6=bdf 0x%lx\n", (unsigned long)sb.args[6]);
+        unsigned used = attempts_used(t.name);
+        if (used)
+            tool_result_printf(s->r, "  attempts used: %u of %d\n",
+                               used, DRV_ATTEMPT_BUDGET);
+    } else {
+        tool_result_printf(s->r, "  usable: no - %s\n", why);
+    }
+    s->shown++;
+}
+
+static int t_driver_targets(const tool_call_t *c, tool_result_t *r) {
+    json_value_t in;
+    if (parse_obj(c, &in) != TOOL_OK)
+        return fail(r, TOOL_EINVAL, "driver_targets", "", "input must be a JSON object");
+
+    tlist_t s;
+    memset(&s, 0, sizeof s);
+    s.r = r;
+    s.limit = 16;
+
+    int64_t lim;
+    int rc = f_int(&in, "limit", 1, 64, &lim);
+    if (rc < 0) return fail(r, TOOL_EINVAL, "driver_targets", "",
+                            "\"limit\" must be an integer 1-64");
+    if (rc == 1) s.limit = (int)lim;
+
+    if (f_bool(&in, "include_unusable", &s.include_unusable) < 0)
+        return fail(r, TOOL_EINVAL, "driver_targets", "",
+                    "\"include_unusable\" must be a boolean");
+
+    /* Usable targets first: the answer is clipped to the model's result budget,
+     * and the row it can act on must not be the one that falls off the end. */
+    bases_invalidate();
+    s.want_usable = 1;
+    device_foreach(target_row, &s);
+    if (s.include_unusable) {
+        s.want_usable = 0;
+        device_foreach(target_row, &s);
+    }
+
+    if (s.stopped)
+        tool_result_printf(r, "...more not shown (raise \"limit\")\n");
+    tool_result_printf(r,
+        "targets: %d PCI function(s) known, %d can be driven by a program, %d shown\n",
+        s.matched, s.usable, s.shown);
+    if (!s.usable)
+        tool_result_printf(r,
+            "none are targetable right now; add include_unusable=true to see why "
+            "each one was rejected\n");
+
+    trace_ret(s.usable, "driver_targets", "known=%d usable=%d", s.matched, s.usable);
+    return TOOL_OK;
+}
+
+static const tool_t driver_targets_tool = {
+    .name = "driver_targets",
+    .description =
+        "List the devices a driver program may be run against. For each one: the "
+        "sandbox it would get (port ranges and MMIO windows derived from that "
+        "device's own BARs), the PCI function opened for pcicfg, and the registers "
+        "preloaded before the first instruction (r0-r5 = BAR bases, r6 = bdf). "
+        "include_unusable=true also lists the devices that cannot be driven and "
+        "why: already claimed by a driver, bus-mastering (DMA cannot be policed), "
+        "no programmed BAR, or a BAR the VM never allows. driver_run accepts only "
+        "a target named here.",
+    .input_schema =
+        "{\"type\":\"object\",\"properties\":{"
+        "\"include_unusable\":{\"type\":\"boolean\",\"description\":\"also list devices that cannot be targeted, with the reason\"},"
+        "\"limit\":{\"type\":\"integer\",\"description\":\"max rows, 1-64 (default 16)\"}"
+        "},\"required\":[]}",
+    .flags  = 0,
+    .invoke = t_driver_targets,
+};
+REGISTER_TOOL(driver_targets_tool);
+
+/* ====================================================================== */
+/* reading the "source" argument                                          */
+/* ====================================================================== */
+
+/* Decode `source` into g_src. Returns 0, or a TOOL_* code after writing the
+ * error result itself. */
+static int want_source(const json_value_t *in, tool_result_t *r, const char *op,
+                       const char *args) {
+    g_src[0] = '\0';
+    g_srclen = 0;
+
+    size_t n  = 0;
+    int    rc = f_str(in, "source", g_src, sizeof g_src, &n);
+    if (rc == 0)
+        return fail(r, TOOL_EINVAL, op, args,
+                    "\"source\" is required: the program text, one instruction per line");
+    if (rc == -1)
+        return fail(r, TOOL_EINVAL, op, args, "\"source\" must be a string");
+    if (rc == -2)
+        return fail(r, TOOL_EINVAL, op, args,
+                    "\"source\" is longer than %d bytes, which is the whole program "
+                    "budget; a bring-up sequence should be well under it", DRV_SRC_MAX);
+
+    g_srclen = n;
+    if (n == 0)
+        return fail(r, TOOL_EINVAL, op, args, "\"source\" is empty: there is no program to run");
+    return 0;
+}
+
+/* Report an assembler failure the way the model can act on: line number, the
+ * assembler's own words, and the line it wrote. */
+static void put_asm_error(tool_result_t *r, const dvm_asm_err_t *e) {
+    if (e->line > 0) {
+        char text[112];
+        source_line((uint32_t)e->line, text, sizeof text);
+        tool_result_printf(r, "assembly failed at line %d: %s\n", e->line, e->msg);
+        if (text[0]) tool_result_printf(r, "  line %d: %s\n", e->line, text);
+    } else {
+        tool_result_printf(r, "assembly failed: %s\n", e->msg);
+    }
+}
+
+/* ====================================================================== */
+/* driver_assemble                                                        */
+/* ====================================================================== */
+
+static int t_driver_assemble(const tool_call_t *c, tool_result_t *r) {
+    json_value_t in;
+    if (parse_obj(c, &in) != TOOL_OK)
+        return fail(r, TOOL_EINVAL, "driver_assemble", "", "input must be a JSON object");
+
+    int rc = want_source(&in, r, "driver_assemble", "");
+    if (rc != 0) return rc;
+
+    int listing = 0;
+    if (f_bool(&in, "listing", &listing) < 0)
+        return fail(r, TOOL_EINVAL, "driver_assemble", "", "\"listing\" must be a boolean");
+
+    dvm_program_t *prog = (dvm_program_t *)kmalloc(sizeof *prog);
+    if (!prog)
+        return fail(r, TOOL_ENOSPC, "driver_assemble", "",
+                    "no memory for a program image right now");
+
+    dvm_asm_err_t err;
+    memset(&err, 0, sizeof err);
+    if (dvm_assemble(g_src, g_srclen, prog, &err) != 0) {
+        r->is_error = 1;
+        put_asm_error(r, &err);
+        tool_result_printf(r, "nothing was run; fix the line and try again\n");
+        trace_err(TOOL_EINVAL, "driver_assemble", "line=%d", err.line);
+        kfree(prog);
+        return TOOL_EINVAL;
+    }
+
+    tool_result_printf(r, "ok: %lu instructions, %lu labels, %lu strings, "
+                          "%lu source lines\n",
+                       (unsigned long)prog->ninsn, (unsigned long)prog->nlabel,
+                       (unsigned long)prog->nstr, (unsigned long)prog->src_lines);
+    if (listing) {
+        for (uint32_t pc = 0; pc < prog->ninsn && !room_low(r); pc++) {
+            char text[80];
+            if (!dvm_disasm(prog, pc, text, sizeof text)) break;
+            tool_result_printf(r, "%3lu ln%-4lu %s\n", (unsigned long)pc,
+                               (unsigned long)prog->insn[pc].line, text);
+        }
+        if (room_low(r)) tool_result_printf(r, "...listing clipped\n");
+    }
+    tool_result_printf(r, "this only parsed the program; driver_run executes it\n");
+
+    trace_ret((long)prog->ninsn, "driver_assemble", "insns=%lu",
+              (unsigned long)prog->ninsn);
+    kfree(prog);
+    return TOOL_OK;
+}
+
+static const tool_t driver_assemble_tool = {
+    .name = "driver_assemble",
+    .description =
+        "Check that a driver program assembles. Touches no hardware and spends "
+        "none of driver_run's attempts, so use it for every syntax question. "
+        "Returns the instruction, label and string counts, or the first error with "
+        "its line number and the text of that line; listing=true adds a numbered "
+        "disassembly, which is how to confirm the assembler read an addressing "
+        "form the way you meant it.",
+    .input_schema =
+        "{\"type\":\"object\",\"properties\":{"
+        "\"source\":{\"type\":\"string\",\"description\":\"the program text (see driver_run for the instruction set)\"},"
+        "\"listing\":{\"type\":\"boolean\",\"description\":\"also print a numbered disassembly\"}"
+        "},\"required\":[\"source\"]}",
+    .flags  = 0,
+    .invoke = t_driver_assemble,
+};
+REGISTER_TOOL(driver_assemble_tool);
+
+/* ====================================================================== */
+/* driver_run                                                             */
+/* ====================================================================== */
+
+static dvm_trace_t want_trace(const json_value_t *in, int *bad) {
+    char t[16];
+    *bad = 0;
+    int rc = f_str(in, "trace", t, sizeof t, NULL);
+    if (rc == 0) return DVM_TRACE_IO;
+    if (rc < 0)  { *bad = 1; return DVM_TRACE_IO; }
+    if (name_eq(t, "off")) return DVM_TRACE_OFF;
+    if (name_eq(t, "io"))  return DVM_TRACE_IO;
+    if (name_eq(t, "all")) return DVM_TRACE_ALL;
+    *bad = 1;
+    return DVM_TRACE_IO;
+}
+
+static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
+    json_value_t in;
+    if (parse_obj(c, &in) != TOOL_OK)
+        return fail(r, TOOL_EINVAL, "driver_run", "", "input must be a JSON object");
+
+    /* ---- the target names a device, and only a device ---- */
+    char name[DRV_NAME_MAX + 1];
+    int  rc = f_str(&in, "target", name, sizeof name, NULL);
+    if (rc == 0)  return fail(r, TOOL_EINVAL, "driver_run", "",
+                              "\"target\" is required: the name of the device to drive, "
+                              "from driver_targets");
+    if (rc == -1) return fail(r, TOOL_EINVAL, "driver_run", "", "\"target\" must be a string");
+    if (rc == -2) return fail(r, TOOL_ENOENT, "driver_run", "<oversized>",
+                              "no such device: a name longer than %d characters cannot "
+                              "match anything registered", DRV_NAME_MAX);
+
+    bases_invalidate();
+
+    char why[DVM_MSG_MAX + 96];
+    target_t t;
+    if (resolve_target(name, &t, why, sizeof why) != 0)
+        return fail(r, TOOL_ENOENT, "driver_run", name, "%s", why);
+    if (target_blocked(&t, why, sizeof why) != 0)
+        return fail(r, TOOL_EINVAL, "driver_run", t.name, "%s", why);
+
+    /* ---- the retry budget, checked before anything is assembled ---- */
+    unsigned used = attempts_used(t.name);
+    if (used >= DRV_ATTEMPT_BUDGET)
+        return fail(r, TOOL_EINVAL, "driver_run", t.name,
+                    "%d attempts against %s have all failed and no more will be run. "
+                    "Stop here: tell the operator what you tried, what the device "
+                    "returned, and what you think is wrong with it",
+                    DRV_ATTEMPT_BUDGET, t.name);
+
+    /* ---- knobs, each one bounded ---- */
+    int bad = 0;
+    dvm_trace_t trace = want_trace(&in, &bad);
+    if (bad) return fail(r, TOOL_EINVAL, "driver_run", t.name,
+                         "\"trace\" must be \"off\", \"io\" or \"all\"");
+
+    int64_t ms = 0, steps = 0;
+    rc = f_int(&in, "delay_budget_ms", 0, DRV_DELAY_MAX_MS, &ms);
+    if (rc == -1) return fail(r, TOOL_EINVAL, "driver_run", t.name,
+                              "\"delay_budget_ms\" must be an integer");
+    if (rc == -2) return fail(r, TOOL_EINVAL, "driver_run", t.name,
+                              "\"delay_budget_ms\" must be 0-%d; the VM will not spend "
+                              "longer than that in one run", DRV_DELAY_MAX_MS);
+    uint64_t delay_us = (rc == 1) ? (uint64_t)ms * 1000ull : DRV_DELAY_DEF_US;
+
+    rc = f_int(&in, "max_steps", 1, DRV_STEPS_MAX, &steps);
+    if (rc == -1) return fail(r, TOOL_EINVAL, "driver_run", t.name,
+                              "\"max_steps\" must be an integer");
+    if (rc == -2) return fail(r, TOOL_EINVAL, "driver_run", t.name,
+                              "\"max_steps\" must be 1-%lu", (unsigned long)DRV_STEPS_MAX);
+    uint64_t max_steps = (rc == 1) ? (uint64_t)steps : DRV_STEPS_DEF;
+
+    rc = want_source(&in, r, "driver_run", t.name);
+    if (rc != 0) return rc;
+
+    /* ---- the sandbox, derived from the device ---- */
+    sandbox_t sb;
+    if (build_sandbox(&t, &sb, max_steps, delay_us, trace, why, sizeof why) != 0)
+        return fail(r, TOOL_EINVAL, "driver_run", t.name, "%s", why);
+
+    const dvm_io_t *io = hardware_io();
+    if (!io)
+        return fail(r, TOOL_EINVAL, "driver_run", t.name,
+                    "this build has no hardware I/O backend, so no program can run");
+
+    dvm_program_t *prog = (dvm_program_t *)kmalloc(sizeof *prog);
+    if (!prog)
+        return fail(r, TOOL_ENOSPC, "driver_run", t.name,
+                    "no memory for a program image right now");
+
+    /* Everything from here on counts as an attempt: the model named a real
+     * device and asked for its program to be run against it. The recorder is
+     * armed before the assembler runs so that driver_trace can never show a
+     * previous run's accesses next to this attempt's verdict. */
+    const dvm_io_t *rio = recorder_bind(io);
+    memset(&g_last, 0, sizeof g_last);
+    snprintf(g_last.target, sizeof g_last.target, "%s", t.name);
+    snprintf(g_last.sandbox, sizeof g_last.sandbox, "%s", sb.text);
+    g_last.attempt = used + 1;
+
+    dvm_asm_err_t aerr;
+    memset(&aerr, 0, sizeof aerr);
+    if (dvm_assemble(g_src, g_srclen, prog, &aerr) != 0) {
+        attempts_record(t.name, 0);
+        r->is_error = 1;
+        tool_result_printf(r, "target=%s attempt %u of %d\n",
+                           t.name, g_last.attempt, DRV_ATTEMPT_BUDGET);
+        put_asm_error(r, &aerr);
+        tool_result_printf(r, "the device was not touched\n");
+        g_last.valid = 1;
+        g_last.res.status = DVM_TRAP_BADOP;
+        g_last.res.line = (uint32_t)aerr.line;
+        snprintf(g_last.res.msg, sizeof g_last.res.msg, "%s", aerr.msg);
+        source_line((uint32_t)aerr.line, g_last.srcline, sizeof g_last.srcline);
+        trace_err(TOOL_EINVAL, "driver_run", "%s attempt=%u asm line=%d",
+                  t.name, g_last.attempt, aerr.line);
+        kfree(prog);
+        return TOOL_EINVAL;
+    }
+    g_last.ninsn = prog->ninsn;
+
+    /* ---- run it ---- */
+    dvm_result_t res;
+    dvm_status_t st = dvm_run(prog, &sb.pol, rio, sb.args, sb.nargs, &res);
+
+    g_last.valid = 1;
+    g_last.res   = res;
+    if (st != DVM_OK || res.line) {
+        source_line(res.line, g_last.srcline, sizeof g_last.srcline);
+        if (res.pc < prog->ninsn) dvm_disasm(prog, res.pc, g_last.insn, sizeof g_last.insn);
+    }
+    kfree(prog);
+
+    /* A success clears the failure count, which is what makes the budget a
+     * brake on a NON-CONVERGING conversation rather than a hard cap on work.
+     * But "reached halt" is not the same as "made progress": the one-instruction
+     * program `halt` reaches halt while touching nothing, so crediting it would
+     * let the model clear its own budget between failures - and a bound the
+     * model can clear is not a bound. Convergence requires that the program
+     * actually spoke to the device. */
+    int converged = (st == DVM_OK) && res.io_ops > 0;
+    attempts_record(t.name, converged);
+
+    /* ---- what the model reads ---- */
+    tool_result_printf(r, "target=%s %02x:%02x.%x %04x:%04x attempt %u of %d\n",
+                       t.name, t.bus, t.dev, t.fn,
+                       (unsigned)t.vendor, (unsigned)t.device,
+                       g_last.attempt, DRV_ATTEMPT_BUDGET);
+    tool_result_printf(r, "sandbox: %s\n", g_last.sandbox);
+
+    if (st == DVM_OK) {
+        tool_result_printf(r, "status=OK - the program reached halt at line %lu\n",
+                           (unsigned long)res.line);
+        if (!converged)
+            tool_result_printf(r, "note: it reached halt without touching the device "
+                                  "once, so this does not count as progress and the "
+                                  "attempt was spent\n");
+    } else {
+        r->is_error = 1;
+        tool_result_printf(r, "status=%s at line %lu (pc %lu)\n",
+                           dvm_status_name(st), (unsigned long)res.line,
+                           (unsigned long)res.pc);
+        if (res.msg[0]) tool_result_printf(r, "  %s\n", res.msg);
+        if (g_last.insn[0])    tool_result_printf(r, "  instruction: %s\n", g_last.insn);
+        if (g_last.srcline[0]) tool_result_printf(r, "  line %lu: %s\n",
+                                                  (unsigned long)res.line, g_last.srcline);
+    }
+
+    put_counters(r, &res);
+    put_registers(r, &res);
+    put_log_tail(r);
+
+    if (!converged) {
+        unsigned used_now = attempts_used(t.name);
+        unsigned left = (used_now >= DRV_ATTEMPT_BUDGET)
+                            ? 0u : DRV_ATTEMPT_BUDGET - used_now;
+        if (left)
+            tool_result_printf(r, "%u attempt(s) left on this target. Read the "
+                                  "accesses above: they are what the device really "
+                                  "did, in order.\n", left);
+        else
+            tool_result_printf(r, "no attempts left on this target; stop and report "
+                                  "to the operator.\n");
+    }
+
+    if (st == DVM_OK)
+        trace_ok("driver_run", "%s attempt=%u insns=%lu steps=%lu io=%lu",
+                 t.name, g_last.attempt, (unsigned long)g_last.ninsn,
+                 (unsigned long)res.steps, (unsigned long)res.io_ops);
+    else
+        trace_err(TOOL_EINVAL, "driver_run", "%s attempt=%u %s line=%lu",
+                  t.name, g_last.attempt, dvm_status_name(st), (unsigned long)res.line);
+
+    return st == DVM_OK ? TOOL_OK : TOOL_EINVAL;
+}
+
+static const tool_t driver_run_tool = {
+    .name = "driver_run",
+    .description =
+        "Write a device driver and run it. The program is assembled and executed "
+        "on the kernel's driver VM against ONE NAMED DEVICE from driver_targets. "
+        "The sandbox is derived from that device's BARs, so a program can only "
+        "reach the device you named - not kernel memory, the interrupt "
+        "controllers, the console, the PCI config ports or any other device - and "
+        "it cannot loop forever. Everything it does to the hardware comes back to "
+        "you; on a trap: the reason, the source line, that instruction "
+        "disassembled, the final registers, and the tail of the access log with "
+        "the values the device really returned. Fix it and call again, but only 5 "
+        "failed attempts per target are allowed, so read the log instead of "
+        "guessing. This writes to real hardware registers.\n"
+        "MACHINE: 16 registers r0-r15, 64-bit, UNSIGNED. A 32-deep data stack and "
+        "a separate 16-deep call stack. No memory: device registers are the only "
+        "mutable state. On entry r0-r5 hold this device's BAR base addresses (0 if "
+        "that BAR is unused) and r6 holds its bdf for pcicfg.\n"
+        "INSTRUCTIONS (a, b = register or number):\n"
+        " halt | abort \"why\" | nop\n"
+        " mov rd,a | add|sub|mul|div|mod|and|or|xor|shl|shr rd,a,b | not rd,a\n"
+        "   (two-operand shorthand: `add r1,4` means `add r1,r1,4`)\n"
+        " cmp a,b (unsigned) | test a,b (sets zero = ((a&b)==0))\n"
+        " jmp L | beq|bne|blt|ble|bgt|bge L | call L | ret | push a | pop rd\n"
+        " out8|out16|out32 port,a | in8|in16|in32 rd,port\n"
+        " ld8|ld16|ld32 rd,[base+disp] | st8|st16|st32 [base+disp],a\n"
+        " pcicfg rd,bdf,off   (config-space READ only; bdf may be written 00:05.0)\n"
+        " delay us            (microseconds; a floor, not a precise timer)\n"
+        " print \"text\" | print \"text\",a   (goes to the operator's console)\n"
+        "SYNTAX: one instruction per line; `label:` marks a branch target; "
+        "comments start with ; or # or //; commas are optional; case-insensitive; "
+        "numbers may be decimal, 0x hex, 0b binary or contain _; "
+        "`.equ NAME value` defines a constant.\n"
+        "HOW TO WRITE ONE: check the class with pcicfg before touching a port; "
+        "reset the device, then poll for ready with a COUNTED retry loop and a "
+        "delay as backoff (never an unbounded loop); write a register, read it "
+        "back, and `abort \"...\"` with a specific reason if it did not stick; "
+        "leave the values you want reported in registers, because the final "
+        "register file comes back to you.",
+    .input_schema =
+        "{\"type\":\"object\",\"properties\":{"
+        "\"target\":{\"type\":\"string\",\"description\":\"device name from driver_targets, e.g. \\\"pci00:05.0\\\"\"},"
+        "\"source\":{\"type\":\"string\",\"description\":\"the program text, one instruction per line\"},"
+        "\"trace\":{\"type\":\"string\",\"description\":\"console trace detail: \\\"off\\\", \\\"io\\\" (default: every device access) or \\\"all\\\" (every instruction)\"},"
+        "\"delay_budget_ms\":{\"type\":\"integer\",\"description\":\"total milliseconds the program may spend in delay, 0-2000 (default 250)\"},"
+        "\"max_steps\":{\"type\":\"integer\",\"description\":\"instruction budget, 1-1000000 (default 100000)\"}"
+        "},\"required\":[\"target\",\"source\"]}",
+    .flags  = TOOL_MUTATES,
+    .invoke = t_driver_run,
+};
+REGISTER_TOOL(driver_run_tool);
+
+/* ====================================================================== */
+/* driver_trace                                                           */
+/* ====================================================================== */
+
+static int t_driver_trace(const tool_call_t *c, tool_result_t *r) {
+    json_value_t in;
+    if (parse_obj(c, &in) != TOOL_OK)
+        return fail(r, TOOL_EINVAL, "driver_trace", "", "input must be a JSON object");
+
+    if (!g_last.valid)
+        return fail(r, TOOL_ENOENT, "driver_trace", "",
+                    "no program has been run yet, so there is no trace to read");
+
+    int64_t off = 0, lim = 24;
+    int rc = f_int(&in, "offset", 0, 0x7FFFFFFF, &off);
+    if (rc < 0) return fail(r, TOOL_EINVAL, "driver_trace", "",
+                            "\"offset\" must be a non-negative integer");
+    rc = f_int(&in, "limit", 1, 64, &lim);
+    if (rc < 0) return fail(r, TOOL_EINVAL, "driver_trace", "",
+                            "\"limit\" must be an integer 1-64");
+
+    int tail = 0;
+    if (f_bool(&in, "tail", &tail) < 0)
+        return fail(r, TOOL_EINVAL, "driver_trace", "", "\"tail\" must be a boolean");
+
+    tool_result_printf(r, "last run: target=%s attempt %u status=%s\n",
+                       g_last.target, g_last.attempt,
+                       dvm_status_name(g_last.res.status));
+    if (g_last.res.status != DVM_OK) {
+        tool_result_printf(r, "stopped at line %lu: %s\n",
+                           (unsigned long)g_last.res.line,
+                           g_last.res.msg[0] ? g_last.res.msg : "(no message)");
+        if (g_last.srcline[0])
+            tool_result_printf(r, "  line %lu: %s\n",
+                               (unsigned long)g_last.res.line, g_last.srcline);
+    }
+    put_counters(r, &g_last.res);
+    put_registers(r, &g_last.res);
+
+    if (!g_log_n) {
+        tool_result_printf(r, "no device events were recorded\n");
+        trace_ret(0, "driver_trace", "%s events=0", g_last.target);
+        return TOOL_OK;
+    }
+
+    /* The log holds the last DRV_LOG_MAX events; index 1 is the oldest one
+     * still held, which is stated rather than pretended away. */
+    uint64_t first_held = g_log_total - g_log_n + 1;
+    uint32_t start;
+    if (tail) {
+        start = (uint32_t)lim >= g_log_n ? 0 : g_log_n - (uint32_t)lim;
+    } else {
+        uint64_t want = (uint64_t)off + 1;
+        start = (want <= first_held) ? 0 : (uint32_t)(want - first_held);
+    }
+    if (start >= g_log_n)
+        return fail(r, TOOL_EINVAL, "driver_trace", g_last.target,
+                    "offset %lu is past the end: %lu events were recorded",
+                    (unsigned long)off, (unsigned long)g_log_total);
+
+    if (g_log_total > g_log_n)
+        tool_result_printf(r, "%lu events happened; the last %lu are kept\n",
+                           (unsigned long)g_log_total, (unsigned long)g_log_n);
+
+    uint32_t shown = 0;
+    for (uint32_t i = start; i < g_log_n && shown < (uint32_t)lim; i++) {
+        if (room_low(r)) break;
+        const acc_t *a = log_at(i);
+        if (!a) break;
+        put_acc(r, log_index(i), a);
+        shown++;
+    }
+    if (!shown)
+        tool_result_printf(r, "no room left for events; ask for a smaller \"limit\"\n");
+    else
+        tool_result_printf(r, "shown %lu of %lu (events %lu-%lu)\n",
+                           (unsigned long)shown, (unsigned long)g_log_total,
+                           (unsigned long)log_index(start),
+                           (unsigned long)log_index(start + shown - 1));
+
+    trace_ret((long)shown, "driver_trace", "%s events=%lu", g_last.target,
+              (unsigned long)g_log_total);
+    return TOOL_OK;
+}
+
+static const tool_t driver_trace_tool = {
+    .name = "driver_trace",
+    .description =
+        "Read back the device access log of the most recent driver_run: every port "
+        "and MMIO access in order with its width and the value written or read, "
+        "the delays, the final registers, and why the program stopped. driver_run "
+        "already returns the tail of this; use driver_trace for the earlier part "
+        "of a long run. Only the last 256 events are kept, and the answer says so "
+        "when older ones were dropped.",
+    .input_schema =
+        "{\"type\":\"object\",\"properties\":{"
+        "\"offset\":{\"type\":\"integer\",\"description\":\"first event to print, 0-based (default 0)\"},"
+        "\"limit\":{\"type\":\"integer\",\"description\":\"how many events, 1-64 (default 24)\"},"
+        "\"tail\":{\"type\":\"boolean\",\"description\":\"print the LAST \\\"limit\\\" events instead of starting at \\\"offset\\\"\"}"
+        "},\"required\":[]}",
+    .flags  = 0,
+    .invoke = t_driver_trace,
+};
+REGISTER_TOOL(driver_trace_tool);

@@ -32,6 +32,16 @@ SECTIONS {
         __stop_driver_table = .;
     }
 
+    /* Self-registering tool table — the model's syscall surface (see tool.h).
+     * Same mechanism as driver_table: a new tool is a new .c file with no
+     * central list to edit. */
+    .tool_table :
+    {
+        __start_tool_table = .;
+        KEEP(*(tool_table))
+        __stop_tool_table = .;
+    }
+
     .data :
     {
         *(.data)

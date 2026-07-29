@@ -1,4 +1,40 @@
-/* e1000.h — Intel 82540EM (QEMU's default "e1000") NIC driver. */
+/* e1000.h — Intel 82540EM/82545EM ("e1000") gigabit NIC driver.
+ *
+ * PURPOSE
+ *   Move Ethernet frames between the kernel and the wire, and expose the one
+ *   piece of hardware state that natural language keeps asking about: is the
+ *   link up?
+ *
+ * RESPONSIBILITIES
+ *   - Find the card on PCI, map BAR0, read the MAC out of the receive-address
+ *     registers, and program the RX/TX descriptor rings.
+ *   - Transmit and receive single frames by polling descriptor status bits.
+ *     There are no interrupts: the whole kernel is polled and IF stays 0.
+ *   - Implement the driver power lifecycle (driver.h: suspend/resume) for real
+ *     — quiesce DMA, power the PHY down, and bring all of it back so that a
+ *     TLS connection opened after resume actually completes.
+ *
+ * PUBLIC API
+ *   e1000_init          bring-up; also the driver_t.init hook (self-registers)
+ *   e1000_get_mac       the 6-byte station address
+ *   e1000_send          transmit one frame (copies)
+ *   e1000_receive       poll for one frame
+ *   e1000_link_up       is the link up *right now* (live STATUS read)
+ *   e1000_is_suspended  has the driver powered this card down?
+ *
+ * DEPENDENCIES
+ *   pci.h (discovery + BAR + bus mastering), io.h (MMIO), device.h/driver.h
+ *   (publishes "eth0" and the lifecycle hooks), kernel.h (kprintf, mdelay,
+ *   millis). Nothing above this file knows the card exists except net.c.
+ *
+ * FUTURE EXTENSION POINTS
+ *   - e1000_link_up() is the seam a link-state watcher would poll to raise and
+ *     lower NETIF_FLAG_LINK_UP on the lwIP netif instead of pinning it up.
+ *   - The MDIO helpers (MDIC) are the door to the whole PHY register file:
+ *     speed/duplex forcing, loopback, cable diagnostics.
+ *   - remove() would be the same teardown as suspend() plus unpublishing the
+ *     device; the two share their quiesce path already.
+ */
 #ifndef E1000_H
 #define E1000_H
 
@@ -10,11 +46,22 @@ int  e1000_init(void);
 /* Copy out the 6-byte MAC address. */
 void e1000_get_mac(uint8_t mac[6]);
 
-/* Transmit a raw Ethernet frame (copies `data`). Returns 0 on success. */
+/* Transmit a raw Ethernet frame (copies `data`). Returns 0 on success.
+ * Fails (nonzero) rather than blocking forever if the transmit engine does not
+ * retire the descriptor — which is exactly what happens while suspended. */
 int  e1000_send(const void *data, uint16_t len);
 
 /* Poll for one received frame. Returns 1 and fills buf/len if one was
  * available (buf must hold at least 2048 bytes), 0 otherwise. */
 int  e1000_receive(void *buf, uint16_t *len);
+
+/* Live link state: 1 = up. Reads the STATUS register every call, and reports
+ * "down" whenever this driver has powered the card down, because a suspended
+ * card cannot carry a frame no matter what the link bit says. Returns 0 before
+ * e1000_init() has mapped the card. */
+int  e1000_link_up(void);
+
+/* 1 while the driver's suspend hook has the card powered down. */
+int  e1000_is_suspended(void);
 
 #endif /* E1000_H */

@@ -39,9 +39,27 @@ API returns `401` — which proves HTTPS works, just without an answer.
 
 ## ⚠️ Security caveat
 
-This is a hobby OS. TLS certificate verification is **disabled**
-(`MBEDTLS_SSL_VERIFY_NONE`): traffic is encrypted but **not authenticated**, so
-it is vulnerable to man-in-the-middle. Entropy comes from a simple hardware poll
-(RDRAND/TSC), not a vetted CSPRNG. Don't send anything sensitive.
+This is a hobby OS. **In the default build, TLS certificate verification is off**
+(`MBEDTLS_SSL_VERIFY_NONE`): the server's certificate is parsed and then
+believed, so traffic is encrypted but **not authenticated** and is MITM-able by
+anything that can answer on port 443. Don't send anything sensitive.
+
+Real verification is implemented and works, behind a build flag:
+
+```sh
+cd os && make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS
+```
+
+That requires the chain to build to one of two **pinned** Google Trust Services
+roots, requires the certificate to name `api.anthropic.com`, and enforces
+`notBefore`/`notAfter` against the CMOS real-time clock. It is opt-in because a
+pinned trust set eventually breaks: when the endpoint's CA changes or the roots
+rotate, the kernel simply cannot reach the API until it is rebuilt. There is
+also no revocation checking (no CRL, no OCSP).
+
+**Entropy is a separate weakness and is not fixed by any of the above.** The
+CTR_DRBG is seeded by `mbedtls_hardware_poll()` — RDRAND, or a TSC mix when
+RDRAND is absent — with no entropy accounting and no health tests. Functional,
+not a vetted CSPRNG.
 
 See `os/README.md` for the driver model, the TLS build, and details.

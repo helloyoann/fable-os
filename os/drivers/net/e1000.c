@@ -4,7 +4,37 @@
  * and poll the descriptor "done" bits rather than using interrupts. Because
  * the kernel identity-maps physical memory, a buffer's virtual address is also
  * its physical address, so we can hand descriptor addresses straight to the
- * card. */
+ * card.
+ *
+ * POWER MANAGEMENT (driver.h suspend/resume)
+ *   "Suspend the network card" has to mean something at the register level, or
+ *   the tool that offers it is a lie. What suspend() actually does, in the
+ *   order the 8254x software developer's manual asks for:
+ *
+ *     1. mask every interrupt source (IMC) and clear any pending cause (ICR)
+ *     2. clear RCTL.EN, then TCTL.EN — the receive and transmit engines stop
+ *        fetching descriptors, so all DMA into kernel memory ceases
+ *     3. wait for in-flight DMA to retire before we consider the rings ours
+ *     4. power the PHY down over MDIO (PHY control register bit 11) and clear
+ *        CTRL.SLU/ASDE, which on real copper drops the link: the LED goes out
+ *        and the switch on the other end sees the port go away
+ *
+ *   resume() reverses it: PHY power-up plus a fresh auto-negotiation, then the
+ *   exact same bring-up sequence init() runs (hw_bring_up() is shared, so the
+ *   two can never drift), then a bounded wait for the link to come back.
+ *   Because the rings are re-based and the head/tail pointers re-zeroed, any
+ *   descriptor the card was mid-way through before the suspend is discarded
+ *   rather than transmitted late.
+ *
+ *   HONESTY ABOUT WHAT A VM CAN SHOW YOU: QEMU's e1000 model has no PHY power
+ *   state — it stores the power-down bit and keeps STATUS.LU set. So under
+ *   QEMU the *link bit* does not fall when you suspend, and this driver says
+ *   so in the log rather than claiming a transition it cannot observe. What is
+ *   real in both QEMU and silicon is the part that matters: with RCTL.EN and
+ *   TCTL.EN clear no frame can enter or leave, transmits time out instead of
+ *   completing, and e1000_link_up() reports down. On real hardware the PHY
+ *   power-down additionally drops the physical link.
+ */
 
 #include "e1000.h"
 #include "kernel.h"
@@ -17,7 +47,9 @@ static const driver_t e1000_driver;
 
 /* ---- e1000 register offsets ---- */
 #define REG_CTRL   0x0000
+#define REG_STATUS 0x0008
 #define REG_EERD   0x0014
+#define REG_MDIC   0x0020
 #define REG_ICR    0x00C0
 #define REG_IMC    0x00D8
 #define REG_RCTL   0x0100
@@ -40,6 +72,11 @@ static const driver_t e1000_driver;
 #define CTRL_SLU   (1u << 6)
 #define CTRL_ASDE  (1u << 5)
 
+#define STATUS_FD  (1u << 0)
+#define STATUS_LU  (1u << 1)
+#define STATUS_SPEED_SHIFT 6
+#define STATUS_SPEED_MASK  (3u << STATUS_SPEED_SHIFT)
+
 #define RCTL_EN    (1u << 1)
 #define RCTL_UPE   (1u << 3)
 #define RCTL_MPE   (1u << 4)
@@ -53,6 +90,34 @@ static const driver_t e1000_driver;
 #define TX_CMD_IFCS (1u << 1)
 #define TX_CMD_RS   (1u << 3)
 #define STAT_DD     (1u << 0)
+
+/* ---- MDIO (MDIC register) and the internal copper PHY ---- */
+#define MDIC_DATA_MASK 0x0000FFFFu
+#define MDIC_REG_SHIFT 16
+#define MDIC_PHY_SHIFT 21
+#define MDIC_OP_WRITE  (1u << 26)
+#define MDIC_OP_READ   (1u << 27)
+#define MDIC_READY     (1u << 28)
+#define MDIC_ERROR     (1u << 30)
+
+#define PHY_ADDR_INTERNAL 1          /* the 8254x's on-die PHY is address 1 */
+#define PHY_CTRL          0          /* MII control register              */
+#define PHY_CTRL_AUTONEG_EN (1u << 12)
+#define PHY_CTRL_POWER_DOWN (1u << 11)
+#define PHY_CTRL_RESTART_AN (1u << 9)
+
+/* Bounds. Every wait in this driver is bounded: a card that stops answering
+ * must cost milliseconds, not the machine. The two long ones are -D
+ * overridable so the host unit tests do not have to spend real seconds
+ * watching a simulated cable stay unplugged. */
+#define MDIC_POLL_MS   64      /* MDIO transaction: spec says ~64 us       */
+#define DMA_QUIESCE_MS 10      /* in-flight DMA drain after EN is cleared  */
+#ifndef LINK_WAIT_MS
+#define LINK_WAIT_MS   3000    /* copper auto-negotiation, generously      */
+#endif
+#ifndef TX_WAIT_MS
+#define TX_WAIT_MS     50      /* a gigabit frame retires in microseconds  */
+#endif
 
 #define NUM_RX 32
 #define NUM_TX 8
@@ -79,9 +144,12 @@ struct tx_desc {
 
 static volatile uint8_t *mmio;
 static uint8_t mac[6];
+static int suspended;
 
-static struct rx_desc rx_ring[NUM_RX] __attribute__((aligned(16)));
-static struct tx_desc tx_ring[NUM_TX] __attribute__((aligned(16)));
+/* The card writes the status bytes of these descriptors by DMA behind the
+ * compiler's back, so every read of them has to actually happen. */
+static volatile struct rx_desc rx_ring[NUM_RX] __attribute__((aligned(16)));
+static volatile struct tx_desc tx_ring[NUM_TX] __attribute__((aligned(16)));
 static uint8_t rx_buf[NUM_RX][BUF_SZ] __attribute__((aligned(16)));
 static uint8_t tx_buf[NUM_TX][BUF_SZ] __attribute__((aligned(16)));
 static int rx_cur, tx_cur;
@@ -94,6 +162,116 @@ static int find_e1000(pci_dev_t *out) {
     for (unsigned i = 0; i < sizeof ids / sizeof ids[0]; i++)
         if (pci_find_vendor(0x8086, ids[i], out)) return 1;
     return 0;
+}
+
+/* ====================================================================== */
+/* MDIO — talking to the PHY through the MAC's MDIC register              */
+/* ====================================================================== */
+
+/* Wait for the MAC to finish an MDIO transaction. Returns 0 and the completed
+ * MDIC value, or -1 on error/timeout. */
+static int mdic_wait(uint32_t *out) {
+    /* The manual puts an MDIO transaction at roughly 64 us, so spin on the
+     * ready bit first — an MMIO read is itself microseconds across a real PCI
+     * bus — and only fall back to millisecond sleeps for a card that is not
+     * answering at all. Either way this returns. */
+    for (unsigned ms = 0; ms <= MDIC_POLL_MS; ms++) {
+        for (unsigned spin = 0; spin < 256; spin++) {
+            uint32_t v = reg_read(REG_MDIC);
+            if (v & MDIC_ERROR) return -1;
+            if (v & MDIC_READY) { if (out) *out = v; return 0; }
+        }
+        mdelay(1);
+    }
+    return -1;
+}
+
+static int phy_read(uint8_t reg, uint16_t *val) {
+    reg_write(REG_MDIC, MDIC_OP_READ
+                        | ((uint32_t)PHY_ADDR_INTERNAL << MDIC_PHY_SHIFT)
+                        | ((uint32_t)reg << MDIC_REG_SHIFT));
+    uint32_t v = 0;
+    if (mdic_wait(&v) != 0) return -1;
+    *val = (uint16_t)(v & MDIC_DATA_MASK);
+    return 0;
+}
+
+static int phy_write(uint8_t reg, uint16_t val) {
+    reg_write(REG_MDIC, MDIC_OP_WRITE
+                        | ((uint32_t)PHY_ADDR_INTERNAL << MDIC_PHY_SHIFT)
+                        | ((uint32_t)reg << MDIC_REG_SHIFT)
+                        | (uint32_t)val);
+    return mdic_wait(0);
+}
+
+/* Set or clear the PHY's power-down bit. Returns 0 if the PHY answered.
+ * A card whose PHY does not answer MDIO is still fully quiesced by the RCTL/
+ * TCTL half of suspend; we report the failure instead of pretending. */
+static int phy_set_powered(int on) {
+    uint16_t ctrl;
+    if (phy_read(PHY_CTRL, &ctrl) != 0) return -1;
+    if (on) {
+        ctrl = (uint16_t)(ctrl & ~PHY_CTRL_POWER_DOWN);
+        ctrl = (uint16_t)(ctrl | PHY_CTRL_AUTONEG_EN | PHY_CTRL_RESTART_AN);
+    } else {
+        ctrl = (uint16_t)(ctrl | PHY_CTRL_POWER_DOWN);
+    }
+    return phy_write(PHY_CTRL, ctrl);
+}
+
+/* ====================================================================== */
+/* bring-up — shared by init() and resume() so they cannot drift          */
+/* ====================================================================== */
+
+static void hw_bring_up(void) {
+    /* Interrupts stay masked for the life of the driver: everything is polled
+     * and IF is 0. Clear any cause the card latched while it was down. */
+    reg_write(REG_IMC, 0xFFFFFFFF);
+    (void)reg_read(REG_ICR);
+
+    /* Ask the MAC to consider the link up and to auto-detect speed/duplex. */
+    reg_write(REG_CTRL, reg_read(REG_CTRL) | CTRL_SLU | CTRL_ASDE);
+
+    /* Program our unicast filter from the address we saved at init, with
+     * AV (address valid) set. Deterministic: never re-derived from whatever
+     * the registers happen to hold after a power transition. */
+    uint32_t ral = (uint32_t)mac[0] | ((uint32_t)mac[1] << 8)
+                 | ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
+    uint32_t rah = (uint32_t)mac[4] | ((uint32_t)mac[5] << 8);
+    reg_write(REG_RAL, ral);
+    reg_write(REG_RAH, rah | (1u << 31));
+
+    /* Clear the multicast table. */
+    for (int i = 0; i < 128; i++) reg_write(REG_MTA + i * 4, 0);
+
+    /* RX ring. */
+    for (int i = 0; i < NUM_RX; i++) {
+        rx_ring[i].addr = (uint64_t)(uintptr_t)rx_buf[i];
+        rx_ring[i].status = 0;
+    }
+    reg_write(REG_RDBAL, (uint32_t)(uintptr_t)rx_ring);
+    reg_write(REG_RDBAH, (uint32_t)((uint64_t)(uintptr_t)rx_ring >> 32));
+    reg_write(REG_RDLEN, NUM_RX * sizeof(struct rx_desc));
+    reg_write(REG_RDH, 0);
+    reg_write(REG_RDT, NUM_RX - 1);
+    rx_cur = 0;
+    reg_write(REG_RCTL, RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC);
+
+    /* TX ring. Re-basing it and zeroing head/tail is what makes a resume safe:
+     * anything the card had queued before the suspend is dropped, not sent. */
+    for (int i = 0; i < NUM_TX; i++) {
+        tx_ring[i].addr = (uint64_t)(uintptr_t)tx_buf[i];
+        tx_ring[i].status = STAT_DD;   /* mark free */
+        tx_ring[i].cmd = 0;
+    }
+    reg_write(REG_TDBAL, (uint32_t)(uintptr_t)tx_ring);
+    reg_write(REG_TDBAH, (uint32_t)((uint64_t)(uintptr_t)tx_ring >> 32));
+    reg_write(REG_TDLEN, NUM_TX * sizeof(struct tx_desc));
+    reg_write(REG_TDH, 0);
+    reg_write(REG_TDT, 0);
+    tx_cur = 0;
+    reg_write(REG_TIPG, 0x0060200A);
+    reg_write(REG_TCTL, TCTL_EN | TCTL_PSP | (0x0F << 4) | (0x40 << 12));
 }
 
 int e1000_init(void) {
@@ -112,49 +290,15 @@ int e1000_init(void) {
     reg_write(REG_IMC, 0xFFFFFFFF);   /* mask all interrupts; we poll */
     reg_read(REG_ICR);
 
-    /* Read the MAC from the receive-address registers. */
+    /* Read the MAC from the receive-address registers, once. Every later
+     * bring-up programs this saved copy back. */
     uint32_t ral = reg_read(REG_RAL);
     uint32_t rah = reg_read(REG_RAH);
     mac[0] = ral; mac[1] = ral >> 8; mac[2] = ral >> 16; mac[3] = ral >> 24;
     mac[4] = rah; mac[5] = rah >> 8;
 
-    /* Bring the link up. */
-    reg_write(REG_CTRL, reg_read(REG_CTRL) | CTRL_SLU | CTRL_ASDE);
-
-    /* Make sure our unicast filter is programmed (AV = address valid). */
-    reg_write(REG_RAL, ral);
-    reg_write(REG_RAH, (rah & 0xFFFF) | (1u << 31));
-
-    /* Clear the multicast table. */
-    for (int i = 0; i < 128; i++) reg_write(REG_MTA + i * 4, 0);
-
-    /* RX ring. */
-    for (int i = 0; i < NUM_RX; i++) {
-        rx_ring[i].addr = (uint64_t)(uintptr_t)rx_buf[i];
-        rx_ring[i].status = 0;
-    }
-    reg_write(REG_RDBAL, (uint32_t)(uintptr_t)rx_ring);
-    reg_write(REG_RDBAH, (uint32_t)((uint64_t)(uintptr_t)rx_ring >> 32));
-    reg_write(REG_RDLEN, NUM_RX * sizeof(struct rx_desc));
-    reg_write(REG_RDH, 0);
-    reg_write(REG_RDT, NUM_RX - 1);
-    rx_cur = 0;
-    reg_write(REG_RCTL, RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC);
-
-    /* TX ring. */
-    for (int i = 0; i < NUM_TX; i++) {
-        tx_ring[i].addr = (uint64_t)(uintptr_t)tx_buf[i];
-        tx_ring[i].status = STAT_DD;   /* mark free */
-        tx_ring[i].cmd = 0;
-    }
-    reg_write(REG_TDBAL, (uint32_t)(uintptr_t)tx_ring);
-    reg_write(REG_TDBAH, (uint32_t)((uint64_t)(uintptr_t)tx_ring >> 32));
-    reg_write(REG_TDLEN, NUM_TX * sizeof(struct tx_desc));
-    reg_write(REG_TDH, 0);
-    reg_write(REG_TDT, 0);
-    tx_cur = 0;
-    reg_write(REG_TIPG, 0x0060200A);
-    reg_write(REG_TCTL, TCTL_EN | TCTL_PSP | (0x0F << 4) | (0x40 << 12));
+    suspended = 0;
+    hw_bring_up();
 
     device_t *d = device_create("eth0", DEV_CLASS_NETWORK);
     device_add_resource(d, RES_MMIO, bar0, 0x20000);
@@ -168,8 +312,15 @@ void e1000_get_mac(uint8_t out[6]) {
     memcpy(out, mac, 6);
 }
 
+int e1000_link_up(void) {
+    if (!mmio || suspended) return 0;
+    return (reg_read(REG_STATUS) & STATUS_LU) ? 1 : 0;
+}
+
+int e1000_is_suspended(void) { return suspended; }
+
 int e1000_send(const void *data, uint16_t len) {
-    if (len > BUF_SZ) return -1;
+    if (!mmio || len > BUF_SZ) return -1;
     int idx = tx_cur;
     memcpy(tx_buf[idx], data, len);
     tx_ring[idx].length = len;
@@ -179,18 +330,24 @@ int e1000_send(const void *data, uint16_t len) {
     tx_cur = (idx + 1) % NUM_TX;
     reg_write(REG_TDT, tx_cur);
 
-    /* Wait for the descriptor-done bit (bounded so we never hang forever). */
-    for (uint64_t spin = 0; spin < 100000000ULL; spin++) {
+    /* Wait for the descriptor-done bit. Bounded in *time*, not in spins: while
+     * the card is suspended TCTL.EN is clear, the engine never touches the
+     * descriptor, and this is the path that has to give up quickly and let the
+     * stack report a dead link rather than wedge the machine. */
+    uint64_t deadline = millis() + TX_WAIT_MS;
+    do {
         if (tx_ring[idx].status & STAT_DD) return 0;
-    }
+    } while (millis() < deadline);
     return -1;
 }
 
 int e1000_receive(void *buf, uint16_t *len) {
+    if (!mmio) return 0;
     int idx = rx_cur;
     if (!(rx_ring[idx].status & STAT_DD)) return 0;
 
     uint16_t l = rx_ring[idx].length;
+    if (l > BUF_SZ) l = BUF_SZ;         /* a lying descriptor cannot overrun */
     memcpy(buf, rx_buf[idx], l);
     *len = l;
 
@@ -200,10 +357,119 @@ int e1000_receive(void *buf, uint16_t *len) {
     return 1;
 }
 
+/* ====================================================================== */
+/* power lifecycle                                                        */
+/* ====================================================================== */
+
+static void report_link(const char *what, uint32_t status) {
+    static const char *speed[4] = {"10", "100", "1000", "1000"};
+    kprintf("e1000: %s: status=0x%08x link=%s", what, (unsigned)status,
+            (status & STATUS_LU) ? "up" : "down");
+    if (status & STATUS_LU)
+        kprintf(" %s Mb/s %s-duplex",
+                speed[(status & STATUS_SPEED_MASK) >> STATUS_SPEED_SHIFT],
+                (status & STATUS_FD) ? "full" : "half");
+    kputs("\n");
+}
+
+static int e1000_suspend(device_t *d) {
+    (void)d;
+    if (!mmio) return -1;
+    if (suspended) return 0;                 /* already down; nothing to do */
+
+    uint32_t before = reg_read(REG_STATUS);
+
+    /* 1. No interrupt source may fire while the engines come down. */
+    reg_write(REG_IMC, 0xFFFFFFFF);
+    (void)reg_read(REG_ICR);
+
+    /* 2. Stop the receiver and the transmitter. From here the card fetches no
+     *    descriptors and writes nothing into kernel memory. */
+    reg_write(REG_RCTL, reg_read(REG_RCTL) & ~RCTL_EN);
+    reg_write(REG_TCTL, reg_read(REG_TCTL) & ~TCTL_EN);
+
+    /* 3. Let anything already in flight retire before we call the rings ours. */
+    mdelay(DMA_QUIESCE_MS);
+
+    /* 4. Drop the link: power the PHY down and stop forcing link-up. */
+    int phy = phy_set_powered(0);
+    reg_write(REG_CTRL, reg_read(REG_CTRL) & ~(CTRL_SLU | CTRL_ASDE));
+    mdelay(1);
+
+    suspended = 1;
+
+    uint32_t rctl = reg_read(REG_RCTL), tctl = reg_read(REG_TCTL);
+    uint32_t after = reg_read(REG_STATUS);
+    kprintf("e1000: suspend: rctl=0x%08x tctl=0x%08x (rx=%s tx=%s) phy=%s\n",
+            (unsigned)rctl, (unsigned)tctl,
+            (rctl & RCTL_EN) ? "ON" : "off", (tctl & TCTL_EN) ? "ON" : "off",
+            phy == 0 ? "powered down" : "no MDIO response");
+    report_link("suspend", after);
+    if ((before & STATUS_LU) && (after & STATUS_LU))
+        kputs("e1000: suspend: STATUS.LU still set - this platform does not "
+              "model PHY power state; the engines are off, so no frame can "
+              "enter or leave regardless\n");
+
+    /* A suspend that left an engine running would be a lie the tool layer
+     * would happily repeat, so fail the hook instead. */
+    if ((rctl & RCTL_EN) || (tctl & TCTL_EN)) {
+        suspended = 0;
+        return -1;
+    }
+    return 0;
+}
+
+static int e1000_resume(device_t *d) {
+    (void)d;
+    if (!mmio) return -1;
+    if (!suspended) return 0;
+
+    /* Power the PHY back up and restart auto-negotiation, then re-run the
+     * exact bring-up init() used. The STATUS read below is taken the instant
+     * the PHY write lands: a card that really renegotiates reports the link
+     * *down* here and back up a few hundred milliseconds later, which is the
+     * one link transition this driver can prove from register reads alone. */
+    int phy = phy_set_powered(1);
+    report_link("resume: renegotiating", reg_read(REG_STATUS));
+    hw_bring_up();
+    suspended = 0;
+
+    /* Bounded wait for the link. Copper auto-negotiation takes ~0.5 s under
+     * QEMU and a couple of seconds on real cable; not getting there is worth
+     * saying out loud but is not a failed resume — the engines are running. */
+    uint64_t t0 = millis(), deadline = t0 + LINK_WAIT_MS;
+    uint32_t status;
+    for (;;) {
+        status = reg_read(REG_STATUS);
+        if (status & STATUS_LU) break;
+        if (millis() >= deadline) break;
+    }
+    uint32_t waited = (uint32_t)(millis() - t0);
+
+    uint32_t rctl = reg_read(REG_RCTL), tctl = reg_read(REG_TCTL);
+    kprintf("e1000: resume: rctl=0x%08x tctl=0x%08x (rx=%s tx=%s) phy=%s "
+            "link settled in %u ms\n",
+            (unsigned)rctl, (unsigned)tctl,
+            (rctl & RCTL_EN) ? "on" : "OFF", (tctl & TCTL_EN) ? "on" : "OFF",
+            phy == 0 ? "powered up" : "no MDIO response", (unsigned)waited);
+    report_link("resume", status);
+    if (!(status & STATUS_LU))
+        kputs("e1000: resume: link did not come back within the timeout - "
+              "check the cable\n");
+
+    if (!(rctl & RCTL_EN) || !(tctl & TCTL_EN)) {
+        suspended = 1;
+        return -1;
+    }
+    return 0;
+}
+
 static const driver_t e1000_driver = {
     .name = "e1000",
     .level = DRV_LEVEL_DEVICE,
     .cls = DEV_CLASS_NETWORK,
     .init = e1000_init,
+    .suspend = e1000_suspend,
+    .resume = e1000_resume,
 };
 REGISTER_DRIVER(e1000_driver);

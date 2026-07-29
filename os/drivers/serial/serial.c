@@ -1,9 +1,14 @@
-/* serial.c — COM1 16550 UART, used as the kernel debug console.
+/* serial.c — COM1 16550 UART: the kernel debug console, and an input line.
  *
  * Once we switch the display into a graphics framebuffer the VGA text buffer is
  * no longer visible, so kprintf output is routed here (base.c calls the weak
  * serial_emit, which this driver overrides). QEMU forwards COM1 to a file/stdio
- * with -serial, giving us a verifiable boot log. */
+ * with -serial, giving us a verifiable boot log.
+ *
+ * The line also runs the other way. Receive is polled (no IDT exists, so no IRQ
+ * 4 handler): serial_getc_nb() reads the Line Status Register's Data Ready bit
+ * and pulls a byte if one is there. drivers/input/serial_input.c wraps that as
+ * an input_source_t, which is how a headless test pipes a question in. */
 
 #include "serial.h"
 #include "driver.h"
@@ -12,13 +17,24 @@
 
 #define COM1 0x3F8
 
+/* Register offsets from COM1. */
+#define UART_RBR 0   /* receive buffer (read)                */
+#define UART_IER 1   /* interrupt enable                     */
+#define UART_FCR 2   /* FIFO control (write)                 */
+#define UART_LCR 3   /* line control                         */
+#define UART_MCR 4   /* modem control                        */
+#define UART_LSR 5   /* line status                          */
+
+#define LSR_DR   0x01   /* data ready: a received byte is waiting */
+#define LSR_THRE 0x20   /* transmit holding register empty        */
+
 static const driver_t serial_driver;   /* forward decl for device binding */
 
 void serial_putc(char c) {
-    while (!(inb(COM1 + 5) & 0x20)) { }   /* wait for THR empty */
-    if (c == '\n') {                      /* CRLF for terminals */
+    while (!(inb(COM1 + UART_LSR) & LSR_THRE)) { }   /* wait for THR empty */
+    if (c == '\n') {                                 /* CRLF for terminals */
         outb(COM1, '\r');
-        while (!(inb(COM1 + 5) & 0x20)) { }
+        while (!(inb(COM1 + UART_LSR) & LSR_THRE)) { }
     }
     outb(COM1, (uint8_t)c);
 }
@@ -27,19 +43,54 @@ void serial_write(const char *s) {
     while (*s) serial_putc(*s++);
 }
 
+/* Bytes rescued from the receiver during bring-up, before FCR was touched — see
+ * serial_init(). Handed out first so the received stream stays in order. */
+#define RX_STASH_MAX 16
+static uint8_t rx_stash[RX_STASH_MAX];
+static uint8_t rx_stash_len, rx_stash_pos;
+
+int serial_rx_ready(void) {
+    if (rx_stash_pos < rx_stash_len) return 1;
+    return (inb(COM1 + UART_LSR) & LSR_DR) != 0;
+}
+
+int serial_getc_nb(void) {
+    if (rx_stash_pos < rx_stash_len) return rx_stash[rx_stash_pos++];
+    if (!(inb(COM1 + UART_LSR) & LSR_DR)) return -1;
+    return (int)inb(COM1 + UART_RBR);
+}
+
 /* Override base.c's weak no-op so kprintf reaches the serial line. */
 void serial_emit(char c) {
     serial_putc(c);
 }
 
 static int serial_init(void) {
-    outb(COM1 + 1, 0x00);   /* disable interrupts */
-    outb(COM1 + 3, 0x80);   /* DLAB on */
-    outb(COM1 + 0, 0x01);   /* divisor 1 => 115200 baud (lo) */
-    outb(COM1 + 1, 0x00);   /* (hi) */
-    outb(COM1 + 3, 0x03);   /* 8 bits, no parity, 1 stop; DLAB off */
-    outb(COM1 + 2, 0xC7);   /* enable+clear FIFO, 14-byte threshold */
-    outb(COM1 + 4, 0x0B);   /* DTR/RTS/OUT2 */
+    outb(COM1 + UART_IER, 0x00);   /* no interrupts: we poll both directions */
+    outb(COM1 + UART_LCR, 0x80);   /* DLAB on */
+    outb(COM1 + 0,        0x01);   /* divisor 1 => 115200 baud (lo) */
+    outb(COM1 + 1,        0x00);   /* (hi) */
+    outb(COM1 + UART_LCR, 0x03);   /* 8 bits, no parity, 1 stop; DLAB off */
+    /* Rescue anything already sitting in the receiver before we touch FCR: a
+     * test pipes its question into `-serial stdio` before the guest has run an
+     * instruction, and any FIFO-enable transition resets the receiver and throws
+     * those bytes away. serial_getc_nb() replays the stash ahead of the port, so
+     * the stream stays in order. Costs nothing when there is nothing to rescue. */
+    while ((inb(COM1 + UART_LSR) & LSR_DR) && rx_stash_len < RX_STASH_MAX)
+        rx_stash[rx_stash_len++] = inb(COM1 + UART_RBR);
+
+    /* FIFOs off, deliberately.
+     *
+     * A 16-byte receive FIFO only helps a driver that can fall behind by up to
+     * 16 characters and then catch up — i.e. an interrupt-driven one. We poll,
+     * and boot spends seconds inside DNS and the TLS handshake without polling
+     * at all, so 16 bytes of slack changes nothing. What it does change is
+     * correctness: with the FIFO disabled the far end is only allowed to hand us
+     * a byte once we have consumed the previous one, which makes a piped or
+     * pasted line lossless no matter how long the kernel is busy. Measured
+     * boot-to-prompt is identical either way, so this is free. */
+    outb(COM1 + UART_FCR, 0x00);
+    outb(COM1 + UART_MCR, 0x0B);   /* DTR/RTS/OUT2 */
     serial_write("serial: COM1 up @ 115200\n");
 
     device_t *d = device_create("serial0", DEV_CLASS_SERIAL);

@@ -11,6 +11,14 @@ void kputc(char c);
 void kputs(const char *s);
 void kprintf(const char *fmt, ...);   /* supports %s %c %d %u %x %p %% */
 
+/* Read-only view of the console's own cells, geometry and cursor. Exists so a
+ * tool that paints the framebuffer (tools/screen_tools.c) shares one definition
+ * of where the screen is and where output goes next, instead of duplicating
+ * 0xB8000 and 80x25. Writing through console_fb() does not move the cursor. */
+volatile uint16_t *console_fb(void);
+void console_geometry(int *rows, int *cols);
+void console_cursor(int *row, int *col);
+
 /* ---- Freestanding string/memory ---- */
 void  *memcpy(void *dst, const void *src, size_t n);
 void  *memset(void *dst, int c, size_t n);

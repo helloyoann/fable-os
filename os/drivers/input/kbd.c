@@ -4,9 +4,15 @@
  * so busy-polling the controller's status/data ports is enough and keeps the
  * kernel free of an IDT. Make codes (key down) are < 0x80; break codes (key up)
  * have bit 7 set. We track Shift for the upper-case / symbol layer and ignore
- * everything else (Ctrl, Alt, function keys, the keypad). */
+ * everything else (Ctrl, Alt, function keys, the keypad).
+ *
+ * This driver's only job is scancode -> ASCII. Line assembly (echo, backspace,
+ * line endings, overflow) used to live here; it now lives in drivers/input/
+ * input.c behind input_source_t, shared with the serial and scripted sources.
+ * The keyboard just registers itself as one more source. */
 
 #include "kbd.h"
+#include "input.h"
 #include "driver.h"
 #include "device.h"
 #include "kernel.h"
@@ -41,12 +47,10 @@ static const char map_upper[0x40] = {
 
 static int shift_down;
 
-char kbd_getchar(void) {
-    for (;;) {
-        if (!(inb(PS2_STATUS) & PS2_OBF)) {
-            __asm__ volatile("pause");
-            continue;
-        }
+/* Drain the controller until it yields a printable/edit character, or run out
+ * of pending bytes. Never blocks — this is the input_source_t contract. */
+int kbd_getchar_nb(void) {
+    while (inb(PS2_STATUS) & PS2_OBF) {
         uint8_t sc = inb(PS2_DATA);
 
         if (sc & 0x80) {                       /* break (key release) */
@@ -58,27 +62,43 @@ char kbd_getchar(void) {
         if (sc >= 0x40) continue;              /* outside our table */
 
         char c = shift_down ? map_upper[sc] : map_lower[sc];
-        if (c) return c;
+        if (c) return (int)(unsigned char)c;
+    }
+    return -1;
+}
+
+char kbd_getchar(void) {
+    for (;;) {
+        int c = kbd_getchar_nb();
+        if (c >= 0) return (char)c;
+        __asm__ volatile("pause");
     }
 }
 
+/* Keyboard-only line read. The general path is input_readline(), which reads
+ * from whichever source has input; this stays for a caller that specifically
+ * wants the local console and nothing else. Same editor, same behaviour. */
 int kbd_readline(char *buf, int cap) {
-    int len = 0;
-    for (;;) {
-        char c = kbd_getchar();
-        if (c == '\n') { kputc('\n'); break; }
-        if (c == '\b') {
-            if (len > 0) { len--; kputs("\b \b"); }   /* erase last char */
-            continue;
-        }
-        if (len < cap - 1) {
-            buf[len++] = c;
-            kputc(c);                          /* echo */
-        }
-    }
-    buf[len] = '\0';
-    return len;
+    input_line_t ed;
+    input_line_init(&ed, buf, cap, 1 /* echo */);
+    while (!input_line_push(&ed, kbd_getchar())) { }
+    return input_line_take(&ed, buf, cap);
 }
+
+/* ---- input_source_t adapter ---- */
+
+static int kbd_src_getc(input_source_t *self) {
+    (void)self;
+    int c = kbd_getchar_nb();
+    return (c < 0) ? INPUT_NONE : c;
+}
+
+static input_source_t kbd_src = {
+    .name    = "kbd",
+    .getc_nb = kbd_src_getc,
+    .priv    = NULL,
+    .flags   = INPUT_ECHO,
+};
 
 static void kbd_drain(void) {
     while (inb(PS2_STATUS) & PS2_OBF) (void)inb(PS2_DATA);
@@ -88,6 +108,7 @@ static const driver_t kbd_driver;
 
 static int kbd_init(void) {
     kbd_drain();                       /* clear any stale byte */
+    input_register_source(&kbd_src);
     kprintf("kbd: PS/2 keyboard ready\n");
 
     device_t *d = device_create("kbd0", DEV_CLASS_INPUT);

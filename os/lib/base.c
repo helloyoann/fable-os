@@ -112,6 +112,25 @@ void kputc(char c) {
 
 void kputs(const char *s) { while (*s) kputc(*s++); }
 
+/* ---- direct access to the console's cells, for tools that paint ----
+ * tools/screen_tools.c lets the model read the screen back and paint into it.
+ * Rather than have it duplicate 0xB8000 and 80x25 (which would silently rot the
+ * day this console changes), it asks here. The cursor accessor matters most: a
+ * painted region is transient precisely because THIS cursor decides where the
+ * next character lands and when scroll() fires, so a tool can only be honest
+ * about that if it can see the real value. All three are read-only. */
+volatile uint16_t *console_fb(void) { return VGA; }
+
+void console_geometry(int *rows, int *cols) {
+    if (rows) *rows = VGA_H;
+    if (cols) *cols = VGA_W;
+}
+
+void console_cursor(int *row, int *col) {
+    if (row) *row = cur_row;
+    if (col) *col = cur_col;
+}
+
 static void put_uint(uint64_t v, int base, int width, char pad) {
     char buf[32];
     int i = 0;

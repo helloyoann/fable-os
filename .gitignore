@@ -1,10 +1,36 @@
+# Secrets. The Anthropic API key is not read at runtime — the Makefile bakes it
+# into the kernel with -DTALKOS_API_KEY='"$(KEY)"'. So the key leaks from more
+# than the .env it is kept in:
+#
+#   .env           where the key is kept (os/.env, appliance/.env)
+#   .build-flags   the stamp that forces a rebuild when KEY changes. It records
+#                  the flag set verbatim, i.e. the literal `KEY=sk-ant-...`
+#
+# Every other artifact the key ends up inside (*.o, kernel.elf, kernel.bin,
+# talkos.iso, os/build/) is ignored under "Build artifacts" below.
+.env
+.env.*
+!.env.example
+.build-flags
+
 # Build artifacts
 *.o
 kernel.elf
 kernel.bin
 
+# Dependency files from the compiler's -MMD -MP, one per object
+*.d
+
+# Host test binaries from `make test-host`. Leading **/ because a pattern with a
+# slash in it is anchored to this file's directory, and the tree is os/tests/.
+**/tests/build/
+
 # Packet capture from `make run-pcap`
 net.pcap
+
+# Bootable media from `make iso` (a 4 MB ISO and its staging tree)
+talkos.iso
+os/build/
 
 # Scratch idea notes
 ideas/
@@ -14,7 +40,6 @@ ideas/
 
 # Appliance (Python)
 appliance/.venv/
-appliance/.env
 appliance/visual_check.png
 __pycache__/
 *.pyc

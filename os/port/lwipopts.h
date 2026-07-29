@@ -59,12 +59,37 @@
 /* Debugging off (we print our own progress). */
 #define LWIP_DEBUG                  0
 
-/* TLS via the altcp layer + mbedTLS port. Certificate verification is off
- * (VERIFY_NONE = 0): the kernel has no CA bundle or wall clock, so traffic is
- * encrypted but not authenticated. See README for the security caveat. */
+/* TLS via the altcp layer + mbedTLS port.
+ *
+ * ALTCP_MBEDTLS_AUTHMODE is handed straight to mbedtls_ssl_conf_authmode() by
+ * lwip/src/apps/altcp_tls/altcp_tls_mbedtls.c, and it is the switch that
+ * decides whether a failed chain verification aborts the handshake or is merely
+ * recorded and ignored:
+ *
+ *   0  MBEDTLS_SSL_VERIFY_NONE      certificate parsed, never trust-checked.
+ *                                   Encrypted, NOT authenticated: anything that
+ *                                   can answer on port 443 gets the session.
+ *   2  MBEDTLS_SSL_VERIFY_REQUIRED  chain must build to a trusted root, the
+ *                                   hostname must match, and the validity
+ *                                   period must contain "now", or the handshake
+ *                                   fails.
+ *
+ * (The literals are used rather than the mbedTLS names because this header is
+ * consumed by lwIP's own headers before any mbedTLS header is available.)
+ *
+ * Default is 0 — the historical behaviour, unchanged, because other work in
+ * this tree boots against it. `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS` selects
+ * 2, at which point net/net.c must also install the CA chain and the hostname;
+ * see include/tls_ca.h for the whole picture and for which roots are pinned.
+ * VERIFY_OPTIONAL (1) is deliberately not offered: it verifies and then
+ * continues anyway, which is the worst of both worlds. */
 #define LWIP_ALTCP                  1
 #define LWIP_ALTCP_TLS              1
 #define LWIP_ALTCP_TLS_MBEDTLS      1
+#ifdef TALKOS_VERIFY_CERTS
+#define ALTCP_MBEDTLS_AUTHMODE      2   /* MBEDTLS_SSL_VERIFY_REQUIRED */
+#else
 #define ALTCP_MBEDTLS_AUTHMODE      0   /* MBEDTLS_SSL_VERIFY_NONE */
+#endif
 
 #endif /* LWIPOPTS_H */

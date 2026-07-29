@@ -224,15 +224,31 @@ void *kmemalign(size_t align, size_t n) {
     for (block_t *b = heap_head; b; b = b->next) {
         if (!b->free) continue;
         uintptr_t pl = (uintptr_t)payload_of(b);
-        uintptr_t aligned = align_up(pl, align);
 
-        /* We need room to carve a fresh header at `aligned - HDR`, and that
-         * carved-off front must itself remain a valid free block. */
-        if (aligned != pl) aligned = align_up(pl + HDR, align);
-        size_t front_gap = aligned - HDR - pl;   /* becomes front free block */
-        if (aligned == pl) front_gap = 0;
+        /* Whether this block's payload is ALREADY aligned is a separate
+         * question from whether the front gap is empty, and conflating the two
+         * is how this used to hand back misaligned memory: when `pl + HDR`
+         * happened to be align-aligned the gap came out zero, the "no carving
+         * needed" branch fired, and `pl` — not `aligned` — was returned. Which
+         * of the two fired depended on the arena's link address, so it was
+         * invisible until something moved .bss. */
+        int       already = (pl & (uintptr_t)(align - 1)) == 0;
+        uintptr_t aligned;
+        size_t    front_gap;
 
-        if (front_gap != 0 && front_gap < MIN_PAYLOAD) continue;
+        if (already) {
+            aligned   = pl;
+            front_gap = 0;
+        } else {
+            /* Room for a fresh header at `aligned - HDR`, and the carved-off
+             * front must itself remain a valid free block — so it needs a
+             * payload of its own, not zero bytes. */
+            aligned = align_up(pl + HDR, align);
+            if (aligned - HDR == pl) aligned += align;
+            front_gap = aligned - HDR - pl;
+            if (front_gap < MIN_PAYLOAD) continue;
+        }
+
         if (aligned + n > (uintptr_t)payload_of(b) + b->size) continue;
 
         block_t *target;
