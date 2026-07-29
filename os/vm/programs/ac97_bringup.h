@@ -8,10 +8,10 @@
  *   which argument slot carries which value, what a descriptor entry looks
  *   like).
  *
- *   It exists to make the next phase's failures attributable. When a MODEL is
- *   asked to write an AC'97 driver in this ISA and the machine stays silent,
- *   the question "can the VM drive this hardware at all?" is already answered:
- *   this program does, at boot, on every machine that has the device.
+ *   It exists to make a MODEL's failures attributable. When a model is asked to
+ *   write an AC'97 driver in this ISA (tools/dvm_tools.c) and the machine stays
+ *   silent, the question "can the VM drive this hardware at all?" is already
+ *   answered: this program does, at boot, on every machine that has the device.
  *
  * RESPONSIBILITIES
  *   - Carry the program text (AC97_BRINGUP_SRC) with no lifetime or heap.
@@ -96,8 +96,11 @@
  * 32 entries max, 8 bytes each, 8-byte aligned. Word 0 is the buffer's
  * physical address; word 1 is the length in 16-BIT SAMPLES (not frames and not
  * bytes: a stereo frame is two samples) in bits 15:0, plus these flags. */
-#define AC97_BD_IOC         0x80000000u /* interrupt when this one is done */
-/* BUP, per the 82801AA datasheet, table "BD Control and Length": 0 = when this
+/* (The other flag, IOC in bit 31, raises an interrupt when a buffer completes.
+ * It is not defined here because it can never be used: every PIC line in this
+ * kernel is masked and IF stays 0, so the program polls PICB and DCH instead.)
+ *
+ * BUP, per the 82801AA datasheet, table "BD Control and Length": 0 = when this
  * buffer is complete and no next buffer is ready, keep transmitting the last
  * valid sample; 1 = if this is the last valid buffer, transmit zeros after it.
  * So it belongs on the final descriptor of a stream, which is what the caller

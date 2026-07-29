@@ -198,7 +198,7 @@
  * WHAT AWAITS A REAL API KEY
  *   Everything below is proven against net/model_mock.c and, on hardware,
  *   against a scripted transport compiled only into the fault-injection build.
- *   With TALKOS_API_KEY set and faultchat_bind(model_tls_transport()), the same
+ *   With a key supplied over fw_cfg and faultchat_bind(model_tls_transport()), the same
  *   code sends the same body to api.anthropic.com. What is NOT proven, and
  *   cannot be until a key exists: whether a real model reliably answers with a
  *   bare JSON object, and whether its proposed fixes are any good. The parser

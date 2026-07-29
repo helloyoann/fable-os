@@ -1,4 +1,11 @@
-/* ctype.h — freestanding shim for lwIP. */
+/* ctype.h — freestanding shim: what lwIP gets for <ctype.h>.
+ *
+ * lwIP leaves LWIP_NO_CTYPE_H at 0, so lwip/arch.h maps its lwip_isdigit() and
+ * friends onto these. The compiled set reaches isdigit/isxdigit/islower/isspace
+ * (core/ipv4/ip4_addr.c, ipaddr_aton) and tolower (core/dns.c). The remaining
+ * four complete the set arch.h maps, so enabling a vendored file that needs one
+ * — LWIP_IPV6 turns on core/ipv6/ip6_addr.c, which does — is a config change
+ * rather than a link error. Nothing outside lwIP includes this. */
 #ifndef PORT_CTYPE_H
 #define PORT_CTYPE_H
 

@@ -22,19 +22,3 @@ int32_t kobject_put(kobject_t *obj) {
     if (obj->refcount <= 0) panic("kobject_put: refcount underflow");
     return --obj->refcount;
 }
-
-const char *kobject_type_name(kobj_type_t type) {
-    switch (type) {
-        case KOBJ_DEVICE:        return "device";
-        case KOBJ_DRIVER:        return "driver";
-        case KOBJ_FILESYSTEM:    return "filesystem";
-        case KOBJ_MOUNT:         return "mount";
-        case KOBJ_FILE:          return "file";
-        case KOBJ_INODE:         return "inode";
-        case KOBJ_PROCESS:       return "process";
-        case KOBJ_THREAD:        return "thread";
-        case KOBJ_MEMORY_REGION: return "memory-region";
-        case KOBJ_SOCKET:        return "socket";
-        default:                 return "none";
-    }
-}

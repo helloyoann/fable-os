@@ -391,13 +391,19 @@ static void close_block(sse_msg_t *m) {
             break;
 
         case SSE_BLK_TOOL: {
-            /* The accumulated partial_json must be a complete JSON value or the
-             * request that echoes it back is invalid. Validate; substitute an
-             * empty object when it is not, which the tool reports as missing
-             * arguments — a legible error the model can recover from. */
+            /* The accumulated partial_json must be a complete JSON OBJECT or the
+             * request that echoes it back is invalid. Being parseable is not
+             * enough: fragments concatenating to `123` or `"oops"` parse fine and
+             * would emit "input":123, which chat.c then hands to tool_dispatch as
+             * an argument object. This module's contract is to produce a document
+             * indistinguishable from a non-streamed one, so the type is checked
+             * here rather than left to whatever the readers happen to reject.
+             * Substitute an empty object when it is not, which the tools report as
+             * missing arguments — a legible error the model can recover from. */
             json_value_t v;
             int ok = !m->tool_over && m->tool_len &&
-                     json_parse(m->tool, m->tool_len, &v) == JSON_OK;
+                     json_parse(m->tool, m->tool_len, &v) == JSON_OK &&
+                     v.type == JSON_OBJECT;
             if (m->frozen) break;                    /* freeze() closed it */
             if (ok && mneed(m, m->tool_len + 1)) {
                 json_put_n(&m->w, m->tool, m->tool_len);

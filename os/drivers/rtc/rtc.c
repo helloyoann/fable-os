@@ -275,9 +275,9 @@ static int decode_snapshot(const cmos_snapshot_t *s, rtc_time_t *out) {
      * otherwise fall back to the conventional two-digit pivot. Either way the
      * result is range-checked by rtc_time_valid() below. */
     int year;
-    if (cent >= 19 && cent <= 29 && yr2 <= 99) year = cent * 100 + yr2;
-    else if (yr2 < 70)                         year = 2000 + yr2;
-    else                                       year = 1900 + yr2;
+    if (cent >= 19 && cent <= 29) year = cent * 100 + yr2;   /* yr2 <= 99 above */
+    else if (yr2 < 70)            year = 2000 + yr2;
+    else                          year = 1900 + yr2;
 
     rtc_time_t t;
     t.year = year; t.month = mon; t.day = day;
@@ -326,7 +326,6 @@ static uint64_t now_ms(void) {
  * sweeps, which is once a second against a sweep that takes microseconds. */
 #define RTC_READ_PASSES 5
 
-static int g_available;
 static int64_t g_boot_unix = RTC_ENODEV;
 
 static int uip_clear(void) {
@@ -377,9 +376,7 @@ int rtc_read(rtc_time_t *out) {
          * have straddled a rollover: an update between them would have moved at
          * least the seconds register. */
         if (have_prev && snapshot_eq(&prev, &cur)) {
-            int rc = decode_snapshot(&cur, out);
-            if (rc == RTC_OK) g_available = 1;
-            return rc;
+            return decode_snapshot(&cur, out);
         }
         prev      = cur;
         have_prev = 1;
@@ -394,7 +391,6 @@ int64_t rtc_unix_now(void) {
     return rtc_to_unix(&t);
 }
 
-int rtc_available(void)      { return g_available; }
 int64_t rtc_unix_at_boot(void) { return g_boot_unix; }
 
 /* ====================================================================== */

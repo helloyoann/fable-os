@@ -5,6 +5,7 @@
 #include "kernel.h"
 
 static device_t *registry;       /* singly linked list of all devices */
+static device_t *registry_tail;  /* so registration is O(1)           */
 static int       registry_count;
 
 device_t *device_create(const char *name, device_class_t cls) {
@@ -27,15 +28,21 @@ int device_add_resource(device_t *d, device_res_type_t type,
 }
 
 void device_register(device_t *d) {
+    if (!d) return;
+
+    /* Genuinely idempotent, as device.h promises. The old version cleared
+     * d->next and then walked to the tail — which, for an already-registered
+     * device, IS d, so it linked d to itself and every later device_foreach()
+     * (the device_list/device_info tools, the boot-time device tree) spun
+     * forever. On a kernel with no scheduler that is a permanent hang. */
+    for (device_t *t = registry; t; t = t->next)
+        if (t == d) return;
+
     /* Append so enumeration order matches discovery order. */
     d->next = NULL;
-    if (!registry) {
-        registry = d;
-    } else {
-        device_t *t = registry;
-        while (t->next) t = t->next;
-        t->next = d;
-    }
+    if (registry_tail) registry_tail->next = d;
+    else               registry = d;
+    registry_tail = d;
     registry_count++;
 }
 
@@ -81,7 +88,6 @@ const char *device_state_name(device_state_t state) {
         case DEV_STATE_BOUND:      return "bound";
         case DEV_STATE_ACTIVE:     return "active";
         case DEV_STATE_SUSPENDED:  return "suspended";
-        case DEV_STATE_REMOVED:    return "removed";
         case DEV_STATE_FAILED:     return "failed";
         default:                   return "unknown";
     }

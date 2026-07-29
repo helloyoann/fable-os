@@ -443,12 +443,18 @@ int json_int(const json_value_t *v, int64_t *out) {
 
     if (p < end && *p == '-') { neg = 1; p++; }
 
+    /* The representable magnitude depends on the sign. Bounding both at INT64_MAX
+     * made -9223372036854775808 — a value that fits int64_t exactly — come back
+     * JSON_EINVAL, which the header documents as meaning overflow. INT64_MIN is
+     * not overflow, and it was the one int64 this parser could not express. */
+    const uint64_t limit = neg ? 0x8000000000000000ull : 0x7FFFFFFFFFFFFFFFull;
+
     uint64_t mag = 0;
     int      any = 0;
     for (; p < end && is_digit(*p); p++) {
-        if (mag > (uint64_t)0x7FFFFFFFFFFFFFFFull / 10u) return JSON_EINVAL;
+        if (mag > limit / 10u) return JSON_EINVAL;
         mag = mag * 10u + (uint64_t)(*p - '0');
-        if (mag > (uint64_t)0x7FFFFFFFFFFFFFFFull) return JSON_EINVAL;
+        if (mag > limit) return JSON_EINVAL;
         any = 1;
     }
     if (!any) return JSON_EINVAL;
@@ -459,7 +465,11 @@ int json_int(const json_value_t *v, int64_t *out) {
     }
     if (p < end) return JSON_EINVAL;          /* exponent (or junk): refuse */
 
-    *out = neg ? -(int64_t)mag : (int64_t)mag;
+    /* INT64_MIN spelled without ever forming +9223372036854775808 as an int64_t:
+     * casting 2^63 to a signed type is implementation-defined, and negating
+     * INT64_MAX+1 would be the overflow this function exists to report. */
+    if (neg) *out = (mag == 0x8000000000000000ull) ? INT64_MIN : -(int64_t)mag;
+    else     *out = (int64_t)mag;
     return JSON_OK;
 }
 

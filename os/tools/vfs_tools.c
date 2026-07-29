@@ -48,7 +48,19 @@
  *       make the kernel allocate more than that.
  *
  *   Every rejection becomes a sentence the model can read and act on next turn,
- *   plus an `-> EINVAL` trace line. Nothing here can panic on bad input.
+ *   plus an `-> EINVAL` trace line. No *argument* this file validates can panic
+ *   the machine.
+ *
+ *   ONE HONEST EXCEPTION, because it is not this file's to fix: read_file and
+ *   write_file kmalloc a staging buffer, and mm/heap.c's kmalloc does not return
+ *   NULL on exhaustion — it panics (`kmalloc: out of memory`), which halts the
+ *   machine with interrupts off and no way to say why. The `if (!buf)` ENOSPC
+ *   branches below are therefore UNREACHABLE today. They are kept rather than
+ *   deleted because they are the correct handling and become live the moment the
+ *   allocator learns to fail; what is wrong is the allocator's contract, not
+ *   these branches. Sizes here are bounded (VFST_WRITE_MAX, and a read buffer
+ *   sized from an already-clamped span) so the model cannot aim at this, but a
+ *   fragmented arena can still reach it.
  *
  * OUTPUT BOUNDS
  *   Results share one caller-owned buffer (TOOL_RESULT_MAX = 4096). read_file
@@ -310,9 +322,18 @@ static int arg_enum(const json_value_t *in, const char *key,
         char list[96];
         size_t o = 0;
         list[0] = '\0';
-        for (int i = 0; i < nopts && o + 1 < sizeof list; i++)
-            o += (size_t)snprintf(list + o, sizeof list - o, "%s\"%s\"",
-                                  i ? ", " : "", opts[i]);
+        for (int i = 0; i < nopts && o + 1 < sizeof list; i++) {
+            int n = snprintf(list + o, sizeof list - o, "%s\"%s\"",
+                             i ? ", " : "", opts[i]);
+            /* snprintf returns the length it WOULD have written, so `o` can
+             * overshoot the buffer on the last option that does not fit. The
+             * loop guard above already stops it being used as an offset again,
+             * but the bound belongs next to the arithmetic rather than one line
+             * up: keep it local so the next edit cannot separate them. */
+            if (n < 0) break;
+            o += (size_t)n;
+            if (o >= sizeof list) break;
+        }
         snprintf(err, errcap, "argument \"%s\" must be one of %s", key, list);
     }
     return -1;

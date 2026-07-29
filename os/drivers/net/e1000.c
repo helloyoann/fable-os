@@ -48,7 +48,6 @@ static const driver_t e1000_driver;
 /* ---- e1000 register offsets ---- */
 #define REG_CTRL   0x0000
 #define REG_STATUS 0x0008
-#define REG_EERD   0x0014
 #define REG_MDIC   0x0020
 #define REG_ICR    0x00C0
 #define REG_IMC    0x00D8
@@ -255,6 +254,16 @@ static void hw_bring_up(void) {
     reg_write(REG_RDH, 0);
     reg_write(REG_RDT, NUM_RX - 1);
     rx_cur = 0;
+    /* NOTE, and it contradicts the unicast filter programmed twenty lines up:
+     * RCTL_UPE|RCTL_MPE is full promiscuous mode, which bypasses the RAL/RAH
+     * filter and the (just-cleared) multicast table entirely and accepts every
+     * frame on the segment. Under QEMU user-mode networking nothing else is on
+     * the segment so it is invisible; on real hardware it means every frame on
+     * the wire is DMA'd into rx_buf and pushed through lwIP by the single
+     * threaded poll loop — wasted work and needless exposure. Nothing in net/
+     * asks for promiscuous mode. Dropping the two bits changes the RCTL value
+     * the boot log prints and the QEMU test cases assert, so it is left as a
+     * deliberate, documented decision to revisit rather than a silent one. */
     reg_write(REG_RCTL, RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_SECRC);
 
     /* TX ring. Re-basing it and zeroing head/tail is what makes a resume safe:
@@ -281,8 +290,25 @@ int e1000_init(void) {
         return -1;
     }
 
-    pci_enable_bus_master(&pdev);
+    /* Validate BAR0 before enabling bus mastering or touching a register.
+     * pci_bar() reports 0 unless BAR0 is an assigned 32-bit memory BAR, and 0
+     * must not be believed: a null MMIO base does NOT fault on this kernel (the
+     * low 4 GiB is mapped present+writable), so hw_bring_up() would happily
+     * write RCTL/TCTL/RDBAL/TDBAL and 128 multicast entries into physical
+     * 0x0000-0x5600, then publish eth0 as ACTIVE and report a phantom link read
+     * out of whatever lives at physical 0x8. The `if (!mmio)` guards in
+     * send/receive/link_up/suspend/resume all assume this check happened. */
     uint32_t bar0 = pci_bar(&pdev, 0);
+    if (!bar0) {
+        kprintf("e1000: %02x:%02x.%x BAR0 is not an assigned 32-bit memory BAR "
+                "(raw 0x%08x); not driving this card\n",
+                pdev.bus, pdev.dev, pdev.func,
+                (unsigned)pci_read32(&pdev, 0x10));
+        mmio = NULL;
+        return -1;
+    }
+
+    pci_enable_bus_master(&pdev);
     mmio = (volatile uint8_t *)(uintptr_t)bar0;
     kprintf("e1000: %02x:%02x.%x MMIO=%p\n", pdev.bus, pdev.dev, pdev.func,
             (void *)(uintptr_t)bar0);
@@ -320,8 +346,18 @@ int e1000_link_up(void) {
 int e1000_is_suspended(void) { return suspended; }
 
 int e1000_send(const void *data, uint16_t len) {
-    if (!mmio || len > BUF_SZ) return -1;
+    if (!mmio || !data || len == 0 || len > BUF_SZ) return -1;
+
+    /* Only claim a descriptor the card has finished with. hw_bring_up() marks
+     * every descriptor STAT_DD ("free") and the wait at the bottom of this
+     * function normally keeps that true — but only normally: on the timeout
+     * path below we have already advanced tx_cur and rung the doorbell, so
+     * after NUM_TX consecutive timeouts the tail would wrap past the head and
+     * overwrite descriptors that are still nominally queued. Reading the bit
+     * the free-list comment claims is the invariant makes it actually be one. */
     int idx = tx_cur;
+    if (!(tx_ring[idx].status & STAT_DD)) return -1;   /* TX ring still busy */
+
     memcpy(tx_buf[idx], data, len);
     tx_ring[idx].length = len;
     tx_ring[idx].cmd = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS;
@@ -362,7 +398,10 @@ int e1000_receive(void *buf, uint16_t *len) {
 /* ====================================================================== */
 
 static void report_link(const char *what, uint32_t status) {
-    static const char *speed[4] = {"10", "100", "1000", "1000"};
+    /* STATUS.SPEED encodings 00/01/10 are 10/100/1000 Mb/s; 11 is reserved, and
+     * is reported as "reserved" rather than guessed at — this driver's stated
+     * virtue is not claiming things it cannot observe. */
+    static const char *speed[4] = {"10", "100", "1000", "reserved"};
     kprintf("e1000: %s: status=0x%08x link=%s", what, (unsigned)status,
             (status & STATUS_LU) ? "up" : "down");
     if (status & STATUS_LU)
@@ -410,10 +449,20 @@ static int e1000_suspend(device_t *d) {
               "model PHY power state; the engines are off, so no frame can "
               "enter or leave regardless\n");
 
-    /* A suspend that left an engine running would be a lie the tool layer
-     * would happily repeat, so fail the hook instead. */
+    /* A suspend that left an engine running would be a lie the tool layer would
+     * happily repeat, so fail the hook instead — but fail it by ROLLING BACK,
+     * not by half-undoing. Clearing `suspended` on its own left the PHY powered
+     * down and CTRL.SLU/ASDE clear while reporting the device as not suspended:
+     * the driver manager then leaves it ACTIVE so device_resume() never calls
+     * e1000_resume() for it, and e1000_resume() would early-return anyway
+     * because `suspended` is 0. The result is a permanently dark link with no
+     * code path back short of a reboot. */
     if ((rctl & RCTL_EN) || (tctl & TCTL_EN)) {
+        kputs("e1000: suspend: an engine is still enabled - rolling back to "
+              "the running state\n");
         suspended = 0;
+        phy_set_powered(1);
+        hw_bring_up();
         return -1;
     }
     return 0;

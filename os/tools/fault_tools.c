@@ -87,6 +87,31 @@
  *   [0, 255], "error_code" may be a bounded hex/decimal string or a
  *   non-negative integer and defaults to 0. fault_recover validates every field
  *   twice: for shape here, and for effect inside the handler.
+ *
+ * OUTPUT BOUNDS — AND A KNOWN SHORTFALL, MEASURED, NOT GUESSED
+ *   These tools write into whatever buffer the caller supplies. Two different
+ *   numbers are in play and they do not agree:
+ *
+ *     TOOL_RESULT_MAX      4096   include/tool.h, the family's nominal budget,
+ *                                 and what FAULT_REPORT_MAX is sized against
+ *                                 (include/fault.h: "fits TOOL_RESULT_MAX")
+ *     CHAT_TOOL_RESULT_CAP 1024   include/chat.h — what net/chat.c ACTUALLY
+ *                                 passes for every tool call in production
+ *
+ *   The longest report this file can emit is 1629 bytes (measured, and printed
+ *   by tests/host/test_fault.c's "longest report:" line). So in the shipped
+ *   kernel a full fault_report is cut at 1023 bytes and tool_dispatch overwrites
+ *   the tail with its truncation notice — losing the end of the register block,
+ *   `code @RIP`, the backtrace and the disposition, which is most of the
+ *   diagnosis. fault_status after a fault is in the same position.
+ *
+ *   This is not fixed here because every available fix is a behaviour change or
+ *   sits in another owner's file: raise CHAT_TOOL_RESULT_CAP (include/chat.h),
+ *   or give fault_report an offset/lines argument the way read_file and
+ *   driver_trace already have. Note also that the host tests build their result
+ *   buffer from TOOL_RESULT_MAX, so they cannot see this — they measure a
+ *   machine that does not ship. Recorded so the next reader does not conclude
+ *   from FAULT_REPORT_MAX that the report fits.
  */
 
 #include "tool.h"

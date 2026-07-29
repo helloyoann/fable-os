@@ -2,10 +2,13 @@
  * screen.
  *
  * PURPOSE
- *   VGA text mode is 4000 bytes at physical 0xB8000: 80x25 cells, two bytes per
- *   cell (low = character, high = colour attribute). The kernel identity-maps the
- *   low 4 GiB, so those bytes are just memory. Two capabilities follow, and they
- *   are not symmetrical in interest:
+ *   The console is a grid of cells, two bytes each (low = a slot in the console
+ *   code page, high = a colour attribute). WHERE that grid lives and how big it is
+ *   depends on the display the machine came up with: a linear-framebuffer console
+ *   (lib/fb.c) keeps 128x48 cells in .bss and rasterises them, while the VGA text
+ *   fallback is 80x25 cells at physical 0xB8000. Nothing in this file hardcodes
+ *   either — base, rows and columns all come from lib/base.c at runtime. Two
+ *   capabilities follow, and they are not symmetrical in interest:
  *
  *   read_screen is the strange one. The console is the only place this machine's
  *   history exists — there is no shell, no dmesg, no log file, and the model's
@@ -69,10 +72,13 @@
  * ============================================================================
  * BOUNDS
  * ============================================================================
- *   Coordinates come from the model. The framebuffer ends at 0xB8000 + 80*25*2,
- *   there is no paging protection over it, and there is no IDT — a write past
- *   the end does not fault catchably, it lands in whatever is next (the VGA
- *   registers' shadow, then plain RAM) and the machine misbehaves or resets. So:
+ *   Coordinates come from the model. The cell grid ends at base + rows*cols*2 and
+ *   there is no paging protection over it, so a write past the end does not fault
+ *   at all — it lands in whatever is next (adjacent .bss on the framebuffer path,
+ *   the VGA registers' shadow and then plain RAM on the 0xB8000 path) and the
+ *   machine misbehaves. The IDT (arch/x86_64/idt.c) is no help
+ *   here: this range is mapped and writable, so there is no exception to catch.
+ *   Bounds are the only defence there is. So:
  *
  *   - row and col are rejected, not clamped, when out of range: a rejection
  *     names the geometry and the model fixes it next turn, whereas a clamp
@@ -116,7 +122,7 @@
  *   indistinguishable from a mistake). Nothing here allocates.
  *
  * HOST TESTABILITY
- *   A host process cannot write to 0xB8000. The framebuffer base, geometry and
+ *   A host process cannot write to a real console. The grid base, geometry and
  *   cursor are reached through three small accessors that, under TALKOS_HOSTTEST,
  *   resolve to values a test injects (screen_tools_set_framebuffer /
  *   screen_tools_set_cursor) instead of to lib/base.c. The bounds logic, the
@@ -550,7 +556,11 @@ static int t_read_screen(const tool_call_t *c, tool_result_t *r) {
     if (numbers) tool_result_printf(r, ", \"NN|\" prefix is the row number");
     tool_result_printf(r, "):\n");
 
-    int emitted = 0, stopped = 0;
+    /* -1, not 0: row 0 is a legal place to run out of room, and using 0 as the
+     * "did not stop" sentinel meant a buffer that filled on the very first row
+     * produced no resume hint and then fell through to the blank-tail branch,
+     * reporting rows as blank when they had merely never been rendered. */
+    int emitted = 0, stopped = -1;
     for (int y = (int)first; y <= lastnb; y++) {
         char line[GEOM_MAX_COLS + 1];
         int  n = 0;
@@ -571,7 +581,7 @@ static int t_read_screen(const tool_call_t *c, tool_result_t *r) {
         emitted++;
     }
 
-    if (stopped)
+    if (stopped >= 0)
         tool_result_printf(r,
             "[stopped at row %d: the result buffer is full. Call read_screen "
             "again with first_row=%d.]\n", stopped, stopped);
@@ -600,10 +610,14 @@ static const tool_t read_screen_tool = {
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
         "\"first_row\":{\"type\":\"integer\",\"description\":\"first row to read, "
-        "0 = the top line of the screen (default 0). The screen is 80x25, so rows "
-        "are 0-24.\"},"
+        "0 = the top line of the screen (default 0). This screen's size is NOT "
+        "fixed - it is 128x48 on a framebuffer and 80x25 on the VGA fallback. Call "
+        "screen_info for the real numbers, or omit both bounds to read all of "
+        "it.\"},"
         "\"last_row\":{\"type\":\"integer\",\"description\":\"last row to read, "
-        "inclusive (default 24, the bottom line - the most recent output).\"},"
+        "inclusive. Defaults to the BOTTOM row, which is the most recent output - "
+        "leave it out rather than guessing a number, because guessing 24 on a "
+        "48-row screen reads the oldest half.\"},"
         "\"line_numbers\":{\"type\":\"boolean\",\"description\":\"prefix each "
         "line with its row number as \\\"NN|\\\" (default true). Keep it on if you "
         "intend to paint at coordinates afterwards.\"}"
@@ -782,12 +796,15 @@ static const tool_t write_screen_tool = {
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
         "\"row\":{\"type\":\"integer\",\"description\":\"row to paint on, 0 = top "
-        "line, 24 = bottom line of the 80x25 screen.\"},"
+        "line. The bottom row is 47 on a framebuffer console and 24 on the VGA "
+        "fallback; screen_info reports which, and out-of-range is refused with the "
+        "real extents.\"},"
         "\"col\":{\"type\":\"integer\",\"description\":\"starting column, 0 = "
-        "leftmost, 79 = rightmost (default 0).\"},"
+        "leftmost (default 0). The rightmost is 127 on a framebuffer console and 79 "
+        "on the VGA fallback - ask screen_info.\"},"
         "\"text\":{\"type\":\"string\",\"description\":\"printable ASCII to paint "
-        "(0x20-0x7E). No newlines or tabs: one call paints one row. Anything past "
-        "column 79 is clipped.\"},"
+        "(0x20-0x7E). No newlines or tabs: one call paints one row. Anything past the "
+        "last column is clipped.\"},"
         "\"fg\":{\"type\":\"string\",\"description\":\"text colour, one of: black "
         "blue green cyan red magenta brown light_grey dark_grey light_blue "
         "light_green light_cyan light_red light_magenta yellow white (default "
@@ -797,7 +814,7 @@ static const tool_t write_screen_tool = {
         "light_grey (default black). Bright backgrounds are refused because that "
         "attribute bit is VGA's blink enable.\"},"
         "\"fill_row\":{\"type\":\"boolean\",\"description\":\"also paint the rest "
-        "of the row, from the end of the text to column 79, in the same colours. "
+        "of the row, from the end of the text to the last column, in the same colours. "
         "Use this for a status bar so the background runs edge to edge (default "
         "false).\"}"
         "},\"required\":[\"row\",\"text\"]}",

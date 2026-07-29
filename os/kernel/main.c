@@ -32,6 +32,7 @@
 #include "tool.h"
 #include "chat.h"
 #include "model.h"
+#include "gui.h"
 
 /* Exercise the VFS end-to-end: mount, mkdir, create/write/seek/read a file,
  * stat it, and list a directory. Proves the whole path without a disk. */
@@ -98,10 +99,16 @@ static void ready_banner(int net_up) {
 }
 
 /* Block for a line, but through the non-blocking poll so there is one obvious
- * place to service anything else the machine needs to do between sentences. */
+ * place to service anything else the machine needs to do between sentences.
+ *
+ * This is that place, and gui_tick() is the only other thing in it: the pointer,
+ * the windows and the repaint all happen here, between characters, on the same
+ * single thread. gui_tick() is bounded, never blocks, and returns immediately
+ * when no window is open — see the event-loop section of include/gui.h. */
 static int wait_for_sentence(char *buf, int cap) {
     if (input_source_count() == 0) return INPUT_NONE;
     for (;;) {
+        gui_tick();
         int n = input_poll(buf, cap);
         if (n != INPUT_NONE) return n;
         __asm__ volatile("pause");
@@ -112,7 +119,8 @@ void kernel_main(void) {
     console_init();
     idt_init();               /* before anything can fault: see include/idt.h */
     time_init();
-    drivers_init();           /* serial, pci, nic, keyboard */
+    drivers_init();           /* serial, pci, nic, keyboard, mouse */
+    gui_init();               /* window manager; no windows, so nothing drawn */
 
     /* Device model self-test: list the discovered device tree, then exercise
      * the driver power lifecycle (suspend everything capable, then resume). */
@@ -134,7 +142,7 @@ void kernel_main(void) {
         kputs("\n[net init failed - no actions possible until networking works]\n");
 
     /* Boot self-test: prove the HTTPS round-trip works without needing input.
-     * With no API key compiled in, Anthropic answers 401 — which still means
+     * With no API key supplied over fw_cfg, Anthropic answers 401 — which still means
      * the TLS handshake, request, and response all succeeded. */
     if (net_up) {
         kputs("\n--- self-test: HTTPS to api.anthropic.com ---\n");
@@ -156,7 +164,17 @@ void kernel_main(void) {
 
     static char line[INPUT_LINE_MAX];
     for (;;) {
-        kputs("\n> ");
+        /* The prompt states where the next line is going, because it is not
+         * always the model. A click on a text field borrows the keyboard for
+         * exactly one line — and gui_click_at() is reached by the model's
+         * gui_click tool as well as by a physical click, so the model can arm it
+         * without the operator asking. The one-line advisory printed at arm time
+         * scrolls away behind the rest of a turn; a prompt cannot. Without this,
+         * an operator types an instruction and it silently becomes the contents
+         * of a text box, with no shell to check with and nothing to tell them. */
+        const char *field = gui_key_target();
+        if (field) kprintf("\n[typing into \"%s\", not to the model] > ", field);
+        else       kputs("\n> ");
 
         int n = wait_for_sentence(line, sizeof line);
         if (n == INPUT_NONE) {
@@ -172,6 +190,32 @@ void kernel_main(void) {
                     "sentence could mean something you did not say; "
                     "say it again, shorter.]\n", n);
             continue;
+        }
+
+        /* A click on a text field in a window borrows the keyboard for exactly
+         * one line (include/gui.h, DECISION 3). If one is armed, this line was
+         * meant for that field and not for the model; the grab is consumed
+         * either way, so the prompt can never be captured for longer. After the
+         * truncation check, because a cut-off sentence is not what was typed and
+         * must be refused before anything consumes it. */
+        if (gui_take_line(line, n)) continue;
+
+        /* One re-resolve per sentence while the model is unreachable.
+         *
+         * net_init() resolves the API host exactly once, so a single lost DNS
+         * query at boot used to end the session: chat holds a NULL transport,
+         * every sentence is refused, and the operator cannot ask for a retry
+         * because asking is what needs the network. There is no shell to fall
+         * back to and no other way in. Retrying here is the whole remedy — it
+         * costs nothing when the network is up, and the attempt is bounded and
+         * announced so a machine with no NIC answers promptly instead of
+         * looking hung. Deliberately not a background timer: nothing else in
+         * this kernel runs on its own, and a retry is only useful at the moment
+         * somebody actually wants something done. */
+        if (!net_up && net_retry_resolve() == 0) {
+            net_up = 1;
+            chat_init(model_tls_transport());
+            kputs("[net recovered - the model is reachable again]\n");
         }
 
         chat_ask(line);

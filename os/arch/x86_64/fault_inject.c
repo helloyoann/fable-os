@@ -164,7 +164,7 @@ void fault_inject(fault_inject_kind_t kind) {
             fault_inject_name(kind));
     depth3(kind);
     /* Reached in exactly two cases, and the distinction is the whole point of
-     * Phase 3b: either the exception was a continuable trap (#BP), or it was a
+     * The recovery path: either the exception was a continuable trap (#BP), or it was a
      * real fault that a recovery plan resumed from. fault_last() knows which,
      * so say which — a log that called a recovered #PF "continuable" would
      * misrepresent the one thing this build exists to demonstrate. */
@@ -353,6 +353,12 @@ static int script_send(model_transport_t *t,
                        char *resp_buf, size_t resp_cap,
                        model_response_t *out) {
     (void)t;
+    /* model_transport_t promises nothing about the buffer, and `resp_cap - 1`
+     * below is a size_t: a zero cap would wrap it to SIZE_MAX and run the copy
+     * off the end of memory. Refuse instead, exactly as the real transport
+     * would. */
+    if (!resp_buf || resp_cap == 0 || !out) return MODEL_EINVAL;
+
     script_entries++;
 
     kprintf("[fault-diagnose] scripted transport entered (call %d), request is "

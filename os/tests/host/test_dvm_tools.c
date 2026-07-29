@@ -242,18 +242,12 @@ static const dvm_io_t tlk_io = {
 /* the module under test                                                  */
 /* ====================================================================== */
 
+/* REGISTER_TOOL collects pointers in a linker section; tooltable.h supplies the
+ * Mach-O spelling and its boundary symbols, so core/tool.c walks the same table
+ * the kernel's linker script builds. */
+#include "tooltable.h"
+
 #ifdef __APPLE__
-/* REGISTER_TOOL collects pointers in a linker section. Mach-O spells the
- * section and its bounds differently; same shim tests/host/test_chat.c uses, so
- * core/tool.c walks the same table the kernel's linker script builds. */
-__asm__(".globl ___start_tool_table\n"
-        ".set   ___start_tool_table, section$start$__DATA$tool_table\n"
-        ".globl ___stop_tool_table\n"
-        ".set   ___stop_tool_table, section$end$__DATA$tool_table\n");
-#  undef  REGISTER_TOOL
-#  define REGISTER_TOOL(v)                                                     \
-      static const tool_t *const __toolptr_##v                                 \
-          __attribute__((used, section("__DATA,tool_table"))) = &(v)
 /* Apple's <string.h> defines memcpy/memset/... as fortifying macros, which
  * collide with kernel.h's plain prototypes when both land in one TU. */
 #  undef memcpy
@@ -1402,10 +1396,10 @@ static void test_schema(void) {
            (unsigned)n, (unsigned)CHAT_TOOLS_BYTES);
 
     /* Only driver_run mutates the machine. */
-    CHECK_EQ((int)(tool_find("driver_run")->flags & TOOL_MUTATES), TOOL_MUTATES);
-    CHECK_EQ((int)tool_find("driver_targets")->flags, 0);
-    CHECK_EQ((int)tool_find("driver_assemble")->flags, 0);
-    CHECK_EQ((int)tool_find("driver_trace")->flags, 0);
+    CHECK_TOOL_FLAGS("driver_run", TOOL_MUTATES, TOOL_MUTATES);
+    CHECK_TOOL_FLAGS("driver_targets", ~0u, 0);
+    CHECK_TOOL_FLAGS("driver_assemble", ~0u, 0);
+    CHECK_TOOL_FLAGS("driver_trace", ~0u, 0);
 }
 
 /* ====================================================================== */

@@ -31,11 +31,15 @@
  * DECISION: mem_read (raw memory inspection) IS exposed. The safety argument.
  * ============================================================================
  *   The hazard is real and worth stating plainly: this kernel identity-maps the
- *   low 4 GiB with 2 MiB RWX pages (boot/boot.asm) and has NO IDT. A fault is
- *   not catchable — it triple-faults and resets the VM instantly. So a memory
- *   read driven by model-supplied numbers is the single most dangerous thing in
- *   this codebase, and "it is bounded" has to mean something stronger than a
- *   range check on a plausible-looking value.
+ *   low 4 GiB with 2 MiB RWX pages (boot/boot.asm), so there is no paging
+ *   protection to catch a bad address and a null dereference does not even
+ *   fault. There IS an IDT now (arch/x86_64/idt.c, 256 gates), so a fault in the
+ *   unmapped range is captured and reported rather than triple-faulting — but
+ *   that is a post-mortem, not a guard: it records the crash, it does not let
+ *   the read be retried. So a memory read driven by model-supplied numbers is
+ *   still the single most dangerous thing in this codebase, and "it is bounded"
+ *   has to mean something stronger than a range check on a plausible-looking
+ *   value.
  *
  *   It is exposed because the bound available here is not a heuristic, it is a
  *   static property of the link:
@@ -88,10 +92,11 @@
  *   demo of a debugger rather than one. The window was already the right answer
  *   for that phase, so there is no reason to defer it to that phase.
  *
- *   What is NOT exposed, and stays that way until there is an IDT: any write
- *   (mem_write/poke), any read outside the image window, and any dereference of
- *   a pointer the model supplies to another tool. mem_read is a read of known-
- *   backed RAM; those are not.
+ *   What is NOT exposed: any write (mem_write/poke), any read outside the image
+ *   window, and any dereference of a pointer the model supplies to another tool.
+ *   mem_read is a read of known-backed RAM; those are not. The IDT does not
+ *   change this — a captured fault is a record of the damage, not permission to
+ *   risk it, and a stray WRITE is not undone by having been reported.
  *
  * ============================================================================
  * DECISION: heap_check() panics on corruption. How that is handled.
@@ -394,10 +399,25 @@ static int t_heap_check(const tool_call_t *call, tool_result_t *r) {
     unsigned long blocks = (unsigned long)(s.used_blocks + s.free_blocks);
 
     /* Breadcrumb before the walk: if it panics, this is the only record of what
-     * the machine was doing when it died. */
-    kprintf("heap_check: walking %lu blocks of a %lu KiB arena "
+     * the machine was doing when it died.
+     *
+     * NOTE THE CONVERSIONS. This is kprintf() from lib/base.c, whose grammar is
+     * "%s %c %d %u %x %p %%" and NOTHING ELSE (see include/kernel.h). It has no
+     * 'l' length modifier: on an unrecognised conversion it prints '%' plus the
+     * offending character and DOES NOT CONSUME THE VARARG, so "%lu" emits the
+     * literal text "%lu" and shifts every later argument by one. This line used
+     * to say "%lu" and printed its own format string on real hardware for
+     * exactly that reason - a post-mortem breadcrumb that carried no data.
+     *
+     * The trap is that the OTHER formatter in this kernel, lib/libc_shim.c's
+     * vsnprintf (reached via snprintf and tool_result_printf), DOES handle 'l'.
+     * The same format string is therefore correct three lines away and silently
+     * wrong here. Do not use %l in a kprintf; cast to unsigned instead. Both
+     * values are small enough that the cast cannot lose anything: the arena is
+     * 16 MiB and a block count cannot exceed it. */
+    kprintf("heap_check: walking %u blocks of a %u KiB arena "
             "(panics and halts if corrupt)\n",
-            blocks, (unsigned long)(s.arena_size / 1024));
+            (unsigned)blocks, (unsigned)(s.arena_size / 1024));
 
     int rc = heap_check();          /* panics — does not return — if corrupt */
 

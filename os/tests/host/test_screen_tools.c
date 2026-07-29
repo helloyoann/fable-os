@@ -187,9 +187,9 @@ static void test_tools_are_registered(void) {
         CHECK(t->invoke != NULL);
     }
     /* Painting really changes machine state; reading does not. */
-    CHECK_EQ(tool_find("write_screen")->flags & TOOL_MUTATES, TOOL_MUTATES);
-    CHECK_EQ(tool_find("read_screen")->flags & TOOL_MUTATES, 0);
-    CHECK_EQ(tool_find("screen_info")->flags & TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("write_screen", TOOL_MUTATES, TOOL_MUTATES);
+    CHECK_TOOL_FLAGS("read_screen", TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("screen_info", TOOL_MUTATES, 0);
 }
 
 static void test_schema_is_valid_json(void) {
@@ -230,10 +230,18 @@ static void test_schema_is_valid_json(void) {
     }
     CHECK_EQ(seen, 3);
 
-    /* The geometry has to reach the model somehow; it is in the descriptions as
-     * well as in screen_info, so a model that never calls screen_info still
-     * knows what it may aim at. */
-    CHECK_CONTAINS(schema, "80x25");
+    /* The geometry has to reach the model somehow, and the schema is a link-time
+     * constant that CANNOT carry a runtime number. So the schema's job is to say
+     * that the size is not fixed and to send the model to screen_info, which
+     * reports the truth. This assertion used to be CHECK_CONTAINS(schema,
+     * "80x25") — pinning a value that stopped being true when the console became
+     * a 128x48 framebuffer, and telling a schema-following model that rows end at
+     * 24 on a 48-row screen, i.e. that the most recent output is in the middle. */
+    CHECK_CONTAINS(schema, "screen_info");
+    CHECK_CONTAINS(schema, "is NOT fixed");
+    CHECK(strstr(schema, "so rows are 0-24") == NULL);
+    CHECK(strstr(schema, "bottom line of the 80x25 screen") == NULL);
+    CHECK(strstr(schema, "79 = rightmost") == NULL);
     CHECK_CONTAINS(schema, "\"required\":[\"row\",\"text\"]");
     /* Colour names, not attribute nibbles. */
     CHECK_CONTAINS(schema, "light_magenta");

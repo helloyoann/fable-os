@@ -19,12 +19,6 @@ int strncmp(const char *a, const char *b, size_t n) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-char *strcpy(char *dst, const char *src) {
-    char *d = dst;
-    while ((*d++ = *src++)) { }
-    return dst;
-}
-
 char *strncpy(char *dst, const char *src, size_t n) {
     size_t i = 0;
     for (; i < n && src[i]; i++) dst[i] = src[i];
@@ -37,17 +31,31 @@ char *strchr(const char *s, int c) {
     return (c == 0) ? (char *)s : NULL;
 }
 
-char *strstr(const char *hay, const char *needle) {
-    if (!*needle) return (char *)hay;
-    for (; *hay; hay++) {
-        const char *h = hay, *n = needle;
+/* NOT dead code, however it looks from a default build. mbedTLS's PEM decoder
+ * (mbedtls_pem_read_buffer) and mbedtls_x509_crt_parse call strstr to find the
+ * "-----BEGIN ..." delimiters, and include/mbedtls_config.h only defines
+ * MBEDTLS_PEM_PARSE_C under TALKOS_VERIFY_CERTS. So `nm -u` over a default
+ * build's objects reports no caller, deleting this looks safe, every
+ * translation unit still compiles because port/string.h declares it — and
+ * `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS` fails at LINK time with three
+ * undefined references. That happened. The documented security-hardening build
+ * is the one thing an unbounded-by-construction primitive earns its place for;
+ * if it is ever removed again, remove MBEDTLS_PEM_PARSE_C's users first. */
+char *strstr(const char *haystack, const char *needle) {
+    if (!*needle) return (char *)haystack;
+    for (; *haystack; haystack++) {
+        const char *h = haystack, *n = needle;
         while (*h && *n && *h == *n) { h++; n++; }
-        if (!*n) return (char *)hay;
+        if (!*n) return (char *)haystack;
     }
     return NULL;
 }
 
-/* ---- stdlib ---- */
+/* ---- stdlib ----
+ * mbedTLS reaches the kernel heap through calloc/free only; malloc and realloc
+ * are here because port/stdlib.h declares the whole quartet for vendored code,
+ * and a heap shim that offers three quarters of it is the kind of asymmetry
+ * that costs someone an afternoon. They have no caller in the current build. */
 void *malloc(size_t n)            { return kmalloc(n); }
 void  free(void *p)               { kfree(p); }
 void *calloc(size_t n, size_t sz) { return kcalloc(n, sz); }
@@ -121,6 +129,13 @@ static void emit_uint(struct sbuf *s, uint64_t v, int base, int upper,
     char tmp[32];
     const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     int n = 0;
+    /* `prec` comes from the format string and is accumulated unbounded by the
+     * parser, so it must be clamped before it is used as a write count: "%.40d"
+     * would otherwise run the zero-fill below straight off the end of tmp and
+     * corrupt the caller's stack frame. 32 is past every representable value
+     * (20 digits for a base-10 uint64, 16 for base-16), so no legitimate
+     * conversion is affected by the clamp. */
+    if (prec > (int)sizeof tmp) prec = (int)sizeof tmp;
     if (v == 0 && prec != 0) tmp[n++] = '0';
     while (v) { tmp[n++] = digits[v % base]; v /= base; }
     while (n < prec) tmp[n++] = '0';                 /* precision = min digits */
@@ -135,6 +150,11 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
     for (; *fmt; fmt++) {
         if (*fmt != '%') { sb_putc(&s, *fmt); continue; }
         fmt++;
+        /* A format ending in a bare '%' leaves fmt on the terminator. Without
+         * this the switch below falls to `default`, the loop's own fmt++ steps
+         * PAST the NUL, and formatting continues into whatever .rodata follows —
+         * consuming varargs that were never passed. */
+        if (!*fmt) { sb_putc(&s, '%'); break; }
         int left = 0, zero = 0;
         for (;; fmt++) {                              /* flags */
             if (*fmt == '-') left = 1;
@@ -200,13 +220,26 @@ static int have_rdrand(void) {
     return (ecx >> 30) & 1;
 }
 
+/* The weak fallback: an LCG over the TSC. Not a CSPRNG, but never
+ * uninitialised and never a repeated constant, which is the property that
+ * matters when it is the last resort for seeding CTR_DRBG. */
+static uint64_t tsc_mix(void) {
+    static uint64_t st;
+    st = (st ^ rdtsc()) * 6364136223846793005ull + 1442695040888963407ull;
+    return st ^ (st >> 31) ^ ((uint64_t)rand() << 32);
+}
+
 static uint64_t rdrand64(void) {
     uint64_t v; unsigned char ok;
     for (int tries = 0; tries < 32; tries++) {
         __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok));
         if (ok) return v;
     }
-    return v;
+    /* CPUID advertised RDRAND but the instruction kept declining — a documented
+     * hardware/hypervisor state. Falling back is not optional: returning `v`
+     * here would return an UNINITIALISED local and mbedtls_hardware_poll below
+     * would still report success, seeding TLS from stack garbage. */
+    return tsc_mix();
 }
 
 int mbedtls_hardware_poll(void *data, unsigned char *output, size_t len, size_t *olen) {
@@ -215,14 +248,7 @@ int mbedtls_hardware_poll(void *data, unsigned char *output, size_t len, size_t 
     if (rdrand < 0) rdrand = have_rdrand();
     size_t i = 0;
     while (i < len) {
-        uint64_t r;
-        if (rdrand) {
-            r = rdrand64();
-        } else {                                   /* weak TSC-mixed fallback */
-            static uint64_t st;
-            st = (st ^ rdtsc()) * 6364136223846793005ull + 1442695040888963407ull;
-            r = st ^ (st >> 31) ^ ((uint64_t)rand() << 32);
-        }
+        uint64_t r = rdrand ? rdrand64() : tsc_mix();
         size_t n = (len - i < sizeof r) ? (len - i) : sizeof r;
         memcpy(output + i, &r, n);
         i += n;

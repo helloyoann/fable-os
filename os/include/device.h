@@ -21,7 +21,8 @@
  * FUTURE EXTENSION POINTS
  *   A device carries a parent pointer, so PCI/USB topologies form a tree. New
  *   classes and capability bits extend the enums without breaking callers. When
- *   hot-plug arrives, device_unregister + driver->remove complete the story.
+ *   hot-plug arrives, device_unregister + driver->remove + a DEV_STATE_REMOVED
+ *   complete the story; none of the three exists yet.
  */
 #ifndef DEVICE_H
 #define DEVICE_H
@@ -51,7 +52,6 @@ typedef enum {
     DEV_STATE_BOUND,        /* a driver has claimed it       */
     DEV_STATE_ACTIVE,       /* up and running                */
     DEV_STATE_SUSPENDED,    /* powered down, resumable       */
-    DEV_STATE_REMOVED,      /* gone (hot-unplug)             */
     DEV_STATE_FAILED,       /* bring-up failed               */
 } device_state_t;
 
@@ -77,20 +77,28 @@ typedef struct device {
     device_state_t     state;
     struct driver     *driver;      /* bound driver, or NULL         */
     struct device     *parent;      /* bus/topology parent, or NULL  */
-    void              *drvdata;     /* driver-private state          */
     device_resource_t  res[DEV_MAX_RESOURCES];
     int                nres;
     struct device     *next;        /* registry chain                */
 } device_t;
 
-/* Allocate and initialise a device (state = REGISTERED). Not yet published. */
+/* Allocate and initialise a device (state = REGISTERED). Not yet published.
+ *
+ * `name` is stored by pointer, NOT copied, so it must outlive the device — a
+ * string literal, or a heap buffer the caller never frees (drivers/pci/pci.c
+ * formats one per function and keeps it forever). Devices are never destroyed
+ * today; a future device_unregister() has to deal with this. */
 device_t *device_create(const char *name, device_class_t cls);
 
-/* Attach a resource. Returns 0 on success, -1 if the slot table is full. */
+/* Attach a resource. Returns 0 on success, -1 if the slot table is full — a
+ * dropped resource means the device comes up missing an IRQ or a BAR, so the
+ * return is worth checking (it can only fail because the caller asked for more
+ * than DEV_MAX_RESOURCES, i.e. it is a source bug, not runtime input). */
 int  device_add_resource(device_t *d, device_res_type_t type,
                          uint64_t base, uint64_t size);
 
-/* Publish into the global registry (idempotent per device). */
+/* Publish into the global registry. Idempotent: registering the same device
+ * twice is a no-op, not a corrupt list. */
 void device_register(device_t *d);
 
 void device_bind_driver(device_t *d, struct driver *drv);

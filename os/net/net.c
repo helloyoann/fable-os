@@ -87,9 +87,20 @@
 #include "sse.h"
 #endif
 
-#ifndef TALKOS_API_KEY
-#define TALKOS_API_KEY ""
-#endif
+/* THE API KEY IS NOT COMPILED IN. There is no -DTALKOS_API_KEY and there is no
+ * KEY= in the Makefile, on purpose: a key that reaches the compiler reaches
+ * net.o, kernel.elf, kernel.bin, talkos.iso and the .build-flags stamp, and a
+ * .gitignore is the wrong place to keep a secret out of five build artifacts.
+ *
+ * The key arrives at RUN time over QEMU's fw_cfg channel (drivers/fwcfg/, read
+ * at boot from opt/talkos/apikey) and lives only in RAM. With no key,
+ * fwcfg_apikey() is "" — the header goes out empty, Anthropic answers 401, and
+ * that is the documented default: it still proves DNS, TLS and HTTP worked.
+ *
+ * NOTHING HERE PRINTS THE REQUEST. The `req` buffer below holds the x-api-key
+ * header, so any future debug dump of it is a key disclosure; if one is ever
+ * added it must skip the header block. See include/fwcfg.h, THE SECRET RULE. */
+#include "fwcfg.h"
 
 /* The endpoint. Both names are overridable, but ONLY in a verification build,
  * because their only purpose is to prove that the verifier rejects things:
@@ -188,6 +199,19 @@ static void net_service(void) {
 static struct altcp_tls_config *tls_conf;
 static ip_addr_t server_ip;
 static volatile int dns_done, dns_ok;
+
+/* Set once the netif, the default route, the DNS server and the TLS config are
+ * all up, i.e. once the only thing that can still fail is the lookup itself.
+ * Gates net_retry_resolve(); see the comment on resolve_api_host(). */
+static int stack_up;
+
+/* A retry is paid for by an operator waiting at a prompt, so it is bounded far
+ * more tightly than the boot attempt: long enough for a lost query and one
+ * lwIP retransmit, short enough that a machine with no network answers quickly
+ * instead of appearing hung. */
+#define RETRY_TIMEOUT_MS 3000
+
+static int resolve_api_host(uint32_t timeout_ms);
 
 static void dns_cb(const char *name, const ip_addr_t *ipaddr, void *arg) {
     (void)name; (void)arg;
@@ -399,16 +423,54 @@ int net_init(void) {
     if (!tls_conf) { kprintf("net: TLS config init failed\n"); return -1; }
 #endif
 
+    stack_up = 1;
+    return resolve_api_host(10000);
+}
+
+/* WHY THIS IS SEPARABLE AND RE-RUNNABLE.
+ * Resolution is the one step in net_init() that fails for reasons that have
+ * nothing to do with this machine: a dropped UDP packet to 10.0.2.3 and the
+ * whole boot is over, because net_init() returns -1, chat gets a NULL transport
+ * and every sentence the operator types is refused for the life of the boot. On
+ * a machine whose ONLY interface is the model there is then no way to ask for a
+ * retry — asking is the thing that needs the network. Observed once in ~22 boots
+ * (four queries sent, no answer, a boot 40 seconds earlier resolved in 23 ms),
+ * so it is rare and it is a coin flip that turns the machine into a prompt that
+ * refuses everything.
+ *
+ * Everything above this point in net_init() — netif, default route, DNS server,
+ * TLS config — either succeeds once and stays up or is a permanent property of
+ * the machine, so a retry only has to redo the lookup. `stack_up` is what stops
+ * a retry from being attempted on a machine that never got that far (no NIC),
+ * where it would burn the timeout per sentence and could not possibly work. */
+static int resolve_api_host(uint32_t timeout_ms) {
+    dns_done = dns_ok = 0;
+
     kprintf("net: resolving %s ...\n", API_HOST);
     err_t e = dns_gethostbyname(API_HOST, &server_ip, dns_cb, NULL);
     if (e == ERR_OK) { dns_ok = 1; dns_done = 1; }
     else if (e != ERR_INPROGRESS) { kprintf("net: dns error %d\n", e); return -1; }
 
-    uint64_t deadline = millis() + 10000;
+    uint64_t deadline = millis() + timeout_ms;
     while (!dns_done && millis() < deadline) net_service();
     if (!dns_ok) { kprintf("net: DNS resolution failed\n"); return -1; }
     kprintf("net: %s -> %s, TLS ready\n", API_HOST, ipaddr_ntoa(&server_ip));
     return 0;
+}
+
+int net_retry_resolve(void) {
+    if (!stack_up) return -1;   /* never came up; a lookup cannot help */
+
+    /* Ask the hardware, not the software: netif_set_up() succeeds whether or not
+     * a card was ever found, so lwIP's idea of "up" says nothing. A live
+     * STATUS.LU read is the difference between "one query went missing, try
+     * again" and "there is no network on this machine", and only the first is
+     * worth making the operator wait for. Without this a NIC-less boot spends
+     * the whole retry timeout per sentence before refusing, which reads as a
+     * hang — measured at 3.2 s a sentence, now 0. */
+    if (!e1000_link_up()) return -1;
+
+    return resolve_api_host(RETRY_TIMEOUT_MS);
 }
 
 /* ====================================================================== */
@@ -434,6 +496,55 @@ static int          tx_left;
 
 static const char  *tls_err = "";
 
+/* THE CONNECTION IN PROGRESS, and how this file knows a callback belongs to it.
+ *
+ * Every field above is a file static shared by all attempts, which is only safe
+ * as long as at most one connection is ever wired to our callbacks. lwIP frees a
+ * pcb behind our back on two paths (err_cb, and a successful close in recv_cb)
+ * and on no others — so any exit from tls_send() that is not one of those two
+ * leaves a LIVE pcb still holding altcp_recv/altcp_sent/altcp_err. That pcb is
+ * polled by net_service() for the rest of the boot, and its callbacks would then
+ * run against the NEXT request's state: its ACK would make tx_pump() write this
+ * request's body — x-api-key header included — into a connection the kernel has
+ * already given up on, its late data would interleave into the new response
+ * buffer, and its FIN would set ask_done and return a half-read reply as real.
+ *
+ * So: cur_pcb is the pcb this file is still responsible for, NULL once lwIP owns
+ * it, and tls_send() drops any survivor before it returns. tls_gen is belt and
+ * braces — it stamps each attempt onto its pcb's arg so a callback can prove it
+ * belongs to the attempt in progress rather than that being a property of having
+ * read every exit path correctly. */
+static struct altcp_pcb *cur_pcb;
+static uintptr_t         tls_gen;
+
+/* True for a callback arriving from a connection this file has abandoned. */
+static int stale_cb(const void *arg) { return (uintptr_t)arg != tls_gen; }
+
+/* Let go of a connection unconditionally.
+ *
+ * Deregister BEFORE aborting: altcp_abort() runs lwIP's error path, which calls
+ * conn->err and only then frees (altcp_tls_mbedtls.c's lower_err), so an armed
+ * err_cb would re-enter this file and print "[net error ...]" for a connection
+ * we are deliberately discarding. With the callbacks cleared, lwIP frees it
+ * silently.
+ *
+ * Abort, not close: altcp_close() can fail with ERR_MEM when no pbuf is
+ * available for the FIN, and lwIP's contract is then that the pcb is still ours
+ * with every callback re-armed (it calls setup_callbacks again on that path).
+ * A connection whose request is already over has nothing left to lose by dying
+ * unconditionally, and "close, maybe" is exactly the leak this exists to stop.
+ *
+ * Never called from inside a callback: aborting a pcb from its own callback
+ * obliges the callback to return ERR_ABRT, and keeping that contract at two
+ * call sites is harder to check than deferring the teardown to tls_send(). */
+static void tls_drop(struct altcp_pcb *pcb) {
+    altcp_arg(pcb, (void *)0);
+    altcp_recv(pcb, (altcp_recv_fn)0);
+    altcp_sent(pcb, (altcp_sent_fn)0);
+    altcp_err(pcb, (altcp_err_fn)0);
+    altcp_abort(pcb);
+}
+
 #ifdef TALKOS_STREAM
 /* ~20 KiB of parser state. Static on purpose: the kernel stack is 64 KiB. */
 static sse_http_t stream;
@@ -447,8 +558,23 @@ static void stream_text(void *ctx, const char *text, size_t len) {
 #endif
 
 static err_t recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t err) {
-    (void)arg; (void)err;
-    if (p == NULL) { altcp_close(pcb); ask_done = 1; return ERR_OK; }
+    (void)err;
+    /* Not ours: a connection some earlier attempt abandoned. Consume the data so
+     * lwIP's window reopens, but let none of it reach this attempt's buffer. */
+    if (stale_cb(arg)) {
+        if (p) { altcp_recved(pcb, p->tot_len); pbuf_free(p); }
+        return ERR_OK;
+    }
+    if (p == NULL) {
+        /* Peer FIN: the response is complete. Whether the pcb is gone depends on
+         * whether lwIP could get a pbuf for our FIN — on ERR_MEM it hands the
+         * connection back with every callback re-armed, so cur_pcb stays set and
+         * tls_send()'s teardown finishes the job. Discarding this return is how a
+         * pcb outlives the request that opened it. */
+        if (altcp_close(pcb) == ERR_OK) cur_pcb = (struct altcp_pcb *)0;
+        ask_done = 1;
+        return ERR_OK;
+    }
     for (struct pbuf *q = p; q; q = q->next) {
         const char *d = q->payload;
 #ifdef TALKOS_STREAM
@@ -469,7 +595,11 @@ static err_t recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t err
 }
 
 static void err_cb(void *arg, err_t err) {
-    (void)arg;
+    if (stale_cb(arg)) return;   /* an abandoned connection finally dying */
+
+    /* lwIP frees the pcb the moment this returns, so it is no longer ours to
+     * tear down — and following the pointer again would be a use-after-free. */
+    cur_pcb = (struct altcp_pcb *)0;
 #ifdef TALKOS_VERIFY_CERTS
     /* A refused certificate arrives here as a bare ERR_CLSD, which is
      * indistinguishable from the peer hanging up. Ask mbedTLS what it decided
@@ -511,13 +641,18 @@ static void tx_pump(struct altcp_pcb *pcb) {
 }
 
 static err_t sent_cb(void *arg, struct altcp_pcb *pcb, u16_t len) {
-    (void)arg; (void)len;
+    (void)len;
+    /* The dangerous one: pumping the request into a stale connection would send
+     * this attempt's body, x-api-key header and all, down a socket the kernel
+     * has already reported as failed, and advance tx_ptr so the live connection
+     * gets a truncated request. */
+    if (stale_cb(arg)) return ERR_OK;
     tx_pump(pcb);
     return ERR_OK;
 }
 
 static err_t connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
-    (void)arg;
+    if (stale_cb(arg)) return ERR_OK;
     if (err != ERR_OK) { ask_done = 1; return err; }
     ask_ok = 1;                                  /* TLS handshake completed */
 #ifdef TALKOS_VERIFY_CERTS
@@ -594,16 +729,29 @@ static int tls_send(model_transport_t *t,
     /* Build the HTTP/1.0 request (close-delimited response, no chunking). The
      * JSON writer is just a bounded appender, so it serves for plain text too. */
     /* Headers plus the whole JSON body. The turn loop's request carries every
-     * registered tool's schema (~8 KiB for 18 tools and growing) on top of the
-     * system prompt and the conversation, so this has to be well clear of
-     * chat.h's CHAT_REQ_BYTES or the tool-use path dies with ENOSPC. */
+     * registered tool's schema on top of the system prompt and the conversation,
+     * so this has to stay well clear of chat.h's CHAT_REQ_BYTES or the tool-use
+     * path dies with ENOSPC.
+     *
+     * `req` is that clearance, and it is the outermost bound in the chain: this
+     * 64 KiB has to hold CHAT_REQ_BYTES (61440) plus the request line and
+     * headers. The boot banner prints the schema size actually assembled — 32764
+     * bytes at 45 tools on this build — and include/chat.h works the whole budget
+     * out against these 64 KiB, including how little slack is left. Do not grow
+     * CHAT_REQ_BYTES without growing this buffer first. */
     static char   req[65536];
     json_writer_t w;
     json_writer_init(&w, req, sizeof req);
     json_put(&w,
         "POST /v1/messages HTTP/1.0\r\n"
         "Host: " API_HOST "\r\n"
-        "x-api-key: " TALKOS_API_KEY "\r\n"
+        "x-api-key: ");
+    /* Runtime, from fw_cfg. Already trimmed and already checked to be printable
+     * ASCII by drivers/fwcfg/fwcfg.c, so it cannot inject a CRLF and split this
+     * request — the concatenation below would otherwise be exactly that hole. */
+    json_put(&w, fwcfg_apikey());
+    json_put(&w,
+        "\r\n"
         "anthropic-version: 2023-06-01\r\n"
         "content-type: application/json\r\n"
         "connection: close\r\n"
@@ -652,6 +800,12 @@ static int tls_send(model_transport_t *t,
     struct altcp_pcb *pcb = altcp_tls_new(tls_conf, IPADDR_TYPE_V4);
     if (!pcb) { tls_err = "altcp_tls_new failed"; return MODEL_ETRANSPORT; }
 
+    /* Claim it before any callback can fire, and stamp this attempt's generation
+     * on it so every callback can tell whose connection it is. */
+    cur_pcb = pcb;
+    tls_gen++;
+    altcp_arg(pcb, (void *)tls_gen);
+
     /* Send SNI so CDN-fronted hosts present the right certificate. Under
      * TALKOS_VERIFY_CERTS this same string is what mbedTLS matches the
      * certificate's CN/subjectAltName against, so a failure to set it would
@@ -660,7 +814,8 @@ static int tls_send(model_transport_t *t,
     mbedtls_ssl_context *ssl = (mbedtls_ssl_context *)altcp_tls_context(pcb);
 #ifdef TALKOS_VERIFY_CERTS
     if (!ssl || mbedtls_ssl_set_hostname(ssl, API_SNI) != 0) {
-        altcp_close(pcb);
+        tls_drop(pcb);
+        cur_pcb = (struct altcp_pcb *)0;
         tls_err = "could not set the hostname to verify against";
         return MODEL_ETRANSPORT;
     }
@@ -682,6 +837,14 @@ static int tls_send(model_transport_t *t,
      * way nobody may follow this pointer again. */
     cur_ssl = (mbedtls_ssl_context *)0;
 #endif
+
+    /* THE ONE TEARDOWN. Every return below is a return from a request that is
+     * over, so no connection may outlive this point. On the success path recv_cb
+     * already closed it and cur_pcb is NULL; every other path — the timeout, a
+     * write failure, a connect lwIP refused, a close that could not get a pbuf —
+     * leaves a live pcb still wired to our callbacks. See cur_pcb's comment for
+     * what such a survivor does to the next request. */
+    if (cur_pcb) { tls_drop(cur_pcb); cur_pcb = (struct altcp_pcb *)0; }
 
     if (!ask_done) { tls_err = "timed out";           return MODEL_ETIMEOUT; }
     /* Do not overwrite a reason we already have. err_cb turns mbedTLS's verify
@@ -726,6 +889,47 @@ model_transport_t *model_tls_transport(void) {
 /* net_ask — the protocol side: build, send, read, print                   */
 /* ====================================================================== */
 
+/* Print server-chosen bytes without letting them forge kernel ground truth.
+ *
+ * A KERNEL TRACE LINE IS A '[' IN COLUMN ZERO, and both things net_ask() prints
+ * are chosen by the far end: the model's reply text, and — when the reply is not
+ * a message at all — the raw HTTP body. With certificate verification off by
+ * default, "the far end" is anything that can answer on 443. A bare kputs() of
+ * either let a reply of "[heap_free 0x1000 -> ok]" put a line on the console
+ * that is byte-identical to genuine kernel output, during the boot self-test,
+ * on a machine with no shell to check it against.
+ *
+ * So: C0 control bytes other than '\n' and '\t' are escaped (a '\r' resets the
+ * console column and a '\b' walks back into a real trace line printed earlier,
+ * so cursor motion is not something untrusted text gets to do), and a '[' that
+ * would land in column zero is given one leading space. The column is asked for
+ * rather than modelled, because wrap and scroll reach column zero with no
+ * newline involved.
+ *
+ * This is deliberately the same rule as net/chat.c's print_model_prose(), which
+ * carries the full derivation and the regression tests. The duplication is not
+ * wanted: net_ask() is itself a weaker copy of the turn loop and the fix for
+ * both is to delete it and make the boot self-test a chat_ask() call, which
+ * needs kernel/main.c and chat.c. Reported rather than done. */
+static void print_untrusted(const char *s) {
+    static const char hex[] = "0123456789abcdef";
+
+    for (size_t i = 0; s[i]; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((c < 0x20 && c != '\n' && c != '\t') || c == 0x7F) {
+            kputc('\\'); kputc('x');
+            kputc(hex[(c >> 4) & 0xF]); kputc(hex[c & 0xF]);
+            continue;
+        }
+        if (c == '[') {
+            int col = 0;
+            console_cursor((int *)0, &col);
+            if (col == 0) kputc(' ');
+        }
+        kputc((char)c);
+    }
+}
+
 int net_ask(const char *question) {
     static char req_body[8192];
     static char resp[65536];
@@ -756,8 +960,8 @@ int net_ask(const char *question) {
     /* Already on screen, delta by delta, as it arrived. */
     if (sse_http_streamed(&stream)) { kputc('\n'); return 0; }
 #endif
-    if (trc == JSON_OK || trc == JSON_ENOSPC) kputs(text);
-    else                                      kputs(r.body);   /* e.g. a 401 */
+    if (trc == JSON_OK || trc == JSON_ENOSPC) print_untrusted(text);
+    else                                      print_untrusted(r.body);  /* a 401 */
     kputc('\n');
     return 0;
 }

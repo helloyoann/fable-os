@@ -30,13 +30,39 @@
 
 static const driver_t serial_driver;   /* forward decl for device binding */
 
-void serial_putc(char c) {
-    while (!(inb(COM1 + UART_LSR) & LSR_THRE)) { }   /* wait for THR empty */
-    if (c == '\n') {                                 /* CRLF for terminals */
-        outb(COM1, '\r');
-        while (!(inb(COM1 + UART_LSR) & LSR_THRE)) { }
+/* Bounded wait for the transmit holding register to empty.
+ *
+ * Every kprintf in the kernel funnels through serial_emit -> serial_putc, so an
+ * unbounded wait here hangs the machine INSIDE a print, with no diagnostic
+ * possible because the diagnostic channel is the thing that is stuck. An absent
+ * UART happens to be safe (an unclaimed port reads 0xFF, so THRE looks set), but
+ * a UART that is present and wedged — a flow-controlled far end holding off, an
+ * emulator or hardware fault — is not.
+ *
+ * TX_SPINS is enormous next to a character time at 115200 baud (87 us); in
+ * normal operation the first read already succeeds and this costs one inb. After
+ * TX_GIVE_UP_RUN *consecutive* expiries the port is declared dead and output is
+ * dropped cheaply, so a wedged UART costs a bounded amount of time in total
+ * rather than the full bound per character for the rest of the boot. A single
+ * success clears the run, so a slow far end is waited for, not written off. */
+#define TX_SPINS       1000000u
+#define TX_GIVE_UP_RUN 8
+
+static unsigned tx_timeouts;   /* consecutive THRE waits that expired */
+static int      tx_dead;       /* latched once the run is long enough  */
+
+static int tx_ready(void) {
+    if (tx_dead) return 0;
+    for (unsigned i = 0; i < TX_SPINS; i++) {
+        if (inb(COM1 + UART_LSR) & LSR_THRE) { tx_timeouts = 0; return 1; }
     }
-    outb(COM1, (uint8_t)c);
+    if (++tx_timeouts >= TX_GIVE_UP_RUN) tx_dead = 1;
+    return 0;
+}
+
+void serial_putc(char c) {
+    if (c == '\n' && tx_ready()) outb(COM1, '\r');   /* CRLF for terminals */
+    if (tx_ready()) outb(COM1, (uint8_t)c);
 }
 
 void serial_write(const char *s) {
@@ -48,11 +74,6 @@ void serial_write(const char *s) {
 #define RX_STASH_MAX 16
 static uint8_t rx_stash[RX_STASH_MAX];
 static uint8_t rx_stash_len, rx_stash_pos;
-
-int serial_rx_ready(void) {
-    if (rx_stash_pos < rx_stash_len) return 1;
-    return (inb(COM1 + UART_LSR) & LSR_DR) != 0;
-}
 
 int serial_getc_nb(void) {
     if (rx_stash_pos < rx_stash_len) return rx_stash[rx_stash_pos++];

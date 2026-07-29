@@ -13,7 +13,7 @@
  *   test that fails the build when the loop stops working.
  *
  * HONESTY ABOUT WHAT IS RECORDED
- *   This kernel has no API key compiled in (the API answers 401, which is how
+ *   This kernel is run without a key here (the API answers 401, which is how
  *   the TLS path is proved), so a live model has never actually reached these
  *   tools. THE ASSISTANT TURNS BELOW ARE AUTHORED, NOT CAPTURED FROM A LIVE
  *   MODEL. What is real is everything on the kernel side of the seam: the tool

@@ -171,9 +171,9 @@ static void test_tools_are_registered(void) {
         CHECK(t->invoke != NULL);
     }
     /* heap_check can halt the machine, so it carries the policy flag. */
-    CHECK_EQ(tool_find("heap_check")->flags & TOOL_MUTATES, TOOL_MUTATES);
-    CHECK_EQ(tool_find("heap_stats")->flags & TOOL_MUTATES, 0);
-    CHECK_EQ(tool_find("mem_read")->flags & TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("heap_check", TOOL_MUTATES, TOOL_MUTATES);
+    CHECK_TOOL_FLAGS("heap_stats", TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("mem_read", TOOL_MUTATES, 0);
 }
 
 static void test_schema_is_valid_json(void) {
@@ -404,6 +404,37 @@ static void test_heap_check_clean(void) {
      * attributable when there is no shell to ask afterwards. */
     CHECK_CONTAINS(kcap_text(), "heap_check: walking");
     CHECK_CONTAINS(kcap_text(), "panics and halts if corrupt");
+
+    /* The NUMBERS, not just the words around them. The fragment assertions
+     * above were the only ones here, and they never looked between the words -
+     * so they stayed green while the breadcrumb was written with "%lu", which
+     * lib/base.c's kprintf does not understand, and printed the literal text
+     * "walking %lu blocks of a %lu KiB arena" on real hardware.
+     *
+     * READ THIS BEFORE TRUSTING IT: this assertion does NOT catch that bug, and
+     * no assertion in this file can. tests/host/kshim.c implements kprintf by
+     * delegating to the HOST libc vsnprintf, which is a strict SUPERSET of the
+     * kernel's "%s %c %d %u %x %p %%" grammar. "%lu" therefore renders perfectly
+     * here and wrongly on the machine, and this check passes either way (I
+     * verified that: reverting tools/mem_tools.c to %lu leaves this suite green
+     * and puts the literal format string back in a real serial log).
+     *
+     * So what this buys is narrower than it looks: it pins the two values
+     * against the allocator, which would catch them being wrong or transposed.
+     * The general defect - that a host console assertion is evidence about the
+     * host formatter, not about the kernel's - is only closable by making
+     * kshim's kprintf reimplement the kernel's restricted grammar instead of
+     * delegating, which is a change to shared test infrastructure that every
+     * suite's console assertions depend on. Documented, not attempted. */
+    {
+        heap_stats_t hs;
+        heap_stats(&hs);
+        char want[128];
+        snprintf(want, sizeof want, "heap_check: walking %u blocks of a %u KiB arena",
+                 (unsigned)(hs.used_blocks + hs.free_blocks),
+                 (unsigned)(hs.arena_size / 1024));
+        CHECK_CONTAINS(kcap_text(), want);
+    }
     /* ...and the trace line comes after, from the real result. */
     CHECK_CONTAINS(kcap_text(), "[heap_check blocks=");
     CHECK_CONTAINS(kcap_text(), "-> ok]");
@@ -419,20 +450,30 @@ static void test_heap_check_clean(void) {
  * machine this same path halts — which is exactly what the tool's description
  * tells the model and what the pre-flight exists to avoid stumbling into. */
 static void test_heap_check_corruption_reaches_panic(void) {
-    void *p = kmalloc(64);
+    /* Two allocations, and the SECOND is the one corrupted. The magic word is
+     * found by scanning back from the payload rather than by hardcoding
+     * mm/heap.c's private header size — but a scan back from the first block in
+     * the arena reads below the arena entirely, which ASan reports as a
+     * global-buffer-overflow on mm/heap.c's default_arena. `pad` guarantees
+     * there is a block in front of p, so every byte the scan touches is inside
+     * the arena; zeroing its payload guarantees the first match found going
+     * backwards is p's own header and not a coincidence in someone's data. */
+    void *pad = kmalloc(64);
+    void *p   = kmalloc(64);
+    CHECK(pad != NULL);
     CHECK(p != NULL);
-    if (!p) return;
+    if (!pad || !p) { kfree(pad); kfree(p); return; }
+    CHECK((char *)p > (char *)pad);
+    memset(pad, 0, 64);
 
-    /* Find the block header's magic word by scanning back from the payload,
-     * rather than hardcoding mm/heap.c's private header size. */
     const uint32_t magic = 0x424C4B21u;      /* "BLK!" */
     uint32_t      *slot  = NULL;
     for (int back = 4; back <= 64; back += 4) {
         uint32_t *w = (uint32_t *)((char *)p - back);
-        if (*w == magic) { slot = w; }
+        if (*w == magic) { slot = w; break; }   /* nearest match = p's header */
     }
     CHECK(slot != NULL);
-    if (!slot) { kfree(p); return; }
+    if (!slot) { kfree(p); kfree(pad); return; }
 
     uint32_t saved = *slot;
     *slot          = 0xDEADBEEFu;
@@ -448,6 +489,7 @@ static void test_heap_check_corruption_reaches_panic(void) {
     kpanic_hit = 0;
     kpanic_msg = NULL;
     kfree(p);
+    kfree(pad);
 
     CHECK_EQ(heap_check(), 0);               /* the arena is healthy again */
     CHECK_EQ(kpanic_hit, 0);

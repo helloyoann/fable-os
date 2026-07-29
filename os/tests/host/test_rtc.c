@@ -886,8 +886,8 @@ static void test_tools_are_registered(void) {
     CHECK(tool_find("sys_time") != NULL);
     CHECK(tool_find("time_convert") != NULL);
     /* Neither changes machine state, so neither is flagged. */
-    CHECK_EQ(tool_find("sys_time")->flags, 0u);
-    CHECK_EQ(tool_find("time_convert")->flags, 0u);
+    CHECK_TOOL_FLAGS("sys_time", ~0u, 0u);
+    CHECK_TOOL_FLAGS("time_convert", ~0u, 0u);
 
     /* The advertised schema must be real JSON containing both names. */
     static char schema[8192];

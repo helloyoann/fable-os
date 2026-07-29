@@ -20,8 +20,9 @@
 #     the tone is a short non-silent span near the start, not the whole file.
 #
 # CONCURRENCY: like capture.sh, this only ever kills the QEMU it started, and
-# every path is derived from the PID, so it is safe to run alongside other
-# agents' VMs and the tests/qemu harness.
+# every path it writes is unique to this run (the PID), so it is safe alongside
+# other agents' VMs and the tests/qemu harness. It opens no listening socket at
+# all, so unlike capture.sh it has no monitor to be confused with anyone else's.
 set -e
 
 SECONDS_TO_RUN="${1:-14}"

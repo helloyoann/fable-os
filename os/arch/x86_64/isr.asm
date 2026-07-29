@@ -39,7 +39,7 @@
 ;   Every GPR is saved and restored, `add rsp, 16` drops the two words the stub
 ;   synthesised, and IRETQ restores RIP/CS/RFLAGS/RSP/SS from the frame. The C
 ;   handler receives a pointer to the live frame rather than a copy, which is
-;   deliberate: Phase 3b's recovery path writes to it and returns.
+;   deliberate: the recovery path (fault_recover) writes to it and returns.
 ;
 ;   Segment registers are untouched. boot.asm left DS/ES/FS/GS/SS holding the
 ;   null selector, which is legal at CPL 0 in 64-bit mode, and idt_init() does

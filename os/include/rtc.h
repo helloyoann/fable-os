@@ -57,7 +57,6 @@
  *   Hardware:
  *     rtc_read            sample the CMOS now, tear-free, decoded to UTC.
  *     rtc_unix_now        the same reading as seconds since the epoch.
- *     rtc_available       has a reading ever succeeded on this machine?
  *     rtc_unix_at_boot    the timestamp captured once during driver init.
  *   Pure calendar arithmetic (no hardware, no allocation, host-tested):
  *     rtc_is_leap_year / rtc_days_in_month / rtc_time_valid
@@ -87,8 +86,9 @@
  *     turns certificate date validation back on.
  *   - The chip can raise IRQ 8 (periodic, alarm, update-ended). Nothing is
  *     enabled here — every PIC line is masked and the kernel is polled — but
- *     the alarm registers (0x01/0x03/0x05) and status register C are the hook
- *     for a real timekeeping tick once interrupts are live.
+ *     the alarm registers (0x01/0x03/0x05) and status register C (0x0C) are the
+ *     hook for a real timekeeping tick once interrupts are live. Neither is
+ *     named above: this header only exposes the registers the driver reads.
  *   - Writing the CMOS (setting the clock) is deliberately absent: see the
  *     DECISION note in drivers/rtc/rtc.c.
  */
@@ -126,8 +126,6 @@
 #define RTC_REG_YEAR      0x09
 #define RTC_REG_STATUS_A  0x0A
 #define RTC_REG_STATUS_B  0x0B
-#define RTC_REG_STATUS_C  0x0C
-#define RTC_REG_STATUS_D  0x0D
 #define RTC_REG_CENTURY   0x32
 
 #define RTC_STATUS_A_UIP     0x80   /* update in progress: registers undefined */
@@ -152,18 +150,20 @@ typedef struct rtc_time {
 
 /* Sample the CMOS now and decode it. Waits out any update in progress, then
  * reads the register file twice and requires the two snapshots to be identical,
- * so a rollover cannot be observed half-applied. Returns RTC_OK, or RTC_EIO if
- * the chip never went quiet / never agreed with itself, or RTC_EINVAL if what
- * it produced is not a possible date. `out` is untouched on failure. */
+ * so a rollover cannot be observed half-applied. `out` is untouched on failure.
+ * Returns:
+ *   RTC_OK      a decoded, plausible UTC reading.
+ *   RTC_ENODEV  the chip never left its update window — it is not ticking, or
+ *               there is no chip (every register reads back 0xFF, so UIP looks
+ *               permanently set).
+ *   RTC_EIO     it went quiet but never produced two agreeing sweeps.
+ *   RTC_EINVAL  it produced something that is not a possible date, or `out` is
+ *               NULL. */
 int rtc_read(rtc_time_t *out);
 
 /* rtc_read() rendered as seconds since 1970-01-01T00:00:00Z, or the negative
  * error code from rtc_read()/rtc_to_unix(). Never returns a stale value. */
 int64_t rtc_unix_now(void);
-
-/* Nonzero once any read has succeeded — i.e. this machine has a usable wall
- * clock. Callers that must not block on a broken chip test this first. */
-int rtc_available(void);
 
 /* The timestamp taken once during driver init, or a negative error if that read
  * failed. Cheap, constant, and the anchor for "how long has this been up in

@@ -22,7 +22,7 @@
 # text doesn't already end in a newline. Steps fire in order, and each trigger
 # is only searched for in output produced after the previous one matched.
 #
-# With no API key compiled in (the default), the API answers 401 and chat.c
+# With no API key supplied over fw_cfg (the default), the API answers 401 and chat.c
 # prints it as "[model HTTP/1.1 401 Unauthorized]" followed by the API's own
 # error text under "[model said: ...]". That is a *complete* proof of the
 # path — keystroke -> line editor -> tool schema -> JSON request -> TLS ->
@@ -56,7 +56,7 @@ expect-re [net]: ^>
 # The line editor echoed what we typed...
 expect [net]: what is 2 plus 2?
 # ...the request went out over TLS and the kernel reported, in its own voice,
-# exactly what came back. 401 = no API key compiled in; the TLS path worked.
+# exactly what came back. 401 = no API key supplied; the TLS path worked.
 expect-re [net]: ^\[model HTTP/1\.\d \d{3} \S
 # ...and the REPL looped round for the next sentence.
 expect-re [net]: ^>
@@ -71,7 +71,7 @@ check [net]: http_response allow=200,401
 
 # The tool schema has to survive into the turn: it is rebuilt into every
 # request, and a turn with no tools is a machine that can only talk.
-check [net]: tool_registry min_tools=12 min_schema_bytes=2000 max_schema_bytes=32768 min_bytes_per_tool=80
+check [net]: tool_registry min_tools=12 min_schema_bytes=2000 max_schema_bytes=40960 min_bytes_per_tool=80
 
 forbid-re: \bpanic\b
 forbid: heap corruption

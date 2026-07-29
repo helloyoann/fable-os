@@ -1,9 +1,10 @@
 /* heap.c — kernel heap allocator (see include/heap.h for the contract).
  *
  * ALGORITHM
- *   A first-fit free-list over a single contiguous arena. Every block — free or
- *   in use — carries a fixed 32-byte header and is threaded into one doubly
- *   linked list ordered by address (the "physical" list). Because blocks are
+ *   First fit over a single contiguous arena. There is no separate free list:
+ *   every block — free or in use — carries a fixed 32-byte header and is
+ *   threaded into ONE doubly linked list ordered by address (the "physical"
+ *   list), so an allocation scans live blocks too. Because blocks are
  *   physically adjacent, freeing a block can coalesce with its immediate
  *   neighbours in O(1), which is what keeps long-lived churn (mbedTLS handshakes
  *   allocate and free thousands of bignums) from fragmenting the arena.
@@ -71,11 +72,17 @@ static void check_header(block_t *b, const char *who) {
 }
 
 void heap_init(void *base, size_t size) {
-    if (size <= HDR + MIN_PAYLOAD) panic("heap_init: region too small");
+    if (!base) panic("heap_init: NULL region");
 
-    /* Align the base upward and account for any bytes lost to alignment. */
+    /* Align the base upward and account for any bytes lost to alignment BEFORE
+     * validating the size — validating first would accept a region that is only
+     * big enough before alignment eats up to ALIGN-1 of its bytes, leaving an
+     * arena no allocation can ever satisfy. */
     uintptr_t start = align_up((uintptr_t)base, ALIGN);
-    size -= (size_t)(start - (uintptr_t)base);
+    size_t    lost  = (size_t)(start - (uintptr_t)base);
+    if (size < lost) panic("heap_init: region too small");
+    size -= lost;
+    if (size <= HDR + MIN_PAYLOAD) panic("heap_init: region too small");
 
     heap_head = (block_t *)start;
     heap_head->magic = BLOCK_MAGIC;
@@ -116,10 +123,24 @@ static void split(block_t *b, size_t need) {
     stat_free_blocks++;
 }
 
+/* Round a request up to the payload alignment, rejecting anything the arena
+ * could never hold. This bound is what stops align_up() from wrapping: a
+ * request within ALIGN-1 of SIZE_MAX rounds to 0, the first-fit scan then
+ * matches any block, split() carves a zero-byte payload, and the caller's first
+ * write lands in the next block's header — a corruption that only surfaces at
+ * some unrelated later free. Sizes reach here from parsed data (mbedTLS sizing
+ * a buffer from a certificate length field), so they are untrusted.
+ * Returns 0 if the request is impossible; call ensure_init() first. */
+static int round_request(size_t n, size_t *out) {
+    if (n == 0) n = 1;
+    if (n > arena_bytes) return 0;   /* arena_bytes << SIZE_MAX, so no wrap */
+    *out = align_up(n, ALIGN);
+    return 1;
+}
+
 void *kmalloc(size_t n) {
     ensure_init();
-    if (n == 0) n = 1;
-    n = align_up(n, ALIGN);
+    if (!round_request(n, &n)) panic("kmalloc: out of memory");
 
     for (block_t *b = heap_head; b; b = b->next) {
         if (!b->free || b->size < n) continue;
@@ -136,7 +157,13 @@ void *kmalloc(size_t n) {
     return NULL;
 }
 
-/* Merge `b` with its next neighbour if that neighbour is also free. */
+/* Merge `b` with its next neighbour if that neighbour is also free.
+ *
+ * `b` itself is usually free (kfree), but krealloc's grow-in-place path calls
+ * this on a LIVE block on purpose and adjusts stat_in_use around the call. That
+ * is the only legitimate live-block use: absorbing a free neighbour into a live
+ * block without touching stat_in_use leaves the counter stale, and heap_check()
+ * cannot notice because the block sizes still sum to the arena. */
 static void coalesce_next(block_t *b) {
     block_t *n = b->next;
     if (!n || !n->free) return;
@@ -179,12 +206,21 @@ void *krealloc(void *p, size_t n) {
     size_t want = align_up(n, ALIGN);
 
     if (b->size >= want) {                    /* shrink in place */
+        size_t old = b->size;
         split(b, want);
-        if (b->next && b->next->free) {
-            /* the split remainder can merge with a following free block */
-            coalesce_next(b);
+        if (b->size != old) {
+            /* split() spun a free remainder off the back of a LIVE block, so
+             * the accounting has to follow it, and the remainder — not `b` — is
+             * the block that may now sit next to another free block. Coalescing
+             * from `b` instead would merge the remainder straight back in (a
+             * silent no-op shrink), and on the branch where split() declined it
+             * would absorb a genuinely free neighbour into the live block:
+             * stat_in_use goes stale, heap_check() cannot see it because the
+             * sizes still add up, and the eventual kfree underflows the counter.
+             */
+            stat_in_use -= (old - b->size);
+            if (b->next) coalesce_next(b->next);
         }
-        /* stat_in_use reflects the (possibly reduced) size after split */
         return p;
     }
 
@@ -219,7 +255,7 @@ void *kmemalign(size_t align, size_t n) {
     if (align <= ALIGN) return kmalloc(n);
     if (align & (align - 1)) panic("kmemalign: alignment not power of two");
 
-    n = align_up(n, ALIGN);
+    if (!round_request(n, &n)) panic("kmemalign: out of memory");
 
     for (block_t *b = heap_head; b; b = b->next) {
         if (!b->free) continue;

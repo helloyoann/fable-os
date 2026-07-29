@@ -1,9 +1,9 @@
 # =========================================================================
 # A driver written in the driver VM's ISA, driving real hardware.
 #
-# This is the case that makes the next phase's failures attributable. The VM
-# (include/dvm.h) was verified against a synthetic device on the host, and the
-# reference AC'97 program (vm/programs/ac97_bringup.dvm) is verified against a
+# This is the case that makes a model-written driver's failures attributable.
+# The VM (include/dvm.h) was verified against a synthetic device on the host, and
+# the reference AC'97 program (vm/programs/ac97_bringup.dvm) against a
 # synthetic codec in tests/host/test_dvm_ac97.c. Neither of those proves that
 # an `out16` in the VM reaches a real device. This does: QEMU is asked for an
 # AC'97 controller, the kernel finds it unclaimed, and the program brings it up
@@ -94,7 +94,7 @@ expect-re: ^ac97: codec says glob_sta=0x100 master=0x0 pcm=0x808, picb \d+ -> \d
 # ---- the device is no longer unclaimed -----------------------------------
 expect: --- device tree ---
 expect-re: ^\s*\[\s*\d+\] pci00:04\.0 audio\s+active\s+driver=ac97vm\s+io=[0-9a-f]+$
-check: device_tree count=12 active=serial0,pci0,kbd0,eth0,rtc0,pci00:04.0
+check: device_tree count=14 active=serial0,fwcfg0,pci0,kbd0,mouse0,eth0,rtc0,pci00:04.0
 
 # The 12 KB program image is malloc'd for the run and freed after it; the heap
 # must balance exactly as it does without an AC'97 attached.

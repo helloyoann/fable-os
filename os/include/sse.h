@@ -1,8 +1,9 @@
 /* sse.h — Server-Sent Events: the model's reply, one token at a time.
  *
  * PURPOSE
- *   The console is 80x25 VGA text. When the transport buffers a whole HTTP
- *   response and then prints it, a paragraph appears in one frame; when it
+ *   The console is a fixed grid of text cells with no scrollback (128x48 on a
+ *   framebuffer, 80x25 on the VGA fallback). When the transport buffers a whole
+ *   HTTP response and then prints it, a paragraph appears in one frame; when it
  *   prints the model's tokens as they land on the wire, the machine looks like
  *   it is thinking out loud. This module is what turns the second thing into
  *   code: a resumable state machine that eats arbitrary TCP-sized chunks of a
@@ -99,7 +100,7 @@
  *   appears twice. net_ask() (the boot self-test, which lives in net.c) already
  *   suppresses its own second print via sse_http_streamed(). chat.c needs the
  *   same guard and is outside this change's ownership, so it is reported rather
- *   than made. It is currently unobservable: with no API key compiled in the
+ *   than made. It is currently unobservable: with no API key supplied over fw_cfg the
  *   API answers 401, which is not an event stream, so the streaming path never
  *   produces text for chat.c to duplicate.
  *
@@ -107,10 +108,11 @@
  *   Everything in tests/host/test_sse.c is synthetic. The framing, the
  *   reassembly, the HTTP sniff and the byte-at-a-time equivalence are proven
  *   exhaustively there. LIVE streaming against api.anthropic.com is UNPROVEN
- *   and cannot be proven in this tree: there is no key, so the real endpoint
- *   answers 401 every time. The 401 does exercise the content-type sniff and
- *   the verbatim buffering fallback end to end, which is the half of the path
- *   a keyless build can reach.
+ *   and has never been run: the streaming path is only reachable under
+ *   -DTALKOS_STREAM, no build target sets it, and the keyless boot every test
+ *   uses gets a 401, which is not an event stream. The 401 does exercise the
+ *   content-type sniff and the verbatim buffering fallback end to end, which is
+ *   the half of the path a keyless build can reach.
  *
  * PUBLIC API
  *   sse_parser_init / sse_parser_feed / sse_parser_finish   framing

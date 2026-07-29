@@ -1026,6 +1026,23 @@ static const char *label_at(const dvm_program_t *p, uint32_t pc) {
     return NULL;
 }
 
+/* A string operand is model-authored text, and intern_string() has already
+ * decoded \n, \r, \t and \0 into real bytes in the pool. Re-emit it the way
+ * copy_printable() emits dvm_result_t.msg — printable ASCII only — because
+ * dvm.h offers dvm_disasm() as "one instruction back to text, for listings",
+ * i.e. text a caller may print anywhere. Raw, a program whose literal contained
+ * a newline followed by '[' could be listed into something indistinguishable
+ * from a kernel trace line in column zero. */
+static void put_str_operand(sb_t *s, const char *str) {
+    sb_addf(s, "\"");
+    while (str && *str && s->len + 1 < s->cap) {
+        unsigned char c = (unsigned char)*str++;
+        s->p[s->len++] = (c >= 0x20 && c < 0x7F) ? (char)c : '?';
+        s->p[s->len]   = '\0';
+    }
+    sb_addf(s, "\"");
+}
+
 static void put_operand(sb_t *s, const dvm_program_t *p, uint8_t kind, uint64_t v) {
     switch (kind) {
         case DVM_O_REG: sb_addf(s, "r%lu", (unsigned long)v); break;
@@ -1039,7 +1056,7 @@ static void put_operand(sb_t *s, const dvm_program_t *p, uint8_t kind, uint64_t 
             else   sb_addf(s, "@%lu", (unsigned long)v);
             break;
         }
-        case DVM_O_STR: sb_addf(s, "\"%s\"", str_at(p, v)); break;
+        case DVM_O_STR: put_str_operand(s, str_at(p, v)); break;
         default: sb_addf(s, "-"); break;
     }
 }
@@ -1418,6 +1435,26 @@ static int port_allowed(const dvm_policy_t *p, uint32_t port, uint32_t width) {
     return 0;
 }
 
+/* Buffers for the three "what was this program allowed to touch" strings, sized
+ * from the policy limits rather than guessed, so a diagnostic can never hide a
+ * grant the program actually has. One port range renders as "0xffff-0xffff,"
+ * (14 bytes). dvm_policy_check() has already bounded every window to the low
+ * 4 GiB by the time any of these run, so one MMIO window is at most
+ * "0x1fffffff+0x100000000rw," (26) and one PCI function "00:1f.7," (9).
+ *
+ * These were 96 and 128 bytes, i.e. below the maximum policy: a program with a
+ * full port table was told about its first six ranges and not the other two.
+ * Note that a TRAP message is separately bounded by DVM_MSG_MAX, so a maximal
+ * policy can still be clipped there — but it is clipped in one place, with a
+ * stated size, instead of twice. */
+#define PORT_GRANTS_CAP (DVM_MAX_PORT_RANGES * 14 + 1)
+#define MMIO_GRANTS_CAP (DVM_MAX_MMIO_WINS  * 26 + 1)
+#define PCI_GRANTS_CAP  (DVM_MAX_PCI_FNS    *  9 + 1)
+/* One buffer serves all three lines in dvm_run(): the widest of them. */
+#define GRANTS_CAP MMIO_GRANTS_CAP
+_Static_assert(GRANTS_CAP >= PORT_GRANTS_CAP && GRANTS_CAP >= PCI_GRANTS_CAP,
+               "GRANTS_CAP must hold the widest grant list");
+
 static void put_port_grants(sb_t *s, const dvm_policy_t *p) {
     if (!p->nport) { sb_addf(s, "none"); return; }
     for (int i = 0; i < p->nport; i++)
@@ -1451,7 +1488,7 @@ static dvm_status_t port_gate(run_t *st, uint64_t rawport, uint32_t width,
                     what, (unsigned long)rawport, why);
 
     if (!port_allowed(st->pol, (uint32_t)rawport, width)) {
-        char g[96];
+        char g[PORT_GRANTS_CAP];
         sb_t s; sb_init(&s, g, sizeof g);
         put_port_grants(&s, st->pol);
         return trap(st, DVM_TRAP_PORT_DENIED,
@@ -1497,7 +1534,7 @@ static dvm_status_t mmio_gate(run_t *st, uint64_t addr, uint32_t width, int writ
         if (addr >= c->base && addr + width <= c->base + c->size) { w = c; break; }
     }
     if (!w) {
-        char g[128];
+        char g[MMIO_GRANTS_CAP];
         sb_t s; sb_init(&s, g, sizeof g);
         put_mmio_grants(&s, st->pol);
         return trap(st, DVM_TRAP_MMIO_DENIED,
@@ -1566,6 +1603,11 @@ static dvm_status_t execute(run_t *st) {
             return DVM_OK;
 
         case DVM_ABORT: {
+            /* Sanitised HERE and not only inside trap(): trap() copy_printable()s
+             * what lands in dvm_result_t.msg, but it hands the raw formatted
+             * reason to trace_err(), which would escape a control byte as \x0a
+             * rather than fold it to '?'. Doing it first makes the trap line and
+             * the returned message read identically. */
             char msg[DVM_MSG_MAX];
             copy_printable(msg, sizeof msg, str_at(p, in->val[0]));
             return trap(st, DVM_TRAP_ABORT, "%s", msg);
@@ -1873,15 +1915,13 @@ static dvm_status_t execute(run_t *st) {
 dvm_status_t dvm_run(const dvm_program_t *p, const dvm_policy_t *pol,
                      const dvm_io_t *io, const uint64_t *args, int nargs,
                      dvm_result_t *res) {
-    static const dvm_policy_t deny_all_fallback;   /* zeroed: refuses everything */
-
     if (!res) return DVM_TRAP_POLICY;
     dz(res, sizeof *res);
 
     run_t st;
     dz(&st, sizeof st);
     st.p   = p;
-    st.pol = pol ? pol : &deny_all_fallback;
+    st.pol = pol;          /* the null check below runs before anything reads it */
     st.io  = io;
     st.res = res;
 
@@ -1922,7 +1962,7 @@ dvm_status_t dvm_run(const dvm_program_t *p, const dvm_policy_t *pol,
      * what the program was permitted to touch, which is half of any later
      * diagnosis of what it did. */
     if (pol->trace != DVM_TRACE_OFF) {
-        char g[192];
+        char g[GRANTS_CAP];
         sb_t s;
 
         sb_init(&s, g, sizeof g);

@@ -59,6 +59,25 @@
 /* Debugging off (we print our own progress). */
 #define LWIP_DEBUG                  0
 
+/* ASSERTIONS ARE ON, AND A FAILED ONE HALTS THE MACHINE.
+ *
+ * LWIP_NOASSERT is deliberately not defined, so every LWIP_ASSERT in the
+ * vendored tree is live, and port/arch/cc.h routes LWIP_PLATFORM_ASSERT to
+ * panic() — which on this kernel is `for(;;) { cli; hlt; }`. tcp_in.c and
+ * pbuf.c alone carry dozens of assertions on the RECEIVE path, so this is a
+ * decision about untrusted network input: a peer that trips one takes the
+ * machine down permanently, with no interface left to explain it.
+ *
+ * It is kept that way on purpose for now. This kernel has no memory protection
+ * and one address space; an lwIP invariant that has already been violated means
+ * the packet path is in a state its authors say is impossible, and continuing
+ * from there corrupts silently instead of loudly. Halting is legible: the last
+ * line printed is "lwIP ASSERT: <the invariant>".
+ *
+ * The alternative worth building later is a per-assert reaction that drops the
+ * pbuf and returns, rather than either extreme. That needs a change in
+ * port/arch/cc.h (not here) and a way to report it to the operator. */
+
 /* TLS via the altcp layer + mbedTLS port.
  *
  * ALTCP_MBEDTLS_AUTHMODE is handed straight to mbedtls_ssl_conf_authmode() by

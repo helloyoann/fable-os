@@ -1,5 +1,4 @@
-/* fault.c — decode, capture, render and (since Phase 3b) recover from a CPU
- *           fault.
+/* fault.c — decode, capture, render and recover from a CPU fault.
  *
  * Everything in this file is pure logic over a fault_frame_t and a
  * fault_window_t. It has no hardware dependencies, allocates nothing, and reads
@@ -19,7 +18,7 @@
  *
  * FILE LAYOUT
  *   naming / error-code decoding / window tests / backtrace / capture / report
- *       ... unchanged from Phase 3a: turning a frame into words.
+ *       ... turning a frame into words.
  *   x86_insn_length
  *       ... a partial, deliberately timid instruction-length decoder.
  *   registers, fault_apply_plan
@@ -126,7 +125,7 @@ int fault_has_error_code(uint64_t vector) {
 int fault_is_fatal(uint64_t vector) {
     /* #DB and #BP are traps: RIP already points past the instruction that
      * caused them, so returning simply continues. Nothing in this kernel raises
-     * either one today, but a debugger stub or a Phase 3b breakpoint will, and
+     * either one today, but a debugger stub or a planted breakpoint will, and
      * halting the machine on a breakpoint would be absurd.
      *
      * Vectors >= 32 cannot fire (IF is 0 and every PIC line is masked), so one
@@ -426,7 +425,14 @@ size_t fault_format_report(const fault_record_t *r, char *dst, size_t cap) {
     }
 
     const fault_frame_t *f = &r->regs;
-    char scratch[320];
+    /* Big enough for the LONGEST thing decoded into it, which is a #PF error
+     * code with every reported bit set: 63 bytes for the three-way summary + 40
+     * (reserved bit) + 157 (the NX/EFER.NXE note, the longest single clause) +
+     * 26 (protection key) + 21 (shadow stack) + 13 (SGX) = 320 characters, i.e.
+     * 321 bytes with the terminator. It was exactly 320, so that combination
+     * lost its last character — a silently truncated diagnosis on a machine
+     * where this string is the whole account of the fault. */
+    char scratch[384];
 
     ap(dst, cap, &off, "\n" RULE);
     ap(dst, cap, &off, "*** KERNEL FAULT: %s (vector %lu) - %s\n",
@@ -1083,7 +1089,7 @@ fault_fix_t fault_apply_plan(fault_frame_t *frame, const fault_window_t *window,
 /* ====================================================================== */
 
 /* WHY A RING AND NOT A SLOT
- *   Phase 3a kept exactly one record, which was sound while every fault was
+ *   This started as exactly one record, which was sound while every fault was
  *   terminal: there could never be a second one. The moment a fault can resume,
  *   the single slot becomes a use-after-free with extra steps — tools/
  *   fault_tools.c hands the model a pointer into it, the model's next tool call

@@ -305,13 +305,13 @@ static void test_registration(void) {
     }
 
     /* Only the two power tools change system state. */
-    CHECK_EQ(tool_find("device_suspend")->flags & TOOL_MUTATES, TOOL_MUTATES);
-    CHECK_EQ(tool_find("device_resume")->flags & TOOL_MUTATES, TOOL_MUTATES);
-    CHECK_EQ(tool_find("device_list")->flags & TOOL_MUTATES, 0);
-    CHECK_EQ(tool_find("device_info")->flags & TOOL_MUTATES, 0);
-    CHECK_EQ(tool_find("pci_list")->flags & TOOL_MUTATES, 0);
-    CHECK_EQ(tool_find("pci_info")->flags & TOOL_MUTATES, 0);
-    CHECK_EQ(tool_find("pci_config_read")->flags & TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("device_suspend", TOOL_MUTATES, TOOL_MUTATES);
+    CHECK_TOOL_FLAGS("device_resume", TOOL_MUTATES, TOOL_MUTATES);
+    CHECK_TOOL_FLAGS("device_list", TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("device_info", TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("pci_list", TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("pci_info", TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("pci_config_read", TOOL_MUTATES, 0);
 }
 
 static void test_schema_assembly(void) {

@@ -18,22 +18,101 @@
 #include "tool.h"
 #include "trace.h"
 
+#include <stdio.h>      /* snprintf, via port/stdio.h when freestanding */
+
 /* ====================================================================== */
 /* what the machine tells the model it is                                  */
 /* ====================================================================== */
 
+/* THE SYSTEM PROMPT IS PART OF THE OPERATING SYSTEM.
+ *
+ * It is the only place the model is told what machine it is running, and the
+ * operator's whole experience turns on whether it is specific. "Be helpful and
+ * use your tools" produces a model that narrates plausible kernel work; a prompt
+ * that states this kernel's actual constraints produces one that inspects,
+ * mutates, reads the result back and reports what really happened. So every
+ * sentence below is a fact about THIS build, checkable against the source:
+ *
+ *   - single-threaded, ring 0, IF=0, all PIC lines masked, everything polled:
+ *     boot/boot.asm, arch/x86_64/idt.c, kernel/main.c's loop. There is nothing
+ *     to schedule, nothing to wait for, nobody else to blame.
+ *   - the VFS is RAM-backed (fs/native/ramfs.c): work is lost on reboot, which
+ *     the model must say out loud rather than implying persistence.
+ *   - the tool list is the whole syscall surface: tools[] in this request IS
+ *     tool.h's registry, assembled from it (core/tool.c), so "I do not have a
+ *     tool for that" is a checkable statement and inventing a name is not.
+ *   - trace lines are emitted by the kernel in C after each call returns
+ *     (lib/trace.c) and a '[' in column zero cannot be produced by prose
+ *     (print_model_prose below). Telling the model this is not a threat, it is
+ *     information: claiming an action it did not take is not merely wrong, it is
+ *     visibly wrong to the operator, and honest failure is strictly better.
+ *   - the round budget is real and finite, and the loop reports how much is
+ *     left after each round (see the kernel note in blocks_buf).
+ *
+ * The one thing this prompt must keep verbatim is its opening clause, which
+ * tests/host/test_chat.c pins as "the machine tells the model what it is".
+ */
 static const char SYSTEM_PROMPT[] =
     "You are the resident intelligence of talk-os, a bare-metal x86-64 kernel. "
     "You are not an assistant running on the machine: you ARE its user "
-    "interface. There is no shell, no commands and no other way for the "
-    "operator to drive this computer.\n"
-    "Use the tools to inspect and change real kernel state. Never claim an "
-    "action you did not perform with a tool, and never describe what a tool "
-    "would do instead of calling it.\n"
-    "The kernel prints its own [bracketed] trace line for every tool call, so "
-    "the operator can already see exactly what happened - do not repeat the "
-    "mechanics back to them. Answer in one or two plain sentences. If nothing "
-    "you have can do what was asked, say so plainly.";
+    "interface. There is no shell, no commands, no filesystem browser and no "
+    "other way for the operator to drive this computer. A sentence typed at the "
+    "prompt is the only input; your tool calls are the only way anything "
+    "happens.\n"
+
+    "\nTHE MACHINE. One CPU, ring 0, single-threaded, no userspace, no "
+    "processes, no memory protection: every tool call runs in the kernel's own "
+    "address space and finishes before the next one starts. Interrupts are "
+    "masked and all hardware is polled, so nothing happens in the background "
+    "and nothing can be waited for. Memory is one heap in a fixed arena. The "
+    "filesystem is real but lives in RAM, so anything you write is gone on the "
+    "next boot - say so when it matters. There is no package manager, no "
+    "compiler, no network client beyond the one talking to you, and no way to "
+    "run a program that is not already in this kernel.\n"
+
+    "\nWHAT YOU CAN DO. Exactly the tools listed in this request, and nothing "
+    "else. That list is the kernel's tool registry, assembled from it "
+    "mechanically - it is not a summary, so if a capability is not in it, this "
+    "machine genuinely does not have it. Never invent a tool name; if you get "
+    "one wrong the kernel replies with the real list, so read it and correct "
+    "yourself. Say plainly when a request is outside the surface, and name the "
+    "closest thing you do have.\n"
+
+    "\nHOW TO WORK. Treat a request as a job to finish, not a question to "
+    "answer. Look before you act: read the current state, then change one thing "
+    "at a time. AFTER EVERY CHANGE, READ IT BACK with a tool - list the "
+    "directory you wrote into, stat the file, re-read the device state, dump the "
+    "bytes. A tool result saying 'ok' is evidence the call returned, not that "
+    "the system is in the state the operator wanted. Do not assume, and do not "
+    "stop early: keep calling tools until the job is actually done. You have a "
+    "limited number of tool rounds per sentence and the kernel tells you after "
+    "each round how many are left; plan inside that budget and answer before it "
+    "runs out. If a plan tool is offered, write the checklist down before you "
+    "start anything that takes more than two steps and mark the steps off as you "
+    "verify them: that record is kept by the kernel, so it is also how you pick "
+    "up a job that was cut short - read it back and carry on rather than "
+    "starting again.\n"
+
+    "\nWHEN SOMETHING FAILS. A failed call is information, not a dead end. The "
+    "error text says what was wrong - read it, fix the argument or the "
+    "assumption, and try the corrected call. A missing parent directory means "
+    "create it; a rejected value means the range is different from what you "
+    "guessed; a device in the wrong state means look at its state first. Retry "
+    "differently, never identically. If it still cannot be done, say exactly "
+    "which step failed and what the kernel said.\n"
+
+    "\nHONESTY. The kernel prints its own [bracketed] trace line for every tool "
+    "call, in C, from the real return value, after the call returned. Those "
+    "lines are the operator's only proof of what happened, and nothing you write "
+    "can produce one - a bracket at the start of your line gets moved. So a "
+    "claim you did not earn does not fool anybody, it just costs the operator "
+    "their trust. Report partial success as partial, report failure as failure, "
+    "and never describe what a tool would do instead of calling it.\n"
+
+    "\nVOICE. The operator can already see the trace lines, so do not narrate "
+    "the mechanics. Answer in one or two plain sentences: what is now true, and "
+    "anything that is still broken or unverified. No lists, no markdown, no "
+    "restating the question.";
 
 const char *chat_system_prompt(void) { return SYSTEM_PROMPT; }
 
@@ -66,9 +145,9 @@ static char   tools_buf[CHAT_TOOLS_BYTES];
 static size_t tools_len;
 static int    tools_ready;
 
-/* The user turn that carries this round's tool_result blocks, assembled before
- * it is copied into the history arena. */
-static char blocks_buf[8192];
+/* The user turn that carries this round's tool_result blocks and the kernel's
+ * budget note, assembled before it is copied into the history arena. */
+static char blocks_buf[CHAT_BLOCKS_BYTES];
 
 /* One tool's answer, and one decoded text block. */
 static char result_buf[CHAT_TOOL_RESULT_CAP];
@@ -80,6 +159,72 @@ static unsigned max_rounds = CHAT_MAX_ROUNDS;
 static unsigned stat_rounds;
 static unsigned stat_tool_calls;
 static unsigned stat_evictions;
+static unsigned stat_retries;      /* link failures retried in this turn */
+
+/* ====================================================================== */
+/* the action journal — what the kernel actually ran                       */
+/* ====================================================================== */
+
+/* A ring, so a long session keeps the most recent actions rather than the first
+ * ones. Deliberately NOT rolled back with the conversation: the conversation is
+ * a record of what was said and must stay valid to be resent, while this is a
+ * record of what the machine DID, and a turn that was abandoned still did it.
+ * That asymmetry is the whole value — see chat.h. */
+static chat_action_t journal[CHAT_JOURNAL_ENTRIES];
+static unsigned      journal_total;          /* dispatched since boot */
+
+unsigned chat_turn(void)         { return hist_epoch; }
+unsigned chat_action_total(void) { return journal_total; }
+
+unsigned chat_action_count(void) {
+    return journal_total < CHAT_JOURNAL_ENTRIES ? journal_total
+                                                : CHAT_JOURNAL_ENTRIES;
+}
+
+const chat_action_t *chat_action_at(unsigned i) {
+    unsigned n = chat_action_count();
+    if (i >= n) return (const chat_action_t *)0;
+    /* Oldest kept entry first. Once the ring has wrapped, that is the slot
+     * immediately after the newest. */
+    unsigned base = (journal_total <= CHAT_JOURNAL_ENTRIES)
+                        ? 0 : journal_total % CHAT_JOURNAL_ENTRIES;
+    return &journal[(base + i) % CHAT_JOURNAL_ENTRIES];
+}
+
+/* Copy a bounded, single-line, printable-only summary. The name and the result
+ * text are both reachable from model output (an unknown tool name is echoed, and
+ * a tool may quote its arguments), and this text is handed back to the model
+ * later, so it is sanitised at the point of record rather than at every reader:
+ * no control bytes, no second line, no brackets that could be mistaken for the
+ * kernel's own voice if a reader ever prints it. */
+static void journal_copy(char *dst, size_t cap, const char *src) {
+    size_t j = 0;
+    if (cap == 0) return;
+    for (size_t i = 0; src && src[i] && j + 1 < cap; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '\n' || c == '\r') break;             /* first line only */
+        if (c < 0x20 || c == 0x7F) continue;           /* not text */
+        if (c == '[') c = '{';
+        if (c == ']') c = '}';
+        dst[j++] = (char)c;
+    }
+    /* Trailing spaces carry nothing and make an equality test surprising. */
+    while (j && dst[j - 1] == ' ') j--;
+    dst[j] = '\0';
+}
+
+/* Record one dispatched call, from the dispatch result — never from the model's
+ * account of it. */
+static void journal_record(const char *name, const char *detail, int failed) {
+    chat_action_t *e = &journal[journal_total % CHAT_JOURNAL_ENTRIES];
+
+    journal_total++;
+    e->seq    = journal_total;
+    e->turn   = hist_epoch;
+    e->failed = failed ? 1 : 0;
+    journal_copy(e->name, sizeof e->name, (name && name[0]) ? name : "(no name)");
+    journal_copy(e->detail, sizeof e->detail, detail);
+}
 
 /* ====================================================================== */
 /* history                                                                 */
@@ -96,9 +241,11 @@ static void tools_load(void);
 void chat_init(model_transport_t *t) {
     transport = t;
     chat_reset();
-    stat_rounds = stat_tool_calls = stat_evictions = 0;
+    stat_rounds = stat_tool_calls = stat_evictions = stat_retries = 0;
     max_rounds  = CHAT_MAX_ROUNDS;
     tools_ready = 0;
+    journal_total = 0;
+    memset(journal, 0, sizeof journal);
     /* Assemble the schema now rather than on the first sentence: its size is a
      * fixed property of this build, and the operator should learn at boot — not
      * mid-turn — if the machine's own syscall surface does not fit. */
@@ -228,12 +375,62 @@ static void tools_load(void) {
     tools_len = need;
 }
 
+/* On the final permitted round the request is sent with tool calling turned OFF.
+ * That is what converts the round cap from a silent abort into an answer: the
+ * model was told in the previous round's budget note that this round is its
+ * last, and with no tool available the only continuation left is the report the
+ * operator actually needs.
+ *
+ * WHY THIS IS `tool_choice` AND NOT "OMIT THE tools ARRAY". Dropping the schema
+ * looks like the obvious way to withhold the tools, and it is the version that
+ * quietly breaks: by the final round the history necessarily contains tool_use
+ * and tool_result blocks, and the API's documented behaviour for a conversation
+ * whose history references a tool no longer present in `tools` is a 400 (it is
+ * spelled out for the advisor tool, and a whole beta exists for removing a tool
+ * mid-conversation properly). A 400 on the last round is strictly worse than
+ * today's abort — the operator would get an HTTP error instead of a report.
+ * `{"type":"none"}` is the supported, documented way to say "answer, do not
+ * call anything", and it leaves the schema in place so every tool_use in the
+ * history still resolves.
+ *
+ * It is spliced in here rather than passed through model.h because net/model.c
+ * has no tool_choice field and is not this agent's to change — see the report.
+ * The splice is the same shape net/net.c already uses for "stream":true: insert
+ * one member immediately after the opening brace of an object we just built,
+ * then re-parse the result and fall back to the untouched body if it did not
+ * come out valid. Nothing model-controlled reaches this text. */
+static const char TOOL_CHOICE_NONE[] = "{\"tool_choice\":{\"type\":\"none\"},";
+
+static int forbid_tool_calls(char *body, size_t len, size_t cap, size_t *out_len) {
+    size_t add = sizeof TOOL_CHOICE_NONE - 2;        /* without the '{' and NUL */
+
+    /* Only ever edit something that really is the object model_build promises. */
+    if (len < 2 || body[0] != '{' || body[1] != '"') return -1;
+    if (len + add + 1 > cap)                         return -1;
+
+    memmove(body + add + 1, body + 1, len - 1);
+    memcpy(body, TOOL_CHOICE_NONE, add + 1);
+
+    size_t n = len + add;
+    body[n] = '\0';
+
+    /* Re-read our own output with the parser that faces the network, exactly as
+     * model_build does: a body we cannot parse is never worth sending. */
+    json_value_t v;
+    if (json_parse(body, n, &v) != JSON_OK || v.type != JSON_OBJECT) return -1;
+
+    *out_len = n;
+    return 0;
+}
+
 /* Build the next request from the whole history. On overflow, forget the
  * oldest exchange and try again — a shorter memory beats a dead machine. */
-static int build_request(size_t *out_len) {
+static int build_request(size_t *out_len, int offer_tools) {
     static model_msg_t msgs[CHAT_HISTORY_MSGS];
 
     tools_load();
+
+    size_t offer_len = tools_len;
 
     for (;;) {
         for (size_t i = 0; i < hist_n; i++) {
@@ -247,13 +444,22 @@ static int build_request(size_t *out_len) {
         rq.model         = (const char *)0;      /* model.c's compiled default */
         rq.max_tokens    = 1024;
         rq.system        = SYSTEM_PROMPT;
-        rq.tools         = tools_len ? tools_buf : (const char *)0;
-        rq.tools_len     = tools_len;
+        rq.tools         = offer_len ? tools_buf : (const char *)0;
+        rq.tools_len     = offer_len;
         rq.messages      = msgs;
         rq.message_count = hist_n;
 
         int n = model_build(req_buf, sizeof req_buf, &rq);
-        if (n >= 0) { *out_len = (size_t)n; return CHAT_OK; }
+        if (n >= 0) {
+            size_t len = (size_t)n;
+            /* A failed splice is not a failed turn: the body is still the valid
+             * request model_build produced, and a model that answers with a tool
+             * call on its last round is handled by the cap as before. */
+            if (!offer_tools)
+                forbid_tool_calls(req_buf, len, sizeof req_buf, &len);
+            *out_len = len;
+            return CHAT_OK;
+        }
 
         if (n == MODEL_ENOSPC && hist_drop_oldest_epoch()) {
             kputs("[chat: request over budget - forgot the oldest exchange]\n");
@@ -289,19 +495,72 @@ static int build_request(size_t *out_len) {
  *
  *   The invariant this function enforces is the cheapest one that cannot be
  *   talked around: A KERNEL TRACE LINE IS A '[' IN COLUMN ZERO. Model prose is
- *   never allowed to put one there — a line that would start with '[' gets a
+ *   never allowed to put one there — a '[' that would land in column zero gets a
  *   single leading space. Prose is otherwise untouched, so the model can still
  *   write about brackets, quote a trace line back, or use them mid-sentence;
  *   it just cannot occupy the one position that means "the kernel says so".
+ *
+ *   TWO WAYS THAT INVARIANT WAS ESCAPED, AND WHY IT IS NOW WRITTEN LIKE THIS.
+ *   The first version of this function tracked line starts itself, with
+ *   `at_line_start = (c == '\n')`. That is a MODEL of the console, and the
+ *   console disagreed with it in three places (all reproduced against this
+ *   function, all now regression-tested in tests/host/test_chat.c):
+ *
+ *     1. '\r' — kputc() resets the column on a carriage return, and json.c
+ *        decodes "\r" into a raw 0x0D. `x\r[vfs_write ... -> ok]` therefore put
+ *        a byte-exact forgery in column zero.
+ *     2. '\b' — kputc() steps the cursor left, and from column zero it steps UP
+ *        a row. So backspaces reach column zero, and enough of them walk back
+ *        into a GENUINE trace line printed earlier and overwrite it. That is
+ *        worse than forgery: it is erasure.
+ *     3. wrap — printing in the last column returns the cursor to column zero
+ *        with no newline involved at all. Exactly 80 printable characters of
+ *        prose, then '[', and the forgery lands.
+ *
+ *   Both halves of the fix follow from those. First, prose does not get to move
+ *   the cursor: every C0 control byte except '\n' and '\t' is escaped as \xNN,
+ *   the same way lib/trace.c sanitizes an argument. Prose is text, not
+ *   cursor control, and a reply has no legitimate reason to emit a carriage
+ *   return. Second, the column is not modelled, it is ASKED FOR —
+ *   console_cursor() is the console's own count, so wrap, scroll, tabs and any
+ *   future console change are covered by construction rather than by a rule
+ *   here that has to be kept in sync. lib/base.c owns the console; it owns the
+ *   column too.
  */
-static void print_model_prose(const char *s) {
-    int at_line_start = 1;
-    for (size_t i = 0; s[i]; i++) {
-        char c = s[i];
-        if (at_line_start && c == '[') kputc(' ');
-        kputc(c);
-        at_line_start = (c == '\n');
+/* The length-counted core. It exists because one caller — the raw HTTP body
+ * fallback in print_http_error() — holds a span, not a C string: the body is
+ * whatever answered on 443 and may contain embedded NULs, so stopping at the
+ * first one would leave the rest of an attacker's payload unexamined while
+ * kputc('\0') went to the framebuffer. Everything else calls the string form. */
+static void print_untrusted_n(const char *s, size_t len) {
+    static const char hex[] = "0123456789abcdef";
+
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+
+        /* Cursor control is not prose. '\n' and '\t' are the two controls that
+         * only ever move forward, so they are the two that survive. */
+        if ((c < 0x20 && c != '\n' && c != '\t') || c == 0x7F) {
+            kputc('\\');
+            kputc('x');
+            kputc(hex[(c >> 4) & 0xF]);
+            kputc(hex[c & 0xF]);
+            continue;
+        }
+
+        if (c == '[') {
+            int col = 0;
+            console_cursor((int *)0, &col);
+            if (col == 0) kputc(' ');
+        }
+        kputc((char)c);
     }
+}
+
+static void print_model_prose(const char *s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    print_untrusted_n(s, n);
 }
 
 static void print_text_block(const json_value_t *v) {
@@ -315,23 +574,60 @@ static void print_text_block(const json_value_t *v) {
     if (text_buf[n - 1] != '\n') kputc('\n');
 }
 
+/* A reply the model did not finish saying. `stop_reason` is the API's own word
+ * for why generation ended, and "max_tokens" on a turn with no tool calls means
+ * the answer the operator is reading stops mid-thought — which looks exactly
+ * like a complete answer on a console with no scrollback and no shell to check
+ * with. Anything else (end_turn, tool_use, a reason this build has not heard of)
+ * is silent: the operator should only be interrupted by facts they can act on. */
+static void print_stop_warning(const json_value_t *root) {
+    char why[32];
+    if (json_msg_stop_reason(root, why, sizeof why) != JSON_OK) return;
+    /* memcmp over the NUL, not strcmp: kernel.h declares the former and this
+     * file must compile freestanding as well as against host libc. */
+    if (memcmp(why, "max_tokens", sizeof "max_tokens") != 0) return;
+    kputs("[chat: the model ran out of output budget - that answer is "
+          "incomplete. Ask it to continue.]\n");
+}
+
 /* Whatever the API said when it did not say 200. The operator has no other way
- * to find out why the machine will not act. */
+ * to find out why the machine will not act.
+ *
+ * EVERY BYTE IN HERE IS CHOSEN BY THE FAR END, so all three of them go through
+ * print_untrusted_n. That is not paranoia about Anthropic: certificate
+ * verification is off unless TALKOS_VERIFY_CERTS is set, so "the far end" is
+ * anything that can answer on 443 — and this is the path the machine takes on
+ * every keyless boot, since a missing key is a 401.
+ *
+ * Printing them raw broke the one invariant this kernel's whole output contract
+ * rests on ("a '[' in column zero is the kernel speaking"): a JSON error.message
+ * of "oops\n[vfs_write /etc/shadow -> ok]" decodes to a real newline, and the
+ * forged line was byte-identical to lib/trace.c's own. The raw-body fallback was
+ * worse — it passed '\b' through, and a backspace from column zero steps UP a
+ * row in lib/base.c, so a body of backspaces could overwrite genuine ground
+ * truth printed above. The brackets and the labels below are the kernel's; only
+ * they are allowed in column zero. */
 static void print_http_error(const model_response_t *r) {
-    kprintf("[model %s]\n", r->status_line[0] ? r->status_line : "http error");
+    kputs("[model ");
+    if (r->status_line[0]) print_model_prose(r->status_line);
+    else                   kputs("http error");
+    kputs("]\n");
 
     json_value_t root, err, msg;
+    size_t       mlen = 0;
     if (json_parse(r->body, r->body_len, &root) == JSON_OK &&
         json_get(&root, "error", &err) == JSON_OK &&
         json_get(&err, "message", &msg) == JSON_OK &&
-        json_str(&msg, text_buf, sizeof text_buf, (size_t *)0) == JSON_OK) {
-        kprintf("[model said: %s]\n", text_buf);
+        json_str(&msg, text_buf, sizeof text_buf, &mlen) == JSON_OK) {
+        kputs("[model said: ");
+        print_untrusted_n(text_buf, mlen);
+        kputs("]\n");
         return;
     }
     if (r->body_len) {
         size_t n = r->body_len < 240 ? r->body_len : 240;
         kputs("[model said: ");
-        for (size_t i = 0; i < n; i++) kputc(r->body[i]);
+        print_untrusted_n(r->body, n);
         kputs("]\n");
     }
 }
@@ -340,23 +636,52 @@ static void print_http_error(const model_response_t *r) {
 /* one round of tool calls                                                 */
 /* ====================================================================== */
 
-/* Append one tool_result block to the staging writer. The result text is
- * clipped to whatever escaped room is left rather than being allowed to
- * overflow: a tool_use with no matching result invalidates the whole
- * conversation, so a short answer is always better than a missing one. */
-static void put_tool_result(json_writer_t *w, int first, const char *id,
-                            const char *text, int is_error) {
+/* Fixed cost of one tool_result block that carries no text at all: the two keys
+ * (36), the content key (11), the optional is_error member (16), the braces and
+ * the separating comma (3), the content quotes (2) and the "...[clipped]" marker
+ * (13) that a block with no room still emits. 96 rounds that up. Measured
+ * generously on purpose — being wrong in this direction costs a few bytes of
+ * result text, while being wrong the other way overflows the writer. */
+#define RESULT_BLOCK_OVERHEAD  96
+
+/* Room the budget note at the end of the turn needs (a 288-byte sentence plus
+ * its JSON block framing). Reserved from the very first result, so the note can
+ * never be the thing that does not fit. */
+#define BUDGET_NOTE_RESERVE    384
+
+/* Append one tool_result block to the staging writer.
+ *
+ * FAIR SHARE, NOT FIRST COME. Every tool_use MUST come back with a matching
+ * tool_result or the API rejects the whole conversation — a missing result is
+ * not a shorter answer, it is a dead exchange after the side effects already
+ * happened. The first version of this took "whatever room is left" for each
+ * block in turn, which meant one 1 KiB result could leave the remaining seven
+ * calls with nothing: their clip markers then overflowed the writer and the turn
+ * was abandoned *after* eight real mutations had run.
+ *
+ * So each call is given the room left divided by the number of calls still to be
+ * answered (`pending`, including this one), and its text is clipped to fit that
+ * share. Because every block is bounded by its own share and the shares sum to
+ * no more than the room available, the array cannot overflow however the sizes
+ * fall — the last call is as sure of its slot as the first. */
+static void put_tool_result(json_writer_t *w, int first, size_t pending,
+                            const char *id, const char *text, int is_error) {
     static const char MARK[] = "...[clipped]";
+
+    /* The share is computed BEFORE this block's own bytes go in, from the same
+     * writer state every other block sees. */
+    size_t used = json_writer_len(w);
+    size_t tail = BUDGET_NOTE_RESERVE + 2;            /* note + "]" + NUL */
+    size_t avail = (w->cap > used + tail) ? w->cap - used - tail : 0;
+    size_t share = avail / (pending ? pending : 1);
+    size_t idcost = json_escape((char *)0, 0, id);
+    size_t fixed  = RESULT_BLOCK_OVERHEAD + idcost;
+    size_t room   = (share > fixed) ? share - fixed : 0;
 
     if (!first) json_put_char(w, ',');
     json_put(w, "{\"type\":\"tool_result\",\"tool_use_id\":");
     json_put_string(w, id);
     json_put(w, ",\"content\":");
-
-    /* Room left for the escaped text, keeping back this block's own tail and
-     * the array's closing bracket. */
-    size_t used = json_writer_len(w);
-    size_t room = (w->cap > used + 64) ? w->cap - used - 64 : 0;
 
     if (json_escape((char *)0, 0, text) <= room) {
         json_put_string(w, text);
@@ -365,7 +690,10 @@ static void put_tool_result(json_writer_t *w, int first, const char *id,
          * bytes always fit. Conservative beats clever here. */
         char   clip[CHAT_TOOL_RESULT_CAP];
         size_t limit = sizeof clip - sizeof MARK;
-        size_t keep  = room / 6;
+        /* The marker is subtracted first, so even a share with no room for text
+         * still produces a block that fits: the model is told its result was
+         * lost, instead of the conversation being broken by a missing one. */
+        size_t keep  = (room > sizeof MARK) ? (room - sizeof MARK) / 6 : 0;
         size_t tlen  = strlen(text);
 
         if (keep > tlen)  keep = tlen;
@@ -379,6 +707,67 @@ static void put_tool_result(json_writer_t *w, int first, const char *id,
     json_put_char(w, '}');
 }
 
+/* Append the kernel's own block to the tool_result turn: how much of the round
+ * budget is gone.
+ *
+ * WHY THE MODEL IS TOLD. The cap is the loop's hardest edge — reach it and the
+ * turn is abandoned, the history is rolled back and the operator is told the
+ * machine gave up. A model that cannot see the budget cannot plan inside it, so
+ * that outcome used to arrive with no warning, in the middle of a job, and cost
+ * the operator every completed step. One sentence of arithmetic per round is
+ * enough for the model to triage: finish the important half, then report.
+ *
+ * This is the only kernel voice inside the conversation, and it is the loop's
+ * fact, not the model's: written in C from stat_rounds. It is a text block, not
+ * a tool_result, because it answers nothing the model asked for. It goes last so
+ * the tool_result blocks it accompanies still lead the turn, as the API
+ * requires. */
+static void put_budget_note(json_writer_t *w, unsigned used, unsigned cap,
+                            unsigned calls, unsigned failed) {
+    unsigned left = (cap > used) ? cap - used : 0;
+    /* 288 was too small by 33 bytes, and only for the last-round variant — the
+     * one round where the wording is load-bearing. The instruction the model
+     * received ended mid-word at "...means the turn is abandoned a", losing "nd
+     * the operator is told nothing.", i.e. exactly the consequence that makes the
+     * model answer instead of calling another tool. Nothing failed and no test
+     * caught it: snprintf truncates safely, and the existing assertion only
+     * checks the prefix, which survives inside the first 287 bytes. Sized against
+     * the longest variant (321 characters) and bounded by BUDGET_NOTE_RESERVE
+     * above, which the writer already reserves for this note. */
+    char     note[384];
+    _Static_assert(sizeof note <= BUDGET_NOTE_RESERVE,
+                   "the budget note must fit the room build_request reserves");
+
+    /* NOTE: the kernel's vsnprintf has no star-width; literal formats only.
+     *
+     * left == 0 cannot reach the model — the loop aborts on the cap before
+     * sending again, and the note goes with the abandoned turn — so the last note
+     * the model ever reads is the one written with left == 1. That note travels
+     * INSIDE the final request, the one build_request() sends with no tools
+     * attached, which is why it is phrased in the present tense: by the time it
+     * is read, this is already the last round. */
+    if (left <= 1) {
+        snprintf(note, sizeof note,
+                 "kernel: tool round %u of %u used (%u call(s) this round, %u "
+                 "failed). THIS IS YOUR LAST ROUND AND TOOL CALLING IS NOW OFF. "
+                 "Answer it now with prose: what you changed, what you verified "
+                 "by reading it back, and what is left undone. A tool call "
+                 "instead of an answer means the turn is abandoned and the "
+                 "operator is told nothing.",
+                 used, cap, calls, failed);
+    } else {
+        snprintf(note, sizeof note,
+                 "kernel: tool round %u of %u used, %u left (%u call(s), %u "
+                 "failed). Keep going until the job is verified; answer before "
+                 "the budget runs out.",
+                 used, cap, left, calls, failed);
+    }
+
+    json_put(w, ",{\"type\":\"text\",\"text\":");
+    json_put_string(w, note);
+    json_put_char(w, '}');
+}
+
 /* ====================================================================== */
 /* the turn                                                                */
 /* ====================================================================== */
@@ -388,11 +777,32 @@ static int abort_turn(int rc) {
     return rc;
 }
 
+/* Outcomes that say nothing about the work and everything about the link, so
+ * retrying them is not optimism — it is the difference between a turn that lost
+ * its connection and a turn that threw away four completed mutations.
+ *
+ * 500 is deliberately NOT here. A server error is reported to the operator at
+ * once, because on this machine the likeliest cause is the request we just built
+ * rather than the far end, and hammering it with the same body would only hide
+ * that. 429 (rate limited), 503 (unavailable) and 529 (overloaded) are the three
+ * the API uses to say "later", and later is what a retry is. */
+static int http_retryable(int status) {
+    return status == 429 || status == 503 || status == 529;
+}
+
+/* A transport failure worth another go: the connection, the TLS session or the
+ * read deadline. Not EINVAL/ENOSPC (our bug, deterministic), not ESCRIPT (the
+ * mock has simply run out of script, and retrying that is a test that hangs). */
+static int send_retryable(int rc) {
+    return rc == MODEL_ETRANSPORT || rc == MODEL_ETIMEOUT || rc == MODEL_EPROTO;
+}
+
 int chat_ask(const char *sentence) {
     if (!sentence) return CHAT_EINVAL;
 
     stat_rounds     = 0;
     stat_tool_calls = 0;
+    stat_retries    = 0;
 
     if (!transport) {
         kputs("[no link to the model - this machine cannot act]\n");
@@ -408,26 +818,63 @@ int chat_ask(const char *sentence) {
 
     for (;;) {
         if (stat_rounds >= max_rounds) {
+            /* The conversation is rolled back, but the actions were real and the
+             * operator has already seen their trace lines. Say so, and say that
+             * the record survives, so "what did you get done?" is a question the
+             * next sentence can actually answer (chat_action_at(), exposed to the
+             * model as the action_log tool). */
             kprintf("[chat: stopped after %u tool rounds without an answer - "
                     "the turn was abandoned]\n", max_rounds);
+            kprintf("[chat: %u tool calls did run and were traced above; the "
+                    "kernel's record of them survives - ask what was done]\n",
+                    stat_tool_calls);
             return abort_turn(CHAT_ELIMIT);
         }
 
+        /* The last permitted round is sent with tool calling turned off — see
+         * build_request(). The model was warned in the previous round's budget
+         * note, so this is the promise being kept rather than a surprise. */
+        int last_round = (stat_rounds + 1 >= max_rounds);
+
         size_t req_len = 0;
-        int    rc      = build_request(&req_len);
+        int    rc      = build_request(&req_len, !last_round);
         if (rc != CHAT_OK) return abort_turn(rc);
 
         model_response_t r;
         rc = model_send(transport, req_buf, req_len, resp_buf, sizeof resp_buf, &r);
-        stat_rounds++;
         if (rc != MODEL_OK) {
             const char *why = model_last_error(transport);
             kprintf("[model unreachable: %s]\n",
                     (why && why[0]) ? why : model_strerror(rc));
+            /* A retry does NOT spend a round: the model never saw this request,
+             * so charging it for the attempt would shorten the job for a reason
+             * the model cannot see or do anything about. */
+            if (send_retryable(rc) && stat_retries < CHAT_SEND_RETRIES) {
+                stat_retries++;
+                kprintf("[chat: retrying, attempt %u of %u - the work already "
+                        "done this turn is kept]\n",
+                        stat_retries, (unsigned)CHAT_SEND_RETRIES);
+                continue;
+            }
+            stat_rounds++;
             return abort_turn(CHAT_ETRANSPORT);
         }
+        stat_rounds++;
         if (r.http_status != 200) {
             print_http_error(&r);
+            if (http_retryable(r.http_status) && stat_retries < CHAT_SEND_RETRIES) {
+                stat_retries++;
+                stat_rounds--;               /* the model never answered */
+                kprintf("[chat: the API said try later; retrying, attempt %u of "
+                        "%u]\n", stat_retries, (unsigned)CHAT_SEND_RETRIES);
+                /* Nothing to wait on: interrupts are masked and this kernel has
+                 * no timers, so the delay is a polled busy-wait against the TSC
+                 * millisecond clock (lib/base.c). It is the only thing the
+                 * machine can do with the time, and going straight back at a
+                 * rate limiter would earn the same answer. */
+                mdelay(500u * stat_retries);
+                continue;
+            }
             return abort_turn(CHAT_EHTTP);
         }
         if (r.truncated) {
@@ -448,12 +895,22 @@ int chat_ask(const char *sentence) {
 
         size_t nblocks = json_count(&content);
 
-        /* --- pass 1: how many tool calls, and are they all answerable? -----
+        /* --- pass 1: how many tool calls, are they all answerable, and will the
+         * answers fit? -------------------------------------------------------
          * A tool_use with no usable id can never be answered, and an assistant
          * turn containing one can never be echoed back. Find that out before
          * running anything: it is the difference between a turn that fails and
-         * a machine that has acted but cannot say so. */
-        size_t ncalls = 0;
+         * a machine that has acted but cannot say so.
+         *
+         * The same argument applies to room. put_tool_result() guarantees each
+         * answer fits its fair share, but only while a share is bigger than an
+         * empty block; past that many calls, the array cannot be completed at
+         * all. Discovering that AFTER running eight mutations is the worst
+         * outcome available — the work happened and the conversation carrying it
+         * is dead — so the arithmetic is done here, from the real escaped id
+         * lengths, and a round that cannot be answered is refused untouched. */
+        size_t ncalls   = 0;
+        size_t answer_cost = 2 + BUDGET_NOTE_RESERVE;      /* "[" "]" + the note */
         for (size_t i = 0; i < nblocks; i++) {
             json_value_t blk, type, id;
             if (json_at(&content, i, &blk) != JSON_OK)     continue;
@@ -469,6 +926,15 @@ int chat_ask(const char *sentence) {
                 return abort_turn(CHAT_EPROTO);
             }
             ncalls++;
+            answer_cost += RESULT_BLOCK_OVERHEAD +
+                           json_escape((char *)0, 0, idbuf);
+        }
+
+        if (ncalls && answer_cost > sizeof blocks_buf) {
+            kprintf("[chat: the model asked for %u tools at once and their "
+                    "answers cannot fit one request - nothing was run]\n",
+                    (unsigned)ncalls);
+            return abort_turn(CHAT_ENOSPC);
         }
 
         /* --- the assistant turn goes into the history before anything runs,
@@ -487,7 +953,8 @@ int chat_ask(const char *sentence) {
         json_writer_init(&w, blocks_buf, sizeof blocks_buf);
         json_put_char(&w, '[');
 
-        size_t done = 0;
+        size_t done   = 0;                 /* tool_use blocks answered so far */
+        size_t failed = 0;                 /* of those, ones that did not act */
         for (size_t i = 0; i < nblocks; i++) {
             json_value_t blk, type;
             if (json_at(&content, i, &blk) != JSON_OK)    continue;
@@ -514,10 +981,17 @@ int chat_ask(const char *sentence) {
                 namebuf[0] = '\0';
 
             if (done >= CHAT_MAX_TOOL_CALLS) {
-                /* Refuse, but still answer: every tool_use needs a result. */
-                put_tool_result(&w, done == 0, idbuf,
-                                "refused: too many tool calls in one turn", 1);
+                /* Refuse, but still answer: every tool_use needs a result. The
+                 * refusal says what to do instead, because the model's next move
+                 * is decided by this text and "refused" alone invites it to
+                 * repeat the same batch. */
+                put_tool_result(&w, done == 0, ncalls - done, idbuf,
+                                "refused: too many tool calls in one turn - this "
+                                "machine runs at most 8 per round and 8 already "
+                                "ran. Nothing was done for this one; ask for it "
+                                "again next round, in a smaller batch.", 1);
                 done++;
+                failed++;
                 continue;
             }
 
@@ -539,8 +1013,15 @@ int chat_ask(const char *sentence) {
             tool_dispatch(&call, &res);          /* emits the kernel trace line */
             stat_tool_calls++;
 
-            put_tool_result(&w, done == 0, idbuf, result_buf, res.is_error);
+            /* The kernel's own record of the action, taken from the dispatch
+             * result rather than from anything the model will later say about
+             * it, and kept even if this turn is abandoned. */
+            journal_record(namebuf, result_buf, res.is_error);
+
+            put_tool_result(&w, done == 0, ncalls - done, idbuf, result_buf,
+                            res.is_error);
             done++;
+            if (res.is_error) failed++;
         }
 
         if (ncalls == 0) {
@@ -551,9 +1032,15 @@ int chat_ask(const char *sentence) {
                 hist_rollback_epoch();
             }
             if (nblocks == 0) kputs("[chat: the model said nothing]\n");
+            /* An answer cut off by the output budget is half an answer, and the
+             * operator cannot tell by looking. stop_reason is the API's own word
+             * for it, so it is reported as the kernel's fact, not guessed at. */
+            print_stop_warning(&root);
             return CHAT_OK;
         }
 
+        put_budget_note(&w, stat_rounds, max_rounds, (unsigned)done,
+                        (unsigned)failed);
         json_put_char(&w, ']');
         if (!json_writer_ok(&w)) {
             kprintf("[chat: %u tool results do not fit one turn - "

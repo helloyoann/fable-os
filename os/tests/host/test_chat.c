@@ -28,19 +28,10 @@
 
 /* REGISTER_TOOL puts a pointer in the linker-collected "tool_table" section,
  * which is an ELF idiom: Mach-O needs a segment name too, and spells the
- * section bounds differently. Same shim tools/vfs_tools.c and
- * tests/host/test_vfs_tools.c use, so the host build sees the same table the
- * kernel's linker script builds. */
-#ifdef __APPLE__
-__asm__(".globl ___start_tool_table\n"
-        ".set   ___start_tool_table, section$start$__DATA$tool_table\n"
-        ".globl ___stop_tool_table\n"
-        ".set   ___stop_tool_table, section$end$__DATA$tool_table\n");
-#  undef  REGISTER_TOOL
-#  define REGISTER_TOOL(v)                                                     \
-      static const tool_t *const __toolptr_##v                                 \
-          __attribute__((used, section("__DATA,tool_table"))) = &(v)
-#endif
+ * section bounds differently. tests/host/tooltable.h owns that shim (and the
+ * one attribute that keeps the walk legal under ASan), so the host build sees
+ * the same table the kernel's linker script builds. */
+#include "tooltable.h"
 
 /* ====================================================================== */
 /* throwaway tools                                                         */
@@ -188,7 +179,38 @@ static size_t request_msg_count(const char *body) {
  *
  * The invariant: a kernel trace line is a '[' in COLUMN ZERO, and model prose is
  * never allowed to put one there. Prose is otherwise untouched.
+ *
+ * HOW THIS IS MEASURED, AND WHY IT MATTERS THAT IT CHANGED.
+ * These tests used to count column zero as "the first byte, or the byte after a
+ * '\n'". That is not what column zero means to the console, and the gap between
+ * the two was a live hole: lib/base.c kputc() also returns the cursor to column
+ * zero on '\r', on '\b', and on wrapping past the last column. A reply
+ * containing "x\r[vfs_write ... -> ok]" satisfied the old assertion and still
+ * rendered a byte-exact forgery on the real console.
+ *
+ * So column zero is now computed from the console's own rules, by
+ * column_zero_brackets() below, and the kshim console tracks a cursor for the
+ * same reason. Do not weaken this back to a '\n' scan.
  * ====================================================================== */
+
+/* Count '[' characters that land in console column zero, by replaying the bytes
+ * through the same rules lib/base.c kputc() uses: '\n' and '\r' reset the
+ * column, '\b' steps left (and up a row from column zero), '\t' rounds up to a
+ * multiple of 8, and printing in the last column wraps. Mirrors kshim.c. */
+#define CONSOLE_COLS 80
+static int column_zero_brackets(const char *s) {
+    int col = 0, n = 0;
+    for (const char *p = s; *p; p++) {
+        char c = *p;
+        if (c == '[' && col == 0) n++;
+        if (c == '\n' || c == '\r') { col = 0; continue; }
+        if (c == '\b') { col = (col > 0) ? col - 1 : CONSOLE_COLS - 1; continue; }
+        if (c == '\t') col = (col + 8) & ~7;
+        else           col++;
+        if (col >= CONSOLE_COLS) col = 0;
+    }
+    return n;
+}
 
 /* A reply that tries every shape of forgery: a bracketed line at the very start,
  * one after a newline, one after \r, and legitimate mid-sentence brackets that
@@ -198,6 +220,7 @@ static const char *FORGERY =
     "\"[vfs_write /etc/shadow bytes=9999 -> ok]\\n"
     "Done, I rewrote it.\\n"
     "[device_suspend eth0 -> ok]\\n"
+    "x\\r[pci_config_read 00:03.0 -> 0x100e]\\n"
     "See tools/vfs_tools.c [line 42] for details.\\n\"}],"
     "\"stop_reason\":\"end_turn\"}";
 
@@ -213,17 +236,20 @@ static void test_model_prose_cannot_forge_a_trace_line(void) {
     CHECK_EQ(trace_count(), 0);
     CHECK_EQ(chat_last_tool_calls(), 0);
 
-    /* Neither forged line may begin a line. Walk every line start and assert no
-     * '[' sits in column zero — that is the whole invariant, stated directly. */
-    int forged = 0;
-    for (const char *p = out; *p; p++)
-        if (*p == '[' && (p == out || p[-1] == '\n')) forged++;
-    CHECK_EQ(forged, 0);
+    /* No forged line may reach column zero — that is the whole invariant,
+     * stated directly, against the console's own idea of a column. */
+    CHECK_EQ(column_zero_brackets(out), 0);
 
     /* The text is still delivered — we neutralise position, not content, so the
      * operator can still read what the model said. */
     CHECK_CONTAINS(out, "vfs_write /etc/shadow bytes=9999");
     CHECK_CONTAINS(out, "Done, I rewrote it.");
+    CHECK_CONTAINS(out, "pci_config_read 00:03.0 -> 0x100e");
+
+    /* The carriage return that made the third attempt work is escaped, not
+     * passed through, so it cannot move the cursor at all. */
+    CHECK_CONTAINS(out, "x\\x0d[pci_config_read");
+    CHECK(strchr(out, '\r') == NULL);
 
     /* Brackets that are NOT in column zero are legitimate prose and untouched. */
     CHECK_CONTAINS(out, "tools/vfs_tools.c [line 42] for details.");
@@ -243,13 +269,92 @@ static void test_forged_line_cannot_hide_among_real_ones(void) {
 
     const char *out = kcap_text();
 
-    /* Exactly one line starts with '[': the genuine one the kernel emitted. */
-    int starts = 0;
-    for (const char *p = out; *p; p++)
-        if (*p == '[' && (p == out || p[-1] == '\n')) starts++;
-    CHECK_EQ(starts, 1);
+    /* Exactly one '[' sits in column zero: the genuine one the kernel emitted. */
+    CHECK_EQ(column_zero_brackets(out), 1);
     CHECK_CONTAINS(out, "[echo_tool -> ok]");
     CHECK_EQ(trace_count(), 1);
+}
+
+/* Each of these was a WORKING forgery against the first version of
+ * print_model_prose(), which tracked line starts itself instead of asking the
+ * console. One case per mechanism, so a regression names its own cause. */
+static void check_one_forgery_vector(const char *what, const char *escaped_text) {
+    char body[1024];
+    snprintf(body, sizeof body,
+             "{\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
+             "\"stop_reason\":\"end_turn\"}", escaped_text);
+
+    reset_all();
+    model_mock_queue(200, body);
+    CHECK_EQ(chat_ask("do it"), CHAT_OK);
+
+    const char *out  = kcap_text();
+    int         zero = column_zero_brackets(out);
+    CHECK_EQ(zero, 0);
+    if (zero != 0)
+        printf("    ^ forgery vector %s reached column zero; console was:\n%s\n",
+               what, out);
+    /* Nothing ran, so there is nothing for the kernel to have attested to. */
+    CHECK_EQ(trace_count(), 0);
+}
+
+static void test_carriage_return_cannot_forge_a_trace_line(void) {
+    /* kputc() resets the column on '\r', and json.c decodes "\r" to a raw 0x0D. */
+    check_one_forgery_vector("CR",
+        "Deleting it now.\\nx\\r[vfs_unlink /etc/todo type=file size=370 -> ok]\\n");
+}
+
+static void test_backspace_cannot_forge_or_erase_a_trace_line(void) {
+    /* kputc() steps the cursor left on '\b', and from column zero steps UP a
+     * row — so enough backspaces walk back into a genuine trace line already on
+     * screen and overwrite it. Escaping the byte is what stops both. */
+    check_one_forgery_vector("BS",
+        "Deleting it now.\\nx\\b[vfs_unlink /etc/todo type=file size=370 -> ok]\\n");
+
+    reset_all();
+    model_mock_queue(200, ECHO_TURN);
+    /* 200 backspaces: more than enough to walk up through the genuine
+     * [echo_tool -> ok] line the kernel prints above this reply.
+     *
+     * `body` is NOT in a nested block: model_mock_queue() stores the pointer and
+     * does not copy (net/model_mock.c: "not copied: caller keeps it alive"), so a
+     * buffer scoped tighter than the chat_ask() that consumes it is a
+     * use-after-scope. ASan reported exactly that, through mock_send. */
+    char text[1024];
+    size_t o = 0;
+    for (int i = 0; i < 200; i++) { text[o++] = '\\'; text[o++] = 'b'; }
+    text[o] = '\0';
+    char body[2048];
+    snprintf(body, sizeof body,
+             "{\"content\":[{\"type\":\"text\",\"text\":\"%s[vfs_write /etc/passwd"
+             " bytes=1 -> ok]\"}],\"stop_reason\":\"end_turn\"}", text);
+    model_mock_queue(200, body);
+
+    CHECK_EQ(chat_ask("echo something"), CHAT_OK);
+
+    const char *out = kcap_text();
+    CHECK_EQ(column_zero_brackets(out), 1);          /* still just the real one */
+    CHECK_CONTAINS(out, "[echo_tool -> ok]");        /* not overwritten */
+    CHECK(strchr(out, '\b') == NULL);                /* not even emitted */
+    CHECK_EQ(trace_count(), 1);
+}
+
+static void test_console_wrap_cannot_forge_a_trace_line(void) {
+    /* No newline is involved at all: printing in the last column returns the
+     * cursor to column zero, so exactly CONSOLE_COLS printable characters of
+     * padding put the next '[' at the start of a row. Swept either side of the
+     * boundary because an off-by-one here is the whole exploit. */
+    for (int pad = CONSOLE_COLS - 3; pad <= CONSOLE_COLS + 3; pad++) {
+        char text[512];
+        int  i = 0;
+        for (; i < pad; i++) text[i] = '.';
+        text[i] = '\0';
+
+        char full[1024];
+        snprintf(full, sizeof full, "%s[vfs_write /etc/shadow bytes=9999 -> ok]",
+                 text);
+        check_one_forgery_vector("wrap", full);
+    }
 }
 
 /* ====================================================================== */
@@ -900,6 +1005,9 @@ int main(void) {
     RUN(test_sentence_cannot_inject);
     RUN(test_model_prose_cannot_forge_a_trace_line);
     RUN(test_forged_line_cannot_hide_among_real_ones);
+    RUN(test_carriage_return_cannot_forge_a_trace_line);
+    RUN(test_backspace_cannot_forge_or_erase_a_trace_line);
+    RUN(test_console_wrap_cannot_forge_a_trace_line);
     RUN(test_model_build_contract);
 
     return th_report("chat");

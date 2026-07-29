@@ -193,6 +193,10 @@ static int fail(tool_result_t *r, int err, const char *op, const char *args,
 
     r->is_error = 1;
     r->len = 0;
+    /* Discarding the partial output also discards the truncation: tool_dispatch()
+     * appends "[result truncated at N bytes]" to anything still flagged, which
+     * on a short error message is a false claim. */
+    r->truncated = 0;
     if (r->buf && r->cap) r->buf[0] = '\0';
     tool_result_printf(r, "error: %s", msg);
     trace_err(err, op, "%s", args ? args : "");
@@ -683,6 +687,11 @@ static int build_sandbox(const target_t *t, sandbox_t *sb,
             nm = catf(mmio, sizeof mmio, nm, "%s0x%lx+0x%lx",
                       nm ? "," : "", (unsigned long)b.base, (unsigned long)size);
         }
+        /* i is 0..5 here — the loop bound is 6 and the 64-bit skip below has not
+         * run yet — so this test cannot currently bind. Kept deliberately: it is
+         * the bound on a write into args[7] from an index the BAR walk advances in
+         * two places, and a guard on an array write in the code that derives the
+         * sandbox is worth more than the line it costs. */
         if (i < 6) sb->args[i] = b.base;
         sb->nwin++;
         if (b.is64) i++;

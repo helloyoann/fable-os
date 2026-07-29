@@ -60,6 +60,17 @@ ready [offline]: \[net init failed
 # --- higher-half mapping is live, and the serial driver bound to COM1.
 expect: serial: COM1 up @ 115200
 
+# --- fw_cfg: the channel the API key arrives on --------------------------
+# The key is not a build input any more (there is no KEY= and no
+# -DTALKOS_API_KEY), so what boot has to prove is that the host->guest channel
+# came up and that the kernel is honest about whether a key came with it. This
+# suite passes no key, so the second line is normally the "none" one — it is
+# pinned as a shape so that running the suite WITH
+# TALKOS_TEST_QEMU_EXTRA='-fw_cfg name=opt/talkos/apikey,file=...' does not turn
+# a working machine into a failing case.
+expect-re: ^fwcfg: QEMU fw_cfg at 0x510/0x511, \d+ file\(s\), features 0x[0-9a-f]+$
+expect-re: ^fwcfg: (api key: \d+ bytes loaded from fw_cfg|no api key )
+
 # --- PCI enumeration -----------------------------------------------------
 expect-re: ^pci: 00:00\.0  8086:1237  class 06:00$
 expect-re: ^pci: 00:03\.0  8086:100e  class 02:00$
@@ -68,6 +79,13 @@ check: pci_enumeration count=6
 
 # --- driver bring-up -----------------------------------------------------
 expect: kbd: PS/2 keyboard ready
+# The PS/2 auxiliary port. The bring-up line says which packet length was
+# negotiated: QEMU's mouse takes the IntelliMouse magic sequence, so a machine
+# that reports 3-byte packets here has lost the wheel upgrade. "muted" is the
+# other half of the contract - the driver enables data reporting to verify it,
+# then switches it off again, so nothing arrives in the 8042 output buffer that
+# the keyboard driver would read as scancodes (see include/mouse.h).
+expect-re: ^mouse: PS/2 mouse ready \(4-byte packets, wheel\), \d+x\d+ box, muted until a consumer polls$
 expect-re: ^e1000: 00:03\.0 MMIO=0x[0-9a-f]+$
 # The CMOS wall clock. Pinned as a shape, not a value: the date is whatever the
 # host's clock says. A four-digit year starting 20 is enough to catch a driver
@@ -80,14 +98,15 @@ expect-re: ^rtc: self-check \d+ reads: 0 unreadable, 0 out of order,
 
 # --- device model: tree, then the suspend/resume power cycle -------------
 expect: --- device tree ---
-expect-re: ^devices: 11 registered$
+expect-re: ^devices: 13 registered$
 expect-re: ^\s*\[\s*1\] serial0\s+serial\s+active\s+driver=serial\s+io=3f8 irq=4$
-expect-re: ^\s*\[\s*9\] kbd0\s+input\s+active\s+driver=kbd\s+io=60 irq=1$
-expect-re: ^\s*\[\s*10\] eth0\s+network\s+active\s+driver=e1000\s+mmio=0x[0-9a-f]+$
-expect-re: ^\s*\[\s*11\] rtc0\s+timer\s+active\s+driver=rtc\s+io=70 irq=8$
+expect-re: ^\s*\[\s*10\] kbd0\s+input\s+active\s+driver=kbd\s+io=60 irq=1$
+expect-re: ^\s*\[\s*11\] mouse0\s+input\s+active\s+driver=mouse\s+io=60 irq=12$
+expect-re: ^\s*\[\s*12\] eth0\s+network\s+active\s+driver=e1000\s+mmio=0x[0-9a-f]+$
+expect-re: ^\s*\[\s*13\] rtc0\s+timer\s+active\s+driver=rtc\s+io=70 irq=8$
 expect: --- power cycle: suspend all, then resume all ---
 expect-re: ^-{19}$
-check: device_tree count=11 active=serial0,pci0,kbd0,eth0,rtc0
+check: device_tree count=13 active=serial0,fwcfg0,pci0,kbd0,mouse0,eth0,rtc0
 
 # --- VFS self-test (ramfs mounted at /) ----------------------------------
 expect: --- filesystem self-test (ramfs at /) ---
@@ -118,7 +137,7 @@ check [net]: heap_integrity max_live=64 max_used_kib=64 min_allocs=1000
 # model can actually be handed.
 expect-re [net]: ^  tools  : \d+ registered \(\d+ bytes of schema\)$
 expect-re [net]: ^  model  : reachable over TLS$
-check [net]: tool_registry min_tools=12 min_schema_bytes=2000 max_schema_bytes=32768 min_bytes_per_tool=80
+check [net]: tool_registry min_tools=12 min_schema_bytes=2000 max_schema_bytes=40960 min_bytes_per_tool=80
 
 # (The network-less side of the same banner is covered by no-nic.case, which
 # reaches the prompt with the model genuinely unreachable.)
@@ -133,6 +152,13 @@ expect [net]: Prose is the model talking. [Brackets] are this kernel saying
 expect-re [net]: ^>
 
 # --- things that must never happen ---------------------------------------
+# A byte count is the only thing this kernel may ever say about the API key.
+# These hold whether or not a key was supplied to the run: if one was, none of
+# it reached the console. (Bare "x-api-key" is NOT forbidden — the API's own 401
+# body says "x-api-key header is required", which is the far end talking, not a
+# leak. What is forbidden is the header with a credential after it.)
+forbid-re: sk-ant
+forbid: x-api-key: sk-
 forbid-re: \bpanic\b
 forbid: heap corruption
 forbid: heap: bad magic

@@ -317,6 +317,23 @@ static void test_disasm(void) {
     CHECK_EQ(dvm_disasm(&P, 0, b, 0), 0);                  /* no room      */
 }
 
+/* A listing is text a caller may print anywhere, and a string literal in it is
+ * model-authored. The assembler decodes \n into a REAL newline in the string
+ * pool, so re-emitting the pool verbatim would let a program be listed into
+ * something that looks like a kernel trace line in column zero. Every byte
+ * outside printable ASCII comes back as '?', the same rule copy_printable()
+ * applies to dvm_result_t.msg. */
+static void test_disasm_neutralises_string_bytes(void) {
+    CHECK_EQ(assemble("print \"a\\nx[vfs_write /etc/shadow -> ok]\"\n"
+                      "abort \"tab\\there\"\n"), 0);
+    char b[192];
+    CHECK(dvm_disasm(&P, 0, b, sizeof b) > 0);
+    CHECK_STR(b, "print \"a?x[vfs_write /etc/shadow -> ok]\"");
+    CHECK(strchr(b, '\n') == NULL);
+    CHECK(dvm_disasm(&P, 1, b, sizeof b) > 0);
+    CHECK_STR(b, "abort \"tab?here\"");
+}
+
 /* Every mnemonic and alias in the ISA must assemble to the documented opcode. */
 static void test_all_mnemonics(void) {
     static const struct { const char *src; int op; } t[] = {
@@ -1072,6 +1089,24 @@ static void test_denied_ports(void) {
     CHECK_CONTAINS(R.msg, "not in this program's allowed ranges");
     CHECK_CONTAINS(R.msg, "0xc000-0xc03f");
 
+    /* A FULL port table must be reported in full. The refusal message is what
+     * the model reads to work out what it IS allowed to touch, and the buffer
+     * that renders the list used to be 96 bytes — six of eight ranges — so the
+     * last two vanished with no sign that anything had been dropped. */
+    dvm_policy_init(&POL);
+    POL.trace = DVM_TRACE_OFF;
+    for (int i = 0; i < DVM_MAX_PORT_RANGES; i++)
+        CHECK_EQ(dvm_policy_allow_ports(&POL, (uint16_t)(0xc000 + i * 0x40),
+                                        (uint16_t)(0xc03f + i * 0x40)), 0);
+    CHECK_STATUS(run("out8 0x300, 1\nhalt\n"), DVM_TRAP_PORT_DENIED);
+    for (int i = 0; i < DVM_MAX_PORT_RANGES; i++) {
+        char want[16];
+        snprintf(want, sizeof want, "0x%04x-0x%04x", 0xc000 + i * 0x40,
+                 0xc03f + i * 0x40);
+        CHECK_CONTAINS(R.msg, want);
+    }
+    std_policy();
+
     /* Just outside the granted range, on both sides. */
     CHECK_STATUS(run("in8 r1, 0xbfff\nhalt\n"), DVM_TRAP_PORT_DENIED);
     CHECK_STATUS(run("in8 r1, 0xc040\nhalt\n"), DVM_TRAP_PORT_DENIED);
@@ -1783,6 +1818,7 @@ int main(void) {
 
     RUN(test_assemble_basic);
     RUN(test_disasm);
+    RUN(test_disasm_neutralises_string_bytes);
     RUN(test_all_mnemonics);
     RUN(test_number_forms);
     RUN(test_address_sugar);

@@ -17,11 +17,28 @@
  *   implement the same vnode_ops_t but back reads/writes with a block device
  *   instead of kmalloc'd buffers, and the VFS/kernel API stays identical. File
  *   storage grows by doubling; a real allocator/block map slots in here.
+ *   RAMFS_MAX_FILE is a per-file bound, not a per-mount one: many small files
+ *   can still fill the arena. A superblock byte budget belongs here next.
  */
 
 #include "vfs.h"
 #include "kernel.h"
 #include <string.h>
+
+/* Largest single file.
+ *
+ * A file lives in ONE contiguous kmalloc'd buffer that grows by doubling, so
+ * writing N bytes transiently needs the old buffer plus a new one of up to 2N —
+ * 3N of a 16 MiB arena that is shared with mbedTLS and lwIP. Two things depend
+ * on this bound existing:
+ *   - kmalloc() cannot fail politely (it panics), so an unbounded file size is
+ *     a way for a caller to halt the machine. Refusing the write with
+ *     VFS_ENOSPC is a failure the caller can report and recover from.
+ *   - Without an upper bound, ramfs_grow()'s `cap *= 2` loop can wrap past
+ *     UINT64_MAX and spin forever, which on this kernel (no interrupts, no
+ *     scheduler, no watchdog) is an unrecoverable hang.
+ */
+#define RAMFS_MAX_FILE (1024u * 1024u)
 
 /* A ram-inode: file bytes, or a list of directory entries. */
 typedef struct rnode {
@@ -56,6 +73,11 @@ static int ramfs_lookup(vnode_t *dir, const char *name, vnode_t **out) {
 static int ramfs_create(vnode_t *dir, const char *name, vnode_type_t type,
                         vnode_t **out) {
     rnode_t *rd = dir->priv;
+    /* Reject rather than truncate: strncpy'ing a 100-byte name into a 63-byte
+     * slot would store a name the caller never asked for, and then collide with
+     * every other name sharing that prefix. The VFS rejects the same lengths on
+     * the lookup side (next_component), so the two agree. */
+    if (strlen(name) > VFS_NAME_MAX) return VFS_EINVAL;
     for (rdirent_t *e = rd->kids; e; e = e->next)
         if (strcmp(e->name, name) == 0) return VFS_EEXIST;
 
@@ -74,20 +96,36 @@ static int ramfs_create(vnode_t *dir, const char *name, vnode_type_t type,
     return VFS_OK;
 }
 
+/* Free a vnode's storage and the vnode itself. Only ever called once the last
+ * reference is gone — from ramfs_unlink() when no handle is open, or from
+ * vfs_close() via the reclaim op when one was. */
+static void ramfs_reclaim(vnode_t *n) {
+    rnode_t *rn = n->priv;
+    if (rn) {
+        if (rn->data) kfree(rn->data);
+        kfree(rn);
+    }
+    kfree(n);
+}
+
 static int ramfs_unlink(vnode_t *dir, const char *name) {
     rnode_t *rd = dir->priv;
     rdirent_t **pp = &rd->kids;
     while (*pp) {
         rdirent_t *e = *pp;
         if (strcmp(e->name, name) == 0) {
-            rnode_t *rn = e->vnode->priv;
+            vnode_t *v  = e->vnode;
+            rnode_t *rn = v->priv;
             if (rn->type == VNODE_DIR && rn->kids) return VFS_EINVAL; /* not empty */
             *pp = e->next;
-            if (rn->data) kfree(rn->data);
-            kfree(rn);
-            kfree(e->vnode);
             kfree(e);
             dir->mtime_ms = millis();
+            /* The directory entry held the vnode's original reference. Freeing
+             * the storage regardless of the refcount is a use-after-free for
+             * any handle vfs_open() left holding a reference — which is the
+             * entire point of that reference. Drop ours; if a handle survives,
+             * the file is unreachable by name and vfs_close() reclaims it. */
+            if (kobject_put(&v->obj) == 0) ramfs_reclaim(v);
             return VFS_OK;
         }
         pp = &e->next;
@@ -104,12 +142,18 @@ static int64_t ramfs_read(vnode_t *n, void *buf, uint64_t off, uint64_t len) {
     return (int64_t)len;
 }
 
-/* Ensure the file's backing store holds at least `need` bytes. */
+/* Ensure the file's backing store holds at least `need` bytes. `need` is
+ * bounded by the caller against RAMFS_MAX_FILE, which is what keeps the
+ * doubling below from wrapping. */
 static int ramfs_grow(vnode_t *n, uint64_t need) {
     rnode_t *rn = n->priv;
     if (need <= rn->cap) return VFS_OK;
+    if (need > RAMFS_MAX_FILE) return VFS_ENOSPC;
     uint64_t cap = rn->cap ? rn->cap : 64;
-    while (cap < need) cap *= 2;
+    while (cap < need) {
+        if (cap > RAMFS_MAX_FILE / 2) { cap = need; break; }
+        cap *= 2;
+    }
     uint8_t *nd = krealloc(rn->data, (size_t)cap);
     if (!nd) return VFS_ENOSPC;
     memset(nd + rn->cap, 0, (size_t)(cap - rn->cap));
@@ -120,8 +164,17 @@ static int ramfs_grow(vnode_t *n, uint64_t need) {
 
 static int64_t ramfs_write(vnode_t *n, const void *buf, uint64_t off, uint64_t len) {
     if (n->type != VNODE_FILE) return VFS_EINVAL;
-    if (ramfs_grow(n, off + len) != VFS_OK) return VFS_ENOSPC;
+    if (len == 0) return 0;
+    /* off is a caller-supplied file position (vfs_seek accepts any positive
+     * int64), so off + len must not be formed before it is bounded. */
+    if (off > RAMFS_MAX_FILE || len > RAMFS_MAX_FILE - off) return VFS_ENOSPC;
+    int rc = ramfs_grow(n, off + len);
+    if (rc != VFS_OK) return rc;
     rnode_t *rn = n->priv;
+    /* A write past EOF leaves a hole. ramfs_grow only zeroes past the old
+     * *capacity*, so the hole can still hold bytes from a previous, longer
+     * incarnation of this file — zero it explicitly. */
+    if (off > n->size) memset(rn->data + n->size, 0, (size_t)(off - n->size));
     memcpy(rn->data + off, buf, len);
     if (off + len > n->size) n->size = off + len;
     n->mtime_ms = millis();
@@ -130,6 +183,7 @@ static int64_t ramfs_write(vnode_t *n, const void *buf, uint64_t off, uint64_t l
 
 static int ramfs_readdir(vnode_t *dir, uint32_t index, char *name_out, size_t cap) {
     rnode_t *rd = dir->priv;
+    if (cap == 0) return VFS_EINVAL;         /* `cap - 1` below would wrap */
     for (rdirent_t *e = rd->kids; e; e = e->next)
         if (index-- == 0) { strncpy(name_out, e->name, cap - 1); name_out[cap - 1] = '\0'; return VFS_OK; }
     return VFS_ENOENT;
@@ -137,7 +191,17 @@ static int ramfs_readdir(vnode_t *dir, uint32_t index, char *name_out, size_t ca
 
 static int ramfs_truncate(vnode_t *n, uint64_t size) {
     if (n->type != VNODE_FILE) return VFS_EINVAL;
-    if (size > n->size && ramfs_grow(n, size) != VFS_OK) return VFS_ENOSPC;
+    if (size > n->size) {
+        int rc = ramfs_grow(n, size);
+        if (rc != VFS_OK) return rc;
+    } else if (size < n->size) {
+        /* Zero what is being discarded. Shrinking by only moving `size` leaves
+         * the old bytes in the buffer, and a later write past the new EOF
+         * republishes them: truncate-to-0 then write at offset 10 would read
+         * back ten bytes of the previous contents. */
+        rnode_t *rn = n->priv;
+        if (rn->data) memset(rn->data + size, 0, (size_t)(n->size - size));
+    }
     n->size = size;
     n->mtime_ms = millis();
     return VFS_OK;
@@ -151,6 +215,7 @@ static const vnode_ops_t ramfs_ops = {
     .write    = ramfs_write,
     .readdir  = ramfs_readdir,
     .truncate = ramfs_truncate,
+    .reclaim  = ramfs_reclaim,
 };
 
 static int ramfs_mount(vfs_mount_t *mnt) {
@@ -162,7 +227,9 @@ static int ramfs_mount(vfs_mount_t *mnt) {
 
 static vfs_fstype_t ramfs_type = { .name = "ramfs", .mount = ramfs_mount };
 
-/* Called from vfs bring-up to make "ramfs" available. */
-void ramfs_register(void) {
-    vfs_register_fstype(&ramfs_type);
+/* Called from vfs bring-up to make "ramfs" available. Returns VFS_OK, or
+ * VFS_EEXIST if the name is already taken — which would otherwise surface much
+ * later and much less legibly as a mount failing with VFS_ENOENT. */
+int ramfs_register(void) {
+    return vfs_register_fstype(&ramfs_type);
 }

@@ -69,6 +69,33 @@ extern int th_fails;
         }                                                                     \
     } while (0)
 
+/* Assert a registered tool's flag bits — `mask` selects them, `want` is what
+ * they must be (use ~0u to test the whole word).
+ *
+ * Every suite used to write `tool_find("x")->flags & TOOL_MUTATES` directly, and
+ * tool_find() returns NULL for a tool that failed validation — a one-character
+ * typo in an input_schema is enough. The deref then SIGSEGVs the suite: no FAIL
+ * line, no file, no line number, and `make test-host` dying on a signal with
+ * nothing for the reader (or the agent loop) to go on. Only expand this in a TU
+ * that includes tool.h. */
+#define CHECK_TOOL_FLAGS(name, mask, want)                                    \
+    do {                                                                      \
+        const tool_t *t_ = tool_find(name);                                   \
+        th_checks++;                                                          \
+        if (!t_) {                                                            \
+            th_fails++;                                                       \
+            printf("    FAIL %s:%d  tool_find(\"%s\") is NULL — not "         \
+                   "registered, or its descriptor failed validation\n",       \
+                   __FILE__, __LINE__, (name));                               \
+        } else if ((unsigned)(t_->flags & (unsigned)(mask)) !=                \
+                   (unsigned)(want)) {                                        \
+            th_fails++;                                                       \
+            printf("    FAIL %s:%d  %s flags & %s == %s (got 0x%x)\n",        \
+                   __FILE__, __LINE__, (name), #mask, #want,                  \
+                   (unsigned)(t_->flags & (unsigned)(mask)));                 \
+        }                                                                     \
+    } while (0)
+
 #define RUN(fn)                                                               \
     do {                                                                      \
         printf("  - %s\n", #fn);                                              \
@@ -92,8 +119,21 @@ void        kcap_reset(void);
 const char *kcap_text(void);
 
 /* Set when the code under test calls panic(); lets a test assert that a bad
- * input panics without killing the test process. */
+ * input panics without killing the test process.
+ *
+ * MIND THE DIVERGENCE: the real panic() (lib/base.c) never returns — it is
+ * `for(;;) { cli; hlt; }`. The shim records and RETURNS, so a test keeps
+ * executing the code that follows a panic, with the state that caused it. That
+ * is what makes "prove bad input panics" testable at all, but it means a green
+ * check after a captured panic is not evidence about the machine: on hardware
+ * nothing after that call ever runs. Assert kpanic_hit and stop. */
 extern int         kpanic_hit;
 extern const char *kpanic_msg;
+
+/* Set by kshim.c when the 1 MiB console capture overflowed, and counted when a
+ * kprintf format used a conversion lib/base.c cannot render (see kshim.c). Both
+ * are reported by th_report(); a format violation is also a failed check. */
+extern int kcap_overflowed;
+extern int kfmt_violations;
 
 #endif /* HARNESS_H */

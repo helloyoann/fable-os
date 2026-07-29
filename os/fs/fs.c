@@ -6,9 +6,14 @@
 
 int fs_init(void) {
     vfs_init();
-    ramfs_register();               /* register available filesystems here */
 
-    int rc = vfs_mount("/", "ramfs");
+    int rc = ramfs_register();      /* register available filesystems here */
+    if (rc != VFS_OK) {
+        kprintf("fs: registering ramfs failed (%d)\n", rc);
+        return rc;
+    }
+
+    rc = vfs_mount("/", "ramfs");
     if (rc != VFS_OK) {
         kprintf("fs: mounting ramfs at / failed (%d)\n", rc);
         return rc;

@@ -6,15 +6,40 @@
 ; mode, load a 64-bit GDT, and finally far-jump into 64-bit code.
 
 global start
+global multiboot_info_phys
 extern kernel_main
 extern __bss_start
 extern __bss_end
 
 ; ---------------------------------------------------------------------------
 ; Multiboot v1 header — must be in the first 8 KiB of the file, 4-byte aligned.
+;
+; FLAGS BIT 2 ASKS FOR A LINEAR FRAMEBUFFER.
+;   Setting it means "I have a preferred video mode", and the four fields at
+;   offsets 32..44 say which: mode_type 0 = linear graphics (1 would be EGA
+;   text), then width, height and bits per pixel. A loader that honours the
+;   request sets bit 12 in the information structure and fills in the
+;   framebuffer address, pitch and channel layout; lib/fb.c reads exactly those
+;   fields. GRUB does this. QEMU's built-in `-kernel` loader does NOT — it
+;   ignores the request and never sets bit 12 — which is why lib/fb.c has a
+;   second way to find a framebuffer and a VGA text fallback behind that. The
+;   request is harmless either way: a loader that cannot honour it is required
+;   to boot us anyway.
+;
+;   The five dwords between the checksum and the video fields are the a.out
+;   kludge (header_addr..entry_addr). They are only READ when flag bit 16 is set,
+;   which it is not, but the video fields are found by fixed offset, so the space
+;   has to be there.
+;
+;   1024x768x32 is the mode every emulated adapter and every VBE BIOS supports.
+;   At 8x16 glyphs it is a 128x48 character console. lib/fb.c declines anything
+;   larger than FB_MAX_WIDTH x FB_MAX_HEIGHT rather than overrun its buffer, so a
+;   loader that substitutes a bigger mode costs us the framebuffer, not memory
+;   safety.
 ; ---------------------------------------------------------------------------
 MB_MAGIC    equ 0x1BADB002
-MB_FLAGS    equ 0x0
+MB_VIDEO    equ 1 << 2
+MB_FLAGS    equ MB_VIDEO
 MB_CHECKSUM equ -(MB_MAGIC + MB_FLAGS)
 
 section .multiboot
@@ -22,6 +47,11 @@ align 4
     dd MB_MAGIC
     dd MB_FLAGS
     dd MB_CHECKSUM
+    dd 0, 0, 0, 0, 0            ; offsets 12..28: a.out kludge, unused
+    dd 0                        ; mode_type: 0 = linear graphics
+    dd 1024                     ; width  (pixels)
+    dd 768                      ; height (pixels)
+    dd 32                       ; depth  (bits per pixel)
 
 ; ---------------------------------------------------------------------------
 ; 32-bit entry point
@@ -31,6 +61,7 @@ bits 32
 start:
     mov esp, stack_top          ; set up a stack
     mov ebp, eax                ; preserve the multiboot magic (eax)
+    mov esi, ebx                ; preserve the multiboot INFO pointer (ebx)
 
     ; The multiboot loader reserves .bss but does not zero it. Do that now,
     ; before anything (page tables, C globals) relies on zero-init. We are
@@ -40,6 +71,13 @@ start:
     sub ecx, edi
     xor eax, eax
     rep stosb
+
+    ; Hand the information structure to C. It carries the framebuffer the loader
+    ; gave us (or did not) and the command line, and lib/fb.c is the only reader.
+    ; This has to land AFTER the zeroing, because the variable lives in .bss —
+    ; and the pointer itself has to survive the zeroing, which is what ESI is
+    ; for (rep stosb clobbers EDI/ECX/EAX and nothing else).
+    mov [multiboot_info_phys], esi
 
     mov eax, ebp                ; restore the multiboot magic
     call check_multiboot
@@ -194,6 +232,15 @@ p2_tables:
 stack_bottom:
     resb 4096 * 16              ; 64 KiB stack
 stack_top:
+
+; Physical address of the multiboot information structure, as the loader left it
+; in EBX. Read by lib/fb.c (the framebuffer tag and the kernel command line).
+; Last on purpose: `align` in a nobits section makes NASM try to emit fill bytes,
+; so putting anything before the page tables would either warn or, worse, leave
+; p4_table not 4 KiB aligned.
+alignb 4
+multiboot_info_phys:
+    resd 1
 
 ; ---------------------------------------------------------------------------
 ; 64-bit GDT: one null descriptor + one 64-bit code descriptor.

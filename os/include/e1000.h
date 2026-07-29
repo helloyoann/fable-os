@@ -32,8 +32,16 @@
  *     lower NETIF_FLAG_LINK_UP on the lwIP netif instead of pinning it up.
  *   - The MDIO helpers (MDIC) are the door to the whole PHY register file:
  *     speed/duplex forcing, loopback, cable diagnostics.
- *   - remove() would be the same teardown as suspend() plus unpublishing the
- *     device; the two share their quiesce path already.
+ *   - driver.h advertises probe()/remove(), and this driver implements neither
+ *     (nor does any other in the tree). remove() would be the same teardown as
+ *     suspend() plus unpublishing the device — they would share the quiesce path
+ *     — but there is no device_unregister() to unpublish through yet.
+ *   - MMIO to BAR0 goes through the write-back-cacheable identity mapping
+ *     boot/boot.asm sets up; there is no PAT or MTRR making the PCI hole
+ *     uncacheable. QEMU is unaffected, but on real silicon a register read could
+ *     be served from cache and a ring doorbell could sit in a write-combining
+ *     buffer, which means transmits that never start. Fixing it belongs in the
+ *     page tables, not here.
  */
 #ifndef E1000_H
 #define E1000_H
@@ -47,8 +55,10 @@ int  e1000_init(void);
 void e1000_get_mac(uint8_t mac[6]);
 
 /* Transmit a raw Ethernet frame (copies `data`). Returns 0 on success.
- * Fails (nonzero) rather than blocking forever if the transmit engine does not
- * retire the descriptor — which is exactly what happens while suspended. */
+ * Fails (nonzero) for a NULL, empty or oversized frame, when the next TX
+ * descriptor has not been retired by the card yet, and — rather than blocking
+ * forever — when the transmit engine does not retire this descriptor within a
+ * bounded wall-clock wait, which is exactly what happens while suspended. */
 int  e1000_send(const void *data, uint16_t len);
 
 /* Poll for one received frame. Returns 1 and fills buf/len if one was

@@ -50,8 +50,9 @@
  *   apertures and PM control. One mistargeted dword can move a live device's
  *   MMIO window out from under a driver that is mid-DMA, clear memory decoding
  *   on the host bridge, or park a device's window over kernel RAM. There is no
- *   IOMMU, no page protection on MMIO, and no exception handling yet, so the
- *   failure mode is silent corruption, not a fault we could report.
+ *   IOMMU and no page protection on MMIO, and the IDT does not help: every one of
+ *   those outcomes is a successful write to a mapped address, so the failure mode
+ *   is silent corruption, not a fault we could report.
  *
  *   Discovery does not need writes. The one read-only-looking exception, BAR
  *   *sizing*, is really write-0xFFFFFFFF / read / restore: a non-atomic window
@@ -122,6 +123,11 @@ static int fail(tool_result_t *r, int err, const char *op, const char *args,
 
     r->is_error = 1;
     r->len = 0;                     /* discard any partial output */
+    /* ...and un-say that it was truncated. tool_dispatch() staples "[result
+     * truncated at N bytes]" onto anything still carrying this flag, so leaving
+     * it set after throwing the partial output away appends that claim to a
+     * two-line error message, where it is simply false. */
+    r->truncated = 0;
     if (r->buf && r->cap) r->buf[0] = '\0';
     tool_result_printf(r, "error: %s", msg);
     trace_err(err, op, "%s", args ? args : "");

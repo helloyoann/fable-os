@@ -1,8 +1,8 @@
 /* idt.c — build and install the GDT, the TSS, and the 256-entry IDT.
  *
  * See include/idt.h for the architecture, the TSS/IST reasoning and the PIC
- * reasoning. This file is the hardware-touching half of Phase 3 and is the one
- * part of it that cannot be host-tested: it can only be verified by booting.
+ * reasoning. This file is the hardware-touching half of fault handling and the
+ * one part of it that cannot be host-tested: it can only be verified by booting.
  * Everything that CAN be tested without hardware lives in fault.c instead.
  *
  * ORDER OF OPERATIONS IN idt_init(), and why it is that order:
@@ -184,7 +184,10 @@ static void set_gate(int vector, uint64_t handler, uint8_t ist, uint8_t type) {
     g->offset_low  = (uint16_t)(handler & 0xFFFFu);
     g->selector    = SEL_KERNEL_CODE;
     g->ist         = (uint8_t)(ist & 0x7u);
-    g->type_attr   = (uint8_t)(0x80u | ((0u & 3u) << 5) | (type & 0xFu)); /* P, DPL=0 */
+    /* P=1, DPL=0, type. DPL is written as a literal zero rather than masked
+     * from a parameter because there is no ring 3 on this machine: nothing can
+     * reach a gate from userspace, so no gate ever needs a DPL above 0. */
+    g->type_attr   = (uint8_t)(0x80u | (type & 0xFu));
     g->offset_mid  = (uint16_t)((handler >> 16) & 0xFFFFu);
     g->offset_high = (uint32_t)((handler >> 32) & 0xFFFFFFFFu);
     g->zero        = 0;
@@ -436,9 +439,14 @@ void idt_init(void) {
 
     installed = 1;
 
-    kprintf("idt: 256 gates at %p (limit %u), all verified; TSS with %d IST "
+    /* The verdict comes from `bad`, not from a literal: this line used to say
+     * "all verified" unconditionally, directly under the WARNING saying the
+     * opposite. On a machine whose console is its only record, a summary that
+     * cannot report failure is worse than no summary. */
+    kprintf("idt: 256 gates at %p (limit %u), %s; TSS with %d IST "
             "stacks of %u KiB (#DF=1 NMI=2 #MC=3); PIC remapped to 0x20/0x28 "
             "and fully masked\n",
-            (void *)(uintptr_t)idtr.base, (unsigned)idtr.limit, IST_USED,
-            (unsigned)(IST_STACK_SIZE / 1024));
+            (void *)(uintptr_t)idtr.base, (unsigned)idtr.limit,
+            bad ? "NOT verified - see the WARNING above" : "all verified",
+            IST_USED, (unsigned)(IST_STACK_SIZE / 1024));
 }

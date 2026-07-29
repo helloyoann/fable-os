@@ -174,6 +174,14 @@ int tls_ca_pem_count(const char *pem, size_t len)
          * previous block was never opened. Either way, refuse to guess. */
         if (e < 0 || e < b) return TLS_CA_EMALFORMED;
 
+        /* And a second BEGIN before this block's END means this block was never
+         * terminated — the other half of the header's contract. Looking for the
+         * opener again from just past this one and finding it before `e` is
+         * exactly that case; without this, "BEGIN a BEGIN b END" counted as one
+         * well-formed block because both searches started from the same cursor. */
+        long b2 = find_from(pem, len, (size_t)b + blen, PEM_BEGIN, blen);
+        if (b2 >= 0 && b2 < e) return TLS_CA_EMALFORMED;
+
         count++;
         pos = (size_t)e + elen;
     }

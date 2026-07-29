@@ -8,11 +8,11 @@
  *   reference program in vm/programs/ac97_bringup.dvm, points it at an AC'97
  *   audio controller that no kernel driver has claimed, and lets it play sound.
  *
- *   That matters for one reason. The next phase asks a MODEL to write a driver
- *   in this ISA. When that fails, the failure has to be attributable — a bad
- *   program, not a VM that was never able to drive hardware in the first place.
- *   This file removes the second possibility, at boot, on every machine that
- *   has the device.
+ *   That matters for one reason. A MODEL can write and run a driver in this ISA
+ *   (tools/dvm_tools.c: driver_assemble, driver_run). When one of those fails,
+ *   the failure has to be attributable — a bad program, not a VM that was never
+ *   able to drive hardware in the first place. This file removes the second
+ *   possibility, at boot, on every machine that has the device.
  *
  * WHAT IS AND IS NOT THE DRIVER
  *   The driver is the .dvm program. It does the whole bring-up: the AC-link
@@ -55,9 +55,9 @@
  *   program polls, like everything else in this kernel.
  *
  * FUTURE EXTENSION POINTS
- *   - When the model can run programs itself (the dvm tool), this becomes the
- *     worked example rather than the only caller, and ac97_play_tone() is the
- *     natural shape for a "play something" tool.
+ *   - The model runs its own programs through tools/dvm_tools.c, so this is the
+ *     worked example rather than the only caller. An ac97_play_tone() split out
+ *     of bring_up() is the natural shape for a "play something" tool.
  *   - Stopping playback, changing volume and requeueing buffers are all more
  *     .dvm programs against the same policy; none of them needs new C.
  *   - Nothing here is AC'97-specific except the program text and the two BAR
@@ -81,6 +81,16 @@
 #define NOTE_E5_HZ     660u
 #define BDL_ENTRIES    4u
 #define FRAMES_PER_BD  (TONE_FRAMES / BDL_ENTRIES)
+
+/* Both of these hold for the constants above and would break silently if they
+ * were changed: the descriptor length field is 16 bits, and an uneven split
+ * would drop the tail of the tone with no diagnostic anywhere. A wrong-length
+ * descriptor presents as "the audio sounds odd" on a machine with no debugger,
+ * so it is caught at build time instead. */
+_Static_assert(FRAMES_PER_BD * 2u <= AC97_BD_LEN_MASK,
+               "the buffer-descriptor length field counts 16-bit samples in 16 bits");
+_Static_assert(TONE_FRAMES % BDL_ENTRIES == 0,
+               "the tone must divide evenly across the descriptor list");
 
 /* Both of these are read by the codec's DMA engine long after this file has
  * returned, so neither may ever live on the heap or the stack. 8-byte alignment
@@ -158,12 +168,31 @@ static dvm_status_t bring_up(const pci_dev_t *d, uint16_t nam, uint16_t nabm) {
 
     /* The security boundary. Two port windows the size the AC'97 spec says
      * those BARs are, one PCI function, and no MMIO whatsoever — the trace
-     * prints all three before the first instruction runs. */
+     * prints all three before the first instruction runs.
+     *
+     * Every return is checked. dvm_policy_allow_*() leaves the policy UNCHANGED
+     * when it refuses (dvm.h is explicit that a refusal never silently opens
+     * something smaller), so an unchecked failure here would surface later as
+     * "out8: port 0x... is not in this program's allowed ranges" — a message
+     * that blames the program for a caller's bug.
+     *
+     * WHAT THE POLICY DOES NOT COVER: the VM's allowlist governs what the CPU
+     * does, and this device is a bus master (see pci_enable_bus_master below),
+     * so the codec's own DMA is outside it. Granting the whole 64-byte NABM
+     * window therefore also grants the PCM-IN channel box at +0x00, whose BDBAR
+     * could point anywhere in the low 4 GiB. That is safe only because the
+     * program run here is the hand-written reference; tools/dvm_tools.c refuses
+     * to point a model-authored program at a device that is already
+     * bus-mastering, for exactly this reason. */
     dvm_policy_t pol;
     dvm_policy_init(&pol);
-    dvm_policy_allow_ports(&pol, nam,  (uint16_t)(nam  + AC97_NAM_SIZE  - 1));
-    dvm_policy_allow_ports(&pol, nabm, (uint16_t)(nabm + AC97_NABM_SIZE - 1));
-    dvm_policy_allow_pci(&pol, d->bus, d->dev, d->func);
+    if (dvm_policy_allow_ports(&pol, nam,  (uint16_t)(nam  + AC97_NAM_SIZE  - 1)) != 0 ||
+        dvm_policy_allow_ports(&pol, nabm, (uint16_t)(nabm + AC97_NABM_SIZE - 1)) != 0 ||
+        dvm_policy_allow_pci(&pol, d->bus, d->dev, d->func) != 0) {
+        kputs("ac97: could not build the sandbox policy for this device\n");
+        kfree(prog);
+        return DVM_TRAP_POLICY;
+    }
     /* The program polls the whole tone out and then stops the bus master, so
      * its delay budget has to cover the audio itself: 40 ms for the codec, 20
      * for the DMA reset, 100 watching the position counter, and up to 1.5 s

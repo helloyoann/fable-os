@@ -1,22 +1,27 @@
-# Secrets. The Anthropic API key is not read at runtime — the Makefile bakes it
-# into the kernel with -DTALKOS_API_KEY='"$(KEY)"'. So the key leaks from more
-# than the .env it is kept in:
+# Secrets. There is exactly ONE file in this tree that holds the Anthropic API
+# key, and it is this one: os/.env (KEY="sk-ant-..."), read by `make run` and
+# handed to the guest at boot over QEMU's fw_cfg channel. Nothing the build
+# produces can contain it, because the build is never told what it is.
 #
-#   .env           where the key is kept (os/.env, appliance/.env)
-#   .build-flags   the stamp that forces a rebuild when KEY changes. It records
-#                  the flag set verbatim, i.e. the literal `KEY=sk-ant-...`
-#
-# Every other artifact the key ends up inside (*.o, kernel.elf, kernel.bin,
-# talkos.iso, os/build/) is ignored under "Build artifacts" below.
+# It used to be everywhere. `-DTALKOS_API_KEY='"$(KEY)"'` put the live key
+# inside net.o, kernel.elf, kernel.bin, talkos.iso and the .build-flags stamp
+# (which recorded `KEY=sk-ant-...` in plain text), and this file was what kept
+# those five artifacts out of git. That is the wrong place for a safety
+# property: one `git add -f`, one CI cache, one shared build directory and the
+# key is published. The Makefile has no KEY variable any more and passes no -D,
+# so `grep -r sk-ant` over every build output finds nothing — the entries below
+# are hygiene, not a containment measure.
 .env
 .env.*
 !.env.example
-.build-flags
 
 # Build artifacts
 *.o
 kernel.elf
 kernel.bin
+# The stamp that forces a full rebuild when EXTRA_CFLAGS changes. It used to
+# record `KEY=sk-ant-...` verbatim; there is no KEY to record now.
+.build-flags
 
 # Dependency files from the compiler's -MMD -MP, one per object
 *.d

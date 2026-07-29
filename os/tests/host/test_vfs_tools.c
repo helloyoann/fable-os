@@ -33,12 +33,11 @@
 #include <unistd.h>
 #include <sys/mman.h>
 
-#ifdef __APPLE__
-__asm__(".globl ___start_tool_table\n"
-        ".set   ___start_tool_table, section$start$__DATA$tool_table\n"
-        ".globl ___stop_tool_table\n"
-        ".set   ___stop_tool_table, section$end$__DATA$tool_table\n");
-#endif
+/* The boundary symbols, from the one place that owns that shim. The table
+ * ENTRIES for this suite are emitted by tools/vfs_tools.c, which is compiled as
+ * its own translation unit and so carries its own copy of the Mach-O section
+ * spelling — see REGISTER_VFS_TOOL there. */
+#include "tooltable.h"
 
 /* ---------------------------------------------------------------------- */
 /* plumbing                                                                */
@@ -153,13 +152,13 @@ static void test_tools_are_registered(void) {
 }
 
 static void test_mutating_tools_are_flagged(void) {
-    CHECK(tool_find("write_file")->flags   & TOOL_MUTATES);
-    CHECK(tool_find("make_dir")->flags     & TOOL_MUTATES);
-    CHECK(tool_find("delete_path")->flags  & TOOL_MUTATES);
+    CHECK_TOOL_FLAGS("write_file", TOOL_MUTATES, TOOL_MUTATES);
+    CHECK_TOOL_FLAGS("make_dir", TOOL_MUTATES, TOOL_MUTATES);
+    CHECK_TOOL_FLAGS("delete_path", TOOL_MUTATES, TOOL_MUTATES);
     /* Read-only tools must not claim to mutate. */
-    CHECK_EQ(tool_find("read_file")->flags & TOOL_MUTATES, 0);
-    CHECK_EQ(tool_find("list_dir")->flags  & TOOL_MUTATES, 0);
-    CHECK_EQ(tool_find("stat_path")->flags & TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("read_file", TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("list_dir", TOOL_MUTATES, 0);
+    CHECK_TOOL_FLAGS("stat_path", TOOL_MUTATES, 0);
 }
 
 /* The advertised contract is what the model sees; if it is not valid JSON the

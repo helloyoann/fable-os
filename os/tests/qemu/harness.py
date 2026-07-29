@@ -20,7 +20,10 @@ Environment:
     TALKOS_TEST_QEMU=path   qemu binary (default qemu-system-x86_64)
     TALKOS_TEST_NIC=spec    override every case's -nic (e.g.
                             user,model=e1000,restrict=on to fake no internet)
+    TALKOS_TEST_QEMU_EXTRA   extra QEMU arguments appended to every case, split
+                            like a shell word list (see qemu_args)
     TALKOS_TEST_KEEPLOGS=1  keep the scratch dir even when everything passes
+    TALKOS_TEST_PYTHON=path  interpreter run.sh uses to start this file
 """
 
 import atexit
@@ -243,7 +246,13 @@ class Case:
         elif kind == "description":
             self.description = arg.strip()
         elif kind == "timeout":
-            self.timeout = float(arg.strip())
+            # A typo like `timeout: 3o` must read as a case parse error with a
+            # file and a line, not as a Python traceback from float().
+            try:
+                self.timeout = float(arg.strip())
+            except ValueError:
+                raise SyntaxError("%s:%d: timeout %r is not a number"
+                                  % (self.path, lineno, arg.strip()))
         elif kind == "ready":
             try:
                 re.compile(arg)
@@ -296,15 +305,14 @@ class CheckResult:
         self.failures = []
         self.notes = []
 
-    def fail(self, msg):
-        self.failures.append(msg)
-
     def note(self, msg):
         self.notes.append(msg)
 
+    # The one way a check reports a failure. There used to be a public fail()
+    # beside this whose only caller in the file was need() itself.
     def need(self, cond, msg):
         if not cond:
-            self.fail(msg)
+            self.failures.append(msg)
         return cond
 
 
@@ -577,10 +585,14 @@ class SerialSocket:
 
     def connect(self, deadline):
         while time.time() < deadline:
+            # Closed on every failed attempt: the retry loop runs up to ~200
+            # times in the 10 s window, and leaking a descriptor per attempt (per
+            # interactive case) left reclamation to the garbage collector.
+            s = socket.socket(socket.AF_UNIX)
             try:
-                s = socket.socket(socket.AF_UNIX)
                 s.connect(self.path)
             except (FileNotFoundError, ConnectionRefusedError, OSError):
+                s.close()
                 time.sleep(0.05)
                 continue
             s.setblocking(False)
@@ -670,8 +682,8 @@ SIGNOTE_RE = re.compile(r"terminating on signal (\d+) from pid (\d+)")
 
 FRATRICIDE = ("QEMU was killed from outside (signal %s from pid %s) before "
               "the test finished — something else is running "
-              "`pkill -f qemu-system-x86_64` (capture.sh does that). "
-              "Re-run when it is done.")
+              "`pkill -f qemu-system-x86_64` (capture.sh only does that with "
+              "KILL_OTHERS=1). Re-run when it is done.")
 
 
 def qemu_diagnosis(errpath, early, hit):
@@ -818,10 +830,15 @@ def evaluate(case, log, offline, waited, hit_ready):
     shown_ctx = set()             # positions we've already printed context for
 
     if not log.strip():
+        # The REAL command, not a plausible-looking one. This is the failure
+        # where the reader most needs to paste it and see QEMU's own complaint —
+        # a bad `qemu-extra`, a -device this QEMU does not have, an unknown NIC
+        # model — and a command missing -display/-no-reboot/-serial/-nic and the
+        # case's own extras would behave differently from the one that failed.
         failures.append(Failure(
             "the kernel produced no serial output at all in %.1fs" % waited,
             "      QEMU command was:\n         | " + " ".join(
-                shlex.quote(x) for x in [QEMU, "-kernel", KERNEL])))
+                shlex.quote(x) for x in qemu_args(case, "file:<log>"))))
         return failures, notes, skipped
 
     for a in case.assertions:
@@ -886,7 +903,19 @@ def evaluate(case, log, offline, waited, hit_ready):
         elif a.kind == "check":
             name, args = parse_check_args(a.arg)
             r = CheckResult()
-            CHECKS[name](log, args, r)
+            try:
+                CHECKS[name](log, args, r)
+            except (ValueError, KeyError) as e:
+                # `check: heap_integrity max_live=x` used to raise out of here
+                # as a traceback, after a VM had already booted. The check name
+                # is validated at parse time; its arguments cannot be, because
+                # only the check knows which of them are numbers — so a bad one
+                # becomes an ordinary failure that names the file and the line.
+                failures.append(Failure(
+                    "check %s has a bad argument (%s: %s)"
+                    % (BOLD(name), type(e).__name__, e),
+                    "      %s:%d" % (case.path, a.lineno)))
+                continue
             notes += ["%s: %s" % (name, n) for n in r.notes]
             for f in r.failures:
                 failures.append(Failure(
@@ -922,10 +951,11 @@ def network_available(host="api.anthropic.com", timeout=4.0):
         try:
             infos = socket.getaddrinfo(host, 443, socket.AF_INET,
                                        socket.SOCK_STREAM)
-            s = socket.socket()
-            s.settimeout(timeout)
-            s.connect(infos[0][4])
-            s.close()
+            # `with` so the offline path — the one taken on every CI box without
+            # internet, i.e. the common one — closes the socket too.
+            with socket.socket() as s:
+                s.settimeout(timeout)
+                s.connect(infos[0][4])
             result["ok"] = True
         except Exception as e:      # noqa: BLE001 - any failure means offline
             result["ok"] = False
@@ -983,7 +1013,9 @@ def main(argv):
     for p in paths:
         try:
             cases.append(Case(p))
-        except SyntaxError as e:
+        except (SyntaxError, ValueError) as e:
+            # ValueError too: a malformed setting deep in _setting() should read
+            # as a case parse error, not as an interpreter traceback.
             print(RED("case parse error: %s" % e))
             return 1
     if filters:
@@ -1013,6 +1045,12 @@ def main(argv):
         logpath = os.path.join(workdir, slug + ".log")
         sys.stdout.write("  %-28s " % case.name)
         sys.stdout.flush()
+        # `description:` was parsed and stored by every case file and read by
+        # nothing, which made it decoration that looked like configuration. It is
+        # the one line that says what the case is FOR, so -v prints it.
+        if verbose and case.description:
+            sys.stdout.write("\n      %s\n  %-28s " % (DIM(case.description), ""))
+            sys.stdout.flush()
 
         t0 = time.time()
         log, waited, hit_ready, qerr = boot(case, logpath, timeout, offline)

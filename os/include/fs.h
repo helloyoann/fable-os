@@ -16,7 +16,8 @@
 /* Initialise VFS, register filesystems, mount ramfs at "/". Returns 0 on ok. */
 int fs_init(void);
 
-/* Filesystem registration hooks (implemented by each fs). */
-void ramfs_register(void);
+/* Filesystem registration hooks (implemented by each fs). Return VFS_OK, or
+ * VFS_EEXIST if that filesystem name is already registered. */
+int ramfs_register(void);
 
 #endif /* FS_H */

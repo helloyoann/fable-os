@@ -74,7 +74,7 @@ static void test_error_statuses_are_not_transport_errors(void) {
     model_mock_queue(401, REPLY_401);
 
     /* A 401 is a *successful* exchange: the transport did its job. This is
-     * exactly what the kernel sees today with no API key compiled in. */
+     * exactly what the kernel sees today with no API key supplied. */
     CHECK_EQ(model_send(model_mock_transport(), "{}", 2, resp, sizeof resp, &r),
              MODEL_OK);
     CHECK_EQ(r.http_status, 401);
@@ -285,8 +285,9 @@ static void test_request_build_bounds(void) {
 /* a dry run of the tool-use loop                                          */
 /* ====================================================================== */
 
-/* Stand-in for the real dispatcher the next phase adds: read a tool_use block,
- * "execute" it, and build the follow-up request containing a tool_result. */
+/* A miniature of what core/tool.c + net/chat.c do for real, kept here so this
+ * suite stays a test of the TRANSPORT alone: read a tool_use block, "execute"
+ * it, and build the follow-up request containing a tool_result. */
 static int run_two_turn_conversation(model_transport_t *t, char *final_text,
                                      size_t cap) {
     static char req[8192];
