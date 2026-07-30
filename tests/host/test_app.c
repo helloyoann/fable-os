@@ -888,7 +888,7 @@ static char *slurp(const char *path, size_t *len) {
 }
 
 static void test_artifact_matches_the_compiled_copy(void) {
-    /* `make test-host` runs from os/; the second path is for running the binary
+    /* `make test-host` runs from ; the second path is for running the binary
      * straight out of tests/build/. */
     static const char *paths[] = {
         "apps/examples/calculator.json",
@@ -900,7 +900,7 @@ static void test_artifact_matches_the_compiled_copy(void) {
         disk = slurp(paths[i], &len);
     if (!disk) {
         printf("    FAIL cannot open apps/examples/calculator.json (run the "
-               "suite from os/, as `make test-host` does)\n");
+               "suite from , as `make test-host` does)\n");
         th_fails++; th_checks++;
         return;
     }

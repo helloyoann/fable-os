@@ -373,7 +373,7 @@ static char *slurp(const char *path, size_t *len) {
 }
 
 static void test_source_matches_artifact(void) {
-    /* `make test-host` runs from os/; the second path is for running the
+    /* `make test-host` runs from ; the second path is for running the
      * binary straight out of tests/build/. */
     static const char *paths[] = {
         "vm/programs/ac97_bringup.dvm",
@@ -385,7 +385,7 @@ static void test_source_matches_artifact(void) {
         disk = slurp(paths[i], &len);
     if (!disk) {
         printf("    FAIL cannot open vm/programs/ac97_bringup.dvm "
-               "(run the suite from os/, as `make test-host` does)\n");
+               "(run the suite from , as `make test-host` does)\n");
         th_fails++;
         th_checks++;
         return;

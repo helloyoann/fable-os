@@ -9,7 +9,7 @@
  *   and cannot claim to prove "the verifier works". That claim is made by
  *   booting the kernel: a real handshake to api.anthropic.com succeeding under
  *   the flag, and a deliberately untrusted chain being refused. See the
- *   FABLEOS_VERIFY_CERTS section of os/README.md.
+ *   FABLEOS_VERIFY_CERTS section of README.md.
  *
  *   What is testable here is everything the kernel itself contributes to the
  *   decision, which is exactly where a bug would be silent:

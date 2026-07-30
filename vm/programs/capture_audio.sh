@@ -4,7 +4,7 @@
 # says the program drove the registers, this says the hardware made sound.
 #
 #   make EXTRA_CFLAGS=-DFABLEOS_AC97_REFERENCE      <-- REQUIRED FIRST
-#   vm/programs/capture_audio.sh [seconds]      (run from os/, or anywhere)
+#   vm/programs/capture_audio.sh [seconds]      (run from , or anywhere)
 #
 # THE DEFAULT KERNEL MAKES NO SOUND, ON PURPOSE. fable-os must know nothing about
 # an attached sound card — the model is supposed to write that driver at run time
@@ -36,7 +36,7 @@
 set -e
 
 SECONDS_TO_RUN="${1:-14}"
-DIR="$(cd "$(dirname "$0")/../.." && pwd)"       # os/
+DIR="$(cd "$(dirname "$0")/../.." && pwd)"       # 
 OUT_PREFIX="${OUT_PREFIX:-/tmp/fableos-audio-$$}"
 WAV="${OUT_PREFIX}.wav"
 LOG="${OUT_PREFIX}.log"

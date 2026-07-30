@@ -12,7 +12,7 @@
  *   So this file is a fixture, in two independent ways:
  *     1. it is not in vm/ or drivers/ any more, it is under tests/qemu/, so no
  *        source list in the kernel build even mentions the path; and
- *     2. os/Makefile adds it to KERNEL_SRCS only when EXTRA_CFLAGS contains
+ *     2. Makefile adds it to KERNEL_SRCS only when EXTRA_CFLAGS contains
  *        -DFABLEOS_AC97_REFERENCE, and the #error below refuses to compile it
  *        without that define, so it cannot arrive in an image by accident.
  *

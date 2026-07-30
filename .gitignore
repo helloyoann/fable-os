@@ -1,5 +1,5 @@
 # Secrets. There is exactly ONE file in this tree that holds the Anthropic API
-# key, and it is this one: os/.env (KEY="sk-ant-..."), read by `make run` and
+# key, and it is this one: .env (KEY="sk-ant-..."), read by `make run` and
 # handed to the guest at boot over QEMU's fw_cfg channel. Nothing the build
 # produces can contain it, because the build is never told what it is.
 #
@@ -27,7 +27,7 @@ kernel.bin
 *.d
 
 # Host test binaries from `make test-host`. Leading **/ because a pattern with a
-# slash in it is anchored to this file's directory, and the tree is os/tests/.
+# slash in it is anchored to this file's directory, and the tree is tests/.
 **/tests/build/
 
 # Packet capture from `make run-pcap`
@@ -43,7 +43,7 @@ disk.img
 
 # Bootable media from `make iso` (a 4 MB ISO and its staging tree)
 fableos.iso
-os/build/
+build/
 
 # Scratch idea notes
 ideas/

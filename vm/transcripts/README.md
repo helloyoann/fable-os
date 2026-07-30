@@ -180,5 +180,5 @@ come from it.
         --turn "there's a sound card in this machine with no driver..."
     tests/qemu/wavcheck.py /tmp/run.wav
 
-It costs the operator real money, and `live_audio.py` never reads `os/.env` —
+It costs the operator real money, and `live_audio.py` never reads `.env` —
 `make run-nox` does that, and passes the key to the guest over fw_cfg.

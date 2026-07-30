@@ -810,7 +810,7 @@ def qemu_diagnosis(errpath, early, hit):
 # need with `build-cflags:` and get their own kernel.
 #
 # It has to be built IN THE TREE: EXTRA_CFLAGS is recorded in .build-flags and a
-# change to it discards every kernel object (see os/Makefile), so there is no
+# change to it discards every kernel object (see Makefile), so there is no
 # out-of-tree object directory to build into. The rules that follow from that:
 #
 #   * the result is SNAPSHOTTED into the scratch dir and QEMU boots the snapshot,
@@ -848,7 +848,7 @@ def base_cflags():
 
 
 def _make(cflags, what):
-    """make -C os/ with an exact EXTRA_CFLAGS. No shell: the flags come from a
+    """make -C  with an exact EXTRA_CFLAGS. No shell: the flags come from a
     case file, and `subprocess` with a list argv gives them no way to become
     commands even if the character filter in _setting() were wrong."""
     proc = subprocess.run(["make", "-C", OSDIR, "-j8", "EXTRA_CFLAGS=" + cflags],

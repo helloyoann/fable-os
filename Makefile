@@ -36,13 +36,13 @@ OBJCOPY := x86_64-elf-objcopy
 # Test $(origin KEY), NOT $(KEY). Make imports the environment as make
 # variables, so a plain `ifneq ($(strip $(KEY)),)` also fires when KEY merely
 # happens to be exported in the caller's shell — which is exactly what happens
-# when a zsh/bash dotenv plugin auto-sources os/.env on cd. The operator then
+# when a zsh/bash dotenv plugin auto-sources .env on cd. The operator then
 # gets told "KEY= is gone" for a command they never typed, with a key sitting
 # correctly in the file the message tells them to use. Only a command-line
 # assignment is a mistake worth stopping the build for.
 ifeq ($(origin KEY),command line)
 $(error KEY= on the command line is gone: the API key is never compiled in. Put \
-KEY="sk-ant-..." in os/.env (gitignored) and run `make run` — it is handed to the \
+KEY="sk-ant-..." in .env (gitignored) and run `make run` — it is handed to the \
 guest at boot over fw_cfg. See the README section "The API key never enters the \
 build".)
 endif
@@ -231,7 +231,7 @@ NETFLAGS   := -netdev user,id=n0 -device e1000,netdev=n0
 # ===========================================================================
 # Handing the API key to the guest at RUN time
 #
-#   os/.env               KEY="sk-ant-..."   (gitignored; where the key lives)
+#   .env               KEY="sk-ant-..."   (gitignored; where the key lives)
 #   $ANTHROPIC_API_KEY                       used when .env has no key
 #   make run FABLEOS_ENV=/path/to/other/env   read a different file
 #
@@ -298,14 +298,14 @@ READ_KEY = set +x +v; key=; \
 	if [ -z "$$key" ]; then key=$${ANTHROPIC_API_KEY:-}; fi;
 #      ^ and NOTHING after it. There is deliberately no `key=$${KEY:-}` fallback
 #      for an exported shell KEY. It reads plausible — KEY is this project's own
-#      name for the key inside os/.env — but `KEY` in the ENVIRONMENT is a
+#      name for the key inside .env — but `KEY` in the ENVIRONMENT is a
 #      maximally generic name that a licence key, a GPG key id or an unrelated
 #      secret may already be sitting in, and taking it would send that secret to
 #      api.anthropic.com in the x-api-key header. That is exactly the
 #      exfiltration the two-names rule above exists to prevent; the rule would
 #      be worth little if the environment half quietly read a third, vaguer
 #      name. The dotenv-plugin problem that motivated the $(origin KEY) guard is
-#      already solved by that guard alone: in that scenario os/.env exists and
+#      already solved by that guard alone: in that scenario .env exists and
 #      the loop above wins, so this line would never have fired anyway.
 
 # Expands to the -fw_cfg arguments in "$@", or to nothing at all. No key is the

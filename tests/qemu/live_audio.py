@@ -18,7 +18,7 @@ made through this file produces the same four artefacts under one prefix:
     $OUT.png    the framebuffer at the end of the session
     $OUT.json   turn boundaries, timings, and what was typed
 
-THE KEY IS NEVER TOUCHED. This spawns `make run-nox`, which reads os/.env
+THE KEY IS NEVER TOUCHED. This spawns `make run-nox`, which reads .env
 itself and passes the key to the guest over fw_cfg. This file never opens .env,
 never names an environment variable holding a key, and never puts one on a
 command line. QEMU arguments are appended through QEMU_EXTRA, which the Makefile
@@ -48,8 +48,8 @@ import sys
 import tempfile
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))        # os/tests/qemu
-OSDIR = os.path.dirname(os.path.dirname(HERE))           # os/  (where the Makefile is)
+HERE = os.path.dirname(os.path.abspath(__file__))        # tests/qemu
+OSDIR = os.path.dirname(os.path.dirname(HERE))           #   (where the Makefile is)
 
 # The cards this experiment is about. Nothing here is knowledge the KERNEL has —
 # it is QEMU command-line syntax, on the host side of the machine boundary.

@@ -64,8 +64,8 @@ import os
 import re
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))        # os/tests/qemu
-OSDIR = os.path.dirname(os.path.dirname(HERE))           # os/
+HERE = os.path.dirname(os.path.abspath(__file__))        # tests/qemu
+OSDIR = os.path.dirname(os.path.dirname(HERE))           # 
 
 # Third-party trees bring their own printf. tests/ links the host libc.
 SKIP_PREFIX = ("lwip/", "mbedtls/", "tests/", "port/")

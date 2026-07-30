@@ -7,7 +7,7 @@ phase's model — reads) and once as a C string literal inside the kernel. This
 script derives the second from the first so they cannot drift, and
 tests/host/test_dvm_ac97.c fails the build's test step if anyone skips it.
 
-    python3 vm/programs/gen_header.py        # run from os/, or from anywhere
+    python3 vm/programs/gen_header.py        # run from , or from anywhere
 """
 
 import os

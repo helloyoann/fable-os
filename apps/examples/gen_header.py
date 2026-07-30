@@ -7,7 +7,7 @@ good looks like — reads) and once as a C string literal inside the kernel. Thi
 script derives the second from the first so the two cannot drift, and the host
 tests read the .json files at run time and fail if they ever differ.
 
-    python3 apps/examples/gen_header.py        # run from os/, or from anywhere
+    python3 apps/examples/gen_header.py        # run from , or from anywhere
 
 TWO OUTPUTS, FOR ONE HISTORICAL REASON. calculator_json.h predates the others and
 is spliced between markers inside a hand-written header, because that header

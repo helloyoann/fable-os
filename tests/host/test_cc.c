@@ -82,14 +82,14 @@ static void fs_bringup(void) {
 }
 
 /* Read a file the repository ships, from the working directory `make test-host`
- * uses (os/). Fails loudly rather than silently skipping, because a suite that
+ * uses (). Fails loudly rather than silently skipping, because a suite that
  * quietly stops checking the shipped examples is worse than no suite. */
 static size_t slurp(const char *path, char *dst, size_t cap) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         th_checks++;
         th_fails++;
-        printf("    FAIL cannot open %s (run make test-host from os/)\n", path);
+        printf("    FAIL cannot open %s (run make test-host from )\n", path);
         return 0;
     }
     size_t n = fread(dst, 1, cap - 1, f);

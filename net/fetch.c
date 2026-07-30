@@ -412,7 +412,7 @@ int fetch_build_request(char *dst, size_t cap, const fetch_url_t *u,
         app_s(&a, ":");
         app_u(&a, u->port);
     }
-    app_s(&a, "\r\nUser-Agent: fable-os/1 (bare-metal kernel)\r\nAccept: ");
+    app_s(&a, "\r\nUser-Agent: fable-1 (bare-metal kernel)\r\nAccept: ");
     app_s(&a, (opt->accept && opt->accept[0]) ? opt->accept : "*/*");
     app_s(&a, "\r\nConnection: close\r\n");
 

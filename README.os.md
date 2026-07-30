@@ -240,7 +240,7 @@ The same rule binds the **environment** half, and that took a second pass to get
 right. `make KEY=...` on the command line is a hard error, but the guard tests
 `$(origin KEY)` rather than `$(KEY)` — make imports the environment as make
 variables, so the plain test also fired when a zsh dotenv plugin auto-sourced
-`os/.env` on `cd`, and told the operator "KEY= is gone" for a command they never
+`.env` on `cd`, and told the operator "KEY= is gone" for a command they never
 typed. Fixing that is correct. What briefly came *with* it was a fallback that
 read an exported shell `KEY` as the Anthropic key, which is the identical
 exfiltration one level out: `KEY` in the environment is a maximally generic name

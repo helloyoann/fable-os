@@ -19,7 +19,7 @@
 ;
 ;   NOT SAVED, deliberately:
 ;     - x87/MMX/SSE state. The kernel is built -mno-mmx -mno-sse -mno-sse2
-;       (see CFLAGS in os/Makefile), so the compiler emits none of it and no
+;       (see CFLAGS in Makefile), so the compiler emits none of it and no
 ;       kernel code touches MXCSR or the x87 control word. Saving 512 bytes of
 ;       FXSAVE area per switch to preserve registers that are never written
 ;       would be cost with no property attached. If SSE is ever enabled for
