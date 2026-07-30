@@ -1,4 +1,4 @@
-/* lwipopts.h — lwIP configuration for talk-os.
+/* lwipopts.h — lwIP configuration for fable-os.
  * Bare-metal, single-threaded (NO_SYS), IPv4 + TCP/UDP + DNS, polled. */
 #ifndef LWIPOPTS_H
 #define LWIPOPTS_H
@@ -97,7 +97,7 @@
  * consumed by lwIP's own headers before any mbedTLS header is available.)
  *
  * Default is 0 — the historical behaviour, unchanged, because other work in
- * this tree boots against it. `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS` selects
+ * this tree boots against it. `make EXTRA_CFLAGS=-DFABLEOS_VERIFY_CERTS` selects
  * 2, at which point net/net.c must also install the CA chain and the hostname;
  * see include/tls_ca.h for the whole picture and for which roots are pinned.
  * VERIFY_OPTIONAL (1) is deliberately not offered: it verifies and then
@@ -105,7 +105,7 @@
 #define LWIP_ALTCP                  1
 #define LWIP_ALTCP_TLS              1
 #define LWIP_ALTCP_TLS_MBEDTLS      1
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
 #define ALTCP_MBEDTLS_AUTHMODE      2   /* MBEDTLS_SSL_VERIFY_REQUIRED */
 #else
 #define ALTCP_MBEDTLS_AUTHMODE      0   /* MBEDTLS_SSL_VERIFY_NONE */

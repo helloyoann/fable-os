@@ -44,9 +44,9 @@
 /* Same Mach-O shim every host-tested tool file carries: on the host a bare
  * section name is rejected, so export a named pointer and let the test stand in
  * for the linker. Kernel builds are untouched. */
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 #undef  REGISTER_TOOL
-#define REGISTER_TOOL(var) const tool_t *const talkos_hosttool_##var = &(var)
+#define REGISTER_TOOL(var) const tool_t *const fableos_hosttool_##var = &(var)
 #endif
 
 #define AG_WORD_MAX 24
@@ -520,7 +520,7 @@ REGISTER_TOOL(agenda_control_tool);
  *   yourself" verb one hallucination away from the model, and it is why this is
  *   compiled in only on request:
  *
- *       make EXTRA_CFLAGS=-DTALKOS_REPAIR_DEMO run-nox
+ *       make EXTRA_CFLAGS=-DFABLEOS_REPAIR_DEMO run-nox
  *
  *   THE BUG IS THE MOST ORDINARY ONE THERE IS: a divide with no zero check. gcc
  *   emits an idiv, the divisor is zero, the CPU raises #DE, and the faulting
@@ -535,7 +535,7 @@ REGISTER_TOOL(agenda_control_tool);
  *   lines. There is no private back door for the demonstration to succeed
  *   through.
  */
-#ifdef TALKOS_REPAIR_DEMO
+#ifdef FABLEOS_REPAIR_DEMO
 
 static int demo_divisor;      /* 0 to begin with: that IS the bug's trigger */
 static int demo_runs;
@@ -588,4 +588,4 @@ int  agenda_demo_runs(void) { return demo_runs; }
 int  agenda_demo_ok(void);
 int  agenda_demo_ok(void)   { return demo_ok; }
 
-#endif /* TALKOS_REPAIR_DEMO */
+#endif /* FABLEOS_REPAIR_DEMO */

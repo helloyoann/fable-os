@@ -1,6 +1,6 @@
 /* fb.c — the linear framebuffer. Contract and design rationale: include/fb.h.
  *
- * Two halves, split by TALKOS_HOSTTEST:
+ * Two halves, split by FABLEOS_HOSTTEST:
  *
  *   DRAWING is pure arithmetic over a caller-supplied pixel array. It compiles
  *   and runs on the host, which is the only way to assert exact pixels — every
@@ -346,7 +346,7 @@ int fb_utf8_columns(const char *utf8, size_t n) {
 /* the hardware framebuffer                                               */
 /* ====================================================================== */
 
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 
 /* No ports, no 5 MiB of .bss, no physical addresses in a host process. The
  * drawing half above is the part worth testing and it needs none of this. */
@@ -696,4 +696,4 @@ void fb_present_rect(int32_t x, int32_t y, int32_t w, int32_t h) {
 
 void fb_present(void) { fb_present_rect(0, 0, hw.width, hw.height); }
 
-#endif /* TALKOS_HOSTTEST */
+#endif /* FABLEOS_HOSTTEST */

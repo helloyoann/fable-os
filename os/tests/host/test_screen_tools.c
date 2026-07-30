@@ -3,7 +3,7 @@
  * Runs the REAL tools/screen_tools.c against the REAL core/tool.c, net/json.c
  * and lib/trace.c. Nothing is mocked except the one thing that cannot exist in a
  * host process: the framebuffer itself. tools/screen_tools.c reaches the screen
- * through three accessors that, under TALKOS_HOSTTEST, resolve to an array this
+ * through three accessors that, under FABLEOS_HOSTTEST, resolve to an array this
  * file injects — so the address arithmetic, the bounds tests, the clipping and
  * the exact cell bytes are all the production code paths.
  *
@@ -43,9 +43,9 @@
 /* stand in for the linker-collected tool table                          */
 /* ====================================================================== */
 
-extern const tool_t *const talkos_hosttool_screen_info_tool;
-extern const tool_t *const talkos_hosttool_read_screen_tool;
-extern const tool_t *const talkos_hosttool_write_screen_tool;
+extern const tool_t *const fableos_hosttool_screen_info_tool;
+extern const tool_t *const fableos_hosttool_read_screen_tool;
+extern const tool_t *const fableos_hosttool_write_screen_tool;
 
 /* Deliberately defined WITHOUT the inner const that core/tool.c's extern
  * declaration carries: in the kernel the linker emits this table read-only, but
@@ -68,12 +68,12 @@ _Static_assert(sizeof(__start_tool_table) == 24,
                "tool count changed: update the __stop_tool_table byte offset");
 
 static void install_tool_table(void) {
-    __start_tool_table[0] = talkos_hosttool_screen_info_tool;
-    __start_tool_table[1] = talkos_hosttool_read_screen_tool;
-    __start_tool_table[2] = talkos_hosttool_write_screen_tool;
+    __start_tool_table[0] = fableos_hosttool_screen_info_tool;
+    __start_tool_table[1] = fableos_hosttool_read_screen_tool;
+    __start_tool_table[2] = fableos_hosttool_write_screen_tool;
 }
 
-/* ---- the seams tools/screen_tools.c exposes under TALKOS_HOSTTEST ---- */
+/* ---- the seams tools/screen_tools.c exposes under FABLEOS_HOSTTEST ---- */
 void screen_tools_set_framebuffer(volatile uint16_t *fb, int rows, int cols);
 void screen_tools_set_cursor(int row, int col);
 
@@ -348,16 +348,26 @@ static void test_fill_row_paints_to_the_edge(void) {
     fb_reset();
     screen_tools_set_cursor(5, 0);
 
+    /* Derived from the text rather than hardcoded. Renaming the OS from talk-os
+     * to fable-os moved every one of these by one column and failed four checks
+     * at once — the assertions were pinning "column 6 holds 's'" when what they
+     * mean is "the last painted column holds the last character". */
+    static const char TEXT[] = "fable-os";
+    const int len = (int)(sizeof TEXT - 1);
+
     const char *out = call_tool("write_screen",
-        "{\"row\":0,\"col\":0,\"text\":\"talk-os\",\"fg\":\"black\","
+        "{\"row\":0,\"col\":0,\"text\":\"" "fable-os" "\",\"fg\":\"black\","
         "\"bg\":\"light_grey\",\"fill_row\":true}");
     CHECK(!was_error());
-    CHECK_CONTAINS(out, "filled the remaining 73 column(s)");
+    char want_fill[64];
+    snprintf(want_fill, sizeof want_fill, "filled the remaining %d column(s)",
+             FB_COLS - len);
+    CHECK_CONTAINS(out, want_fill);
 
     const uint16_t attr = 0x7000;                 /* bg=7 fg=0 */
-    CHECK_EQ(fb[0], (uint16_t)(attr | 't'));
-    CHECK_EQ(fb[6], (uint16_t)(attr | 's'));
-    for (int x = 7; x < FB_COLS; x++)
+    for (int i = 0; i < len; i++)
+        CHECK_EQ(fb[i], (uint16_t)(attr | (unsigned char)TEXT[i]));
+    for (int x = len; x < FB_COLS; x++)
         CHECK_EQ(fb[x], (uint16_t)(attr | ' '));
     /* Exactly one row: the first cell of row 1 is untouched. */
     CHECK_EQ(fb[FB_COLS], BLANK);
@@ -671,8 +681,8 @@ static void test_read_screen_reads_the_boot_log(void) {
     fb_reset();
     screen_tools_set_cursor(6, 0);
 
-    /* Verbatim shapes from a real talk-os boot. */
-    fb_puts(0, "talk-os booting");
+    /* Verbatim shapes from a real fable-os boot. */
+    fb_puts(0, "fable-os booting");
     fb_puts(1, "  serial : COM1 115200");
     fb_puts(2, "  pci    : 4 functions, 1 unclaimed");
     fb_puts(3, "  net    : dhcp bound 10.0.2.15");
@@ -683,7 +693,7 @@ static void test_read_screen_reads_the_boot_log(void) {
     CHECK(!was_error());
 
     /* The payoff: the model can read what the kernel printed earlier. */
-    CHECK_CONTAINS(out, "00|talk-os booting\n");
+    CHECK_CONTAINS(out, "00|fable-os booting\n");
     CHECK_CONTAINS(out, "01|  serial : COM1 115200\n");
     CHECK_CONTAINS(out, "03|  net    : dhcp bound 10.0.2.15\n");
     CHECK_CONTAINS(out, "04|[dns_resolve host=api.anthropic.com tries=3 -> ok]\n");
@@ -695,12 +705,12 @@ static void test_read_screen_reads_the_boot_log(void) {
     CHECK(g_res.len < 400);
 
     /* Each row is right-stripped: no 60 spaces of padding. */
-    CHECK(strstr(out, "00|talk-os booting \n") == NULL);
+    CHECK(strstr(out, "00|fable-os booting \n") == NULL);
 
     /* A region reads only that region. */
     out = call_tool("read_screen", "{\"first_row\":4,\"last_row\":4}");
     CHECK_CONTAINS(out, "04|[dns_resolve host=api.anthropic.com tries=3 -> ok]\n");
-    CHECK(strstr(out, "talk-os booting") == NULL);
+    CHECK(strstr(out, "fable-os booting") == NULL);
     CHECK(strstr(out, "ai> ready") == NULL);
     CHECK_CONTAINS(out, "screen rows 4-4 of 0-24");
 }

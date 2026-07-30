@@ -20,14 +20,14 @@
  *   port/time.h's time() returns seconds since boot and says so in its own
  *   comment; changing it would change the meaning of every mbedTLS timestamp in
  *   the default build, which is not this change's to do. Instead mbedTLS is
- *   pointed at talkos_tls_time() through MBEDTLS_PLATFORM_TIME_MACRO, under the
+ *   pointed at fableos_tls_time() through MBEDTLS_PLATFORM_TIME_MACRO, under the
  *   flag only. The default build's time() is untouched and still returns uptime.
  */
 
 #include "tls_ca.h"
 #include "rtc.h"
 
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
 /* Only the two adapter functions at the bottom need mbedTLS's declarations.
  * Keeping the include inside the flag is what lets tests/host/test_tls_verify.c
  * compile this exact file natively, with no -Imbedtls/include and no config. */
@@ -247,11 +247,11 @@ struct tm *tls_ca_gmtime_r(int64_t ts, struct tm *out)
 /* mbedTLS adapters — flag-gated, called only by mbedTLS                  */
 /* ====================================================================== */
 
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
 
 /* MBEDTLS_PLATFORM_TIME_MACRO. Signature must match mbedtls_time_t (*)(
  * mbedtls_time_t *), and mbedtls_config.h pins mbedtls_time_t to `long`. */
-long talkos_tls_time(long *tloc)
+long fableos_tls_time(long *tloc)
 {
     long now = (long)tls_ca_now_unix();
     if (tloc) *tloc = now;
@@ -270,4 +270,4 @@ struct tm *mbedtls_platform_gmtime_r(const mbedtls_time_t *tt, struct tm *tm_buf
     return tls_ca_gmtime_r((int64_t)*tt, tm_buf);
 }
 
-#endif /* TALKOS_VERIFY_CERTS */
+#endif /* FABLEOS_VERIFY_CERTS */

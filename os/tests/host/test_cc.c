@@ -386,7 +386,7 @@ static const case_t SUBSET[] = {
                        "int main(void){return 4;}\n#endif", 3 },
   { "nested ifdef",    "#define A\n#ifdef A\n#ifndef B\nint main(void){return 9;}\n"
                        "#endif\n#endif", 9 },
-  { "builtin header",  "#include <talkos.h>\nint main(void){uint32_t x=7;"
+  { "builtin header",  "#include <fableos.h>\nint main(void){uint32_t x=7;"
                        "return (int)x;}", 7 },
   { "predeclared types no include",
                        "int main(void){uint8_t a=250;int16_t b=-3;size_t c=4;"

@@ -45,7 +45,7 @@
 
 #include <stdio.h>          /* snprintf: port/stdio.h freestanding, libc on host */
 
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 /* kshim.c supplies these; kernel.h is not includable here (its declarations
  * fight the host libc, see the note in the Makefile about -Iport). */
 void kputs(const char *s);
@@ -59,7 +59,7 @@ void kprintf(const char *fmt, ...);
 /* 1. the platform seam                                                   */
 /* ====================================================================== */
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 
 /* The identity map boot/boot.asm builds covers the low 4 GiB with 2 MiB huge
  * pages. Anything at or above that is not mapped at all, and a firmware pointer
@@ -148,7 +148,7 @@ static const acpi_platform_t hw_platform = {
 };
 #define DEFAULT_PLATFORM (&hw_platform)
 
-#else  /* TALKOS_HOSTTEST */
+#else  /* FABLEOS_HOSTTEST */
 
 /* A host process has no physical memory and no ports. Every capability is
  * absent, so discovery reports "no ACPI" instead of interpreting whatever

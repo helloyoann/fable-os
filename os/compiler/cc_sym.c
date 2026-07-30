@@ -361,7 +361,7 @@ static cc_type_t *type_of_code(char c) {
 
 /* The predeclared integer typedefs. A program that writes uint32_t without an
  * #include is the common case, and failing it would waste a turn for no reason;
- * <talkos.h> declares the same names again and the parser accepts an identical
+ * <fableos.h> declares the same names again and the parser accepts an identical
  * typedef, so both spellings work. */
 int cc_declare_symbols(void) {
     static const struct { const char *name; char code; } tds[] = {

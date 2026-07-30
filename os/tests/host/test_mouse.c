@@ -52,7 +52,7 @@
  *      switched on.
  *
  * NOT COVERED HERE, proved by booting instead (see the mouse: lines in
- * tests/qemu/cases/boot.case and the TALKOS_MOUSE_SELFTEST watch loop): that
+ * tests/qemu/cases/boot.case and the FABLEOS_MOUSE_SELFTEST watch loop): that
  * these bytes come from a real 8042, and that QEMU's mouse really does accept
  * the magic sequence.
  */

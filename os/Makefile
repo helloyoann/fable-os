@@ -1,4 +1,4 @@
-# Build the talk-os bare-metal kernel on macOS.
+# Build the fable-os bare-metal kernel on macOS.
 #
 #   make            build kernel.bin
 #   make run        boot in QEMU (graphics window + serial on stdio)
@@ -16,8 +16,8 @@ OBJCOPY := x86_64-elf-objcopy
 # ===========================================================================
 # THE API KEY IS NOT A BUILD INPUT
 #
-# It used to be: `-DTALKOS_API_KEY='"$(KEY)"'` put the live secret inside
-# net.o, kernel.elf, kernel.bin, talkos.iso AND .build-flags (which recorded
+# It used to be: `-DFABLEOS_API_KEY='"$(KEY)"'` put the live secret inside
+# net.o, kernel.elf, kernel.bin, fableos.iso AND .build-flags (which recorded
 # the flag set verbatim, i.e. `KEY=sk-ant-...` in plain text). Five artifacts,
 # kept out of git by a .gitignore — one `git add -f`, one CI cache, one shared
 # build directory and the key is published. That is the wrong place for a
@@ -49,7 +49,7 @@ endif
 
 # One-off diagnostic builds. Empty in every normal build; the only current use
 # is the exception self-test, which is compiled out entirely without it:
-#   make EXTRA_CFLAGS=-DTALKOS_FAULT_TEST=FAULT_INJECT_PF_WRITE
+#   make EXTRA_CFLAGS=-DFABLEOS_FAULT_TEST=FAULT_INJECT_PF_WRITE
 # See arch/x86_64/fault_inject.c.
 EXTRA_CFLAGS ?=
 
@@ -69,7 +69,7 @@ CFLAGS  := -ffreestanding -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
 #             never reached the mbedTLS and lwIP objects that consume them.
 #             -MMD -MP above emits a .d per object; they are included below.
 #
-#   flags     `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS` in an already-built tree
+#   flags     `make EXTRA_CFLAGS=-DFABLEOS_VERIFY_CERTS` in an already-built tree
 #             printed "Nothing to be done" and left the previous kernel in
 #             place. Worse, recompiling ONE object without the flag afterwards
 #             produced a kernel that verified nothing and still printed
@@ -122,7 +122,7 @@ endif
 # The `-not -path './tests/*'` above protects tests/build, which has its own flag
 # stamp. tests/qemu/fixtures is the exception and is purged explicitly, because a
 # fixture object is only in $(KERNEL_OBJS) when its flag is set — so after
-# `make EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE` the AC'97 fixture's .o and .d
+# `make EXTRA_CFLAGS=-DFABLEOS_AC97_REFERENCE` the AC'97 fixture's .o and .d
 # survived the flip back. The .o was harmless (nothing linked it), but the .d was
 # not: it names vm/programs/ac97_bringup.h as a prerequisite, and the audits that
 # check THIS KERNEL KNOWS NOTHING ABOUT AUDIO read the -MMD depfiles to find out
@@ -173,11 +173,11 @@ KERNEL_SRCS := kernel/main.c kernel/drivers.c $(TOOL_SRCS) \
 # unmapped page; its own header argues that a machine whose only interface is
 # natural language must not have a "kill yourself" verb sitting one hallucination
 # away from the model, and everything that would call it is already behind
-# #ifdef TALKOS_FAULT_TEST. That made "it is unreachable" a convention about the
+# #ifdef FABLEOS_FAULT_TEST. That made "it is unreachable" a convention about the
 # source; leaving the object out of a normal image makes it a fact about the
 # binary. Verified before the change: no object in the kernel link had an
 # undefined reference to fault_inject or fault_inject_name.
-ifneq ($(findstring TALKOS_FAULT,$(EXTRA_CFLAGS)),)
+ifneq ($(findstring FABLEOS_FAULT,$(EXTRA_CFLAGS)),)
 KERNEL_SRCS += arch/x86_64/fault_inject.c
 endif
 
@@ -194,13 +194,13 @@ endif
 # tests/qemu/cases/ac97.case assert it and keeps the proof that the VM can drive
 # real silicon from rotting.
 #
-#   make EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE
+#   make EXTRA_CFLAGS=-DFABLEOS_AC97_REFERENCE
 #
 # The case's `build-cflags:` line makes the harness do exactly that and then put
 # the tree back; the fixture also #errors if compiled without the define. A
 # default `make` links no audio code at all — verify with:
 #   nm kernel.elf | grep -i ac97      (expect nothing)
-ifneq ($(findstring TALKOS_AC97_REFERENCE,$(EXTRA_CFLAGS)),)
+ifneq ($(findstring FABLEOS_AC97_REFERENCE,$(EXTRA_CFLAGS)),)
 KERNEL_SRCS += tests/qemu/fixtures/ac97_boot.c
 endif
 
@@ -233,7 +233,7 @@ NETFLAGS   := -netdev user,id=n0 -device e1000,netdev=n0
 #
 #   os/.env               KEY="sk-ant-..."   (gitignored; where the key lives)
 #   $ANTHROPIC_API_KEY                       used when .env has no key
-#   make run TALKOS_ENV=/path/to/other/env   read a different file
+#   make run FABLEOS_ENV=/path/to/other/env   read a different file
 #
 # WHY A TEMP FILE. QEMU's -fw_cfg takes either `string=` or `file=`. `string=`
 # is not an option: it puts the secret in QEMU's argv, where `ps` shows it to
@@ -252,7 +252,7 @@ NETFLAGS   := -netdev user,id=n0 -device e1000,netdev=n0
 # make variable is visible in `make -p`, is exported to every sub-make, and gets
 # echoed with the recipe.
 # ===========================================================================
-TALKOS_ENV ?= .env
+FABLEOS_ENV ?= .env
 
 # WHICH LINE OF .env IS THE KEY. Two rules, both learned the hard way.
 #
@@ -282,17 +282,17 @@ TALKOS_ENV ?= .env
 # expanded, so `make run 2>&1 | tee build.log` puts the live key in a log file
 # four times over. One token prevents it.
 READ_KEY = set +x +v; key=; \
-	if [ -f '$(TALKOS_ENV)' ]; then \
+	if [ -f '$(FABLEOS_ENV)' ]; then \
 	  for n in ANTHROPIC_API_KEY KEY; do \
-	    key=$$(sed -n "s/^[[:space:]]*\(export[[:space:]]*\)*$$n[[:space:]]*=[[:space:]]*//p" '$(TALKOS_ENV)' \
+	    key=$$(sed -n "s/^[[:space:]]*\(export[[:space:]]*\)*$$n[[:space:]]*=[[:space:]]*//p" '$(FABLEOS_ENV)' \
 	           | head -n 1 | tr -d '\r\n' \
 	           | sed -e 's/^"//' -e 's/"$$//' -e "s/^'//" -e "s/'$$//"); \
 	    if [ -n "$$key" ]; then break; fi; \
 	  done; \
-	  other=$$(sed -n 's/^[[:space:]]*\(export[[:space:]]*\)*\([A-Z_]*KEY\)[[:space:]]*=.*/\2/p' '$(TALKOS_ENV)' \
+	  other=$$(sed -n 's/^[[:space:]]*\(export[[:space:]]*\)*\([A-Z_]*KEY\)[[:space:]]*=.*/\2/p' '$(FABLEOS_ENV)' \
 	           | grep -vx -e KEY -e ANTHROPIC_API_KEY | sort -u | tr '\n' ' '); \
 	  if [ -n "$$other" ]; then \
-	    echo "note: $(TALKOS_ENV) also defines $$other - IGNORED. Only KEY and ANTHROPIC_API_KEY are read as the Anthropic key."; \
+	    echo "note: $(FABLEOS_ENV) also defines $$other - IGNORED. Only KEY and ANTHROPIC_API_KEY are read as the Anthropic key."; \
 	  fi; \
 	fi; \
 	if [ -z "$$key" ]; then key=$${ANTHROPIC_API_KEY:-}; fi;
@@ -312,15 +312,15 @@ READ_KEY = set +x +v; key=; \
 # supported default: the kernel boots, says it has none, and the API answers 401.
 KEY_ARGS = $(READ_KEY) set --; \
 	if [ -n "$$key" ]; then \
-	  keyfile=$$(mktemp "$${TMPDIR:-/tmp}/talkos-fwcfg.XXXXXXXX") || exit 1; \
+	  keyfile=$$(mktemp "$${TMPDIR:-/tmp}/fableos-fwcfg.XXXXXXXX") || exit 1; \
 	  trap 'rm -f "$$keyfile"' EXIT HUP INT QUIT TERM; \
 	  chmod 600 "$$keyfile"; \
 	  printf '%s' "$$key" > "$$keyfile"; \
 	  key=; \
-	  set -- -fw_cfg "name=opt/talkos/apikey,file=$$keyfile"; \
-	  echo "note: api key passed to the guest over fw_cfg as opt/talkos/apikey"; \
+	  set -- -fw_cfg "name=opt/fableos/apikey,file=$$keyfile"; \
+	  echo "note: api key passed to the guest over fw_cfg as opt/fableos/apikey"; \
 	else \
-	  echo "note: no api key in $(TALKOS_ENV) and no ANTHROPIC_API_KEY - the API will answer 401"; \
+	  echo "note: no api key in $(FABLEOS_ENV) and no ANTHROPIC_API_KEY - the API will answer 401"; \
 	fi;
 
 all: kernel.bin
@@ -460,13 +460,13 @@ disk-mount: $(DISK_IMG)
 	@hdiutil attach -imagekey diskimage-class=CRawDiskImage $(DISK_IMG) || \
 	   { echo "disk: hdiutil refused the image (is it already attached?)"; exit 1; }
 	@echo ""
-	@ls -la /Volumes/TALKOS 2>/dev/null || true
+	@ls -la /Volumes/FABLEOS 2>/dev/null || true
 	@echo ""
 	@echo "eject it with 'make disk-unmount' before booting the machine again."
 
 disk-unmount:
-	@diskutil eject /Volumes/TALKOS 2>/dev/null || \
-	   echo "disk: nothing mounted at /Volumes/TALKOS"
+	@diskutil eject /Volumes/FABLEOS 2>/dev/null || \
+	   echo "disk: nothing mounted at /Volumes/FABLEOS"
 
 run: kernel.bin $(DISK_IMG)
 	@$(RESIZE_WINDOW)
@@ -478,7 +478,7 @@ run-nox: kernel.bin $(DISK_IMG)
 # ===========================================================================
 # Bootable media — GRUB, an ISO, and a USB stick
 #
-#   make iso            build talkos.iso (GRUB + kernel, BIOS El Torito,
+#   make iso            build fableos.iso (GRUB + kernel, BIOS El Torito,
 #                       isohybrid MBR so the same file works on a USB stick)
 #   make run-iso        boot the ISO in QEMU through GRUB (-cdrom, no -kernel)
 #   make run-iso-nox    same, headless, serial on stdio
@@ -500,7 +500,7 @@ run-nox: kernel.bin $(DISK_IMG)
 GRUB_MKRESCUE ?= $(shell command -v grub-mkrescue 2>/dev/null || \
                          command -v i686-elf-grub-mkrescue 2>/dev/null || \
                          command -v x86_64-elf-grub-mkrescue 2>/dev/null)
-ISO     := talkos.iso
+ISO     := fableos.iso
 ISOROOT := build/iso
 
 iso: $(ISO)
@@ -592,7 +592,7 @@ HOSTCC     ?= cc
 # string.h) for lwIP/mbedTLS; on the host they would shadow the real libc
 # headers. Host tests link against real libc.
 HOST_CFLAGS := -std=gnu11 -g -O1 -Wall -Wextra -Iinclude -Itests/host \
-               -DTALKOS_HOSTTEST
+               -DFABLEOS_HOSTTEST
 HOST_SHIM  := tests/host/harness.c tests/host/kshim.c
 
 # tests/host/test_cc.c does something no other suite does: it EXECUTES the x86-64
@@ -665,14 +665,14 @@ TESTSRC_test_acpi := drivers/acpi/acpi.c drivers/acpi/power.c tools/power_tools.
 TESTSRC_test_tls_verify := net/tls_ca.c drivers/rtc/rtc.c
 # test_tls_chain links the REAL vendored mbedTLS and asks it for verdicts, which
 # is the only way to test the verifier rather than a transcription of it. It is
-# the one host test that needs the kernel's mbedTLS config and TALKOS_VERIFY_CERTS
+# the one host test that needs the kernel's mbedTLS config and FABLEOS_VERIFY_CERTS
 # — before this, nothing in the tree built with that flag at all, so a
 # path-validation check could be switched off with `make test` still green.
 # -w because the vendored library is not warning-clean under -Wall -Wextra on the
 # host; the sources under test here are tls_ca.c and rtc.c, both covered warning-
 # clean by test_tls_verify.
 TESTSRC_test_tls_chain := net/tls_ca.c drivers/rtc/rtc.c $(MBEDTLS_SRCS)
-HOSTCFLAGS_test_tls_chain := -DTALKOS_VERIFY_CERTS -Imbedtls/include \
+HOSTCFLAGS_test_tls_chain := -DFABLEOS_VERIFY_CERTS -Imbedtls/include \
                              -DMBEDTLS_CONFIG_FILE='"mbedtls_config.h"' -w
 TESTSRC_test_fb := lib/fb.c lib/font.c lib/font_spleen8x16.c
 TESTSRC_test_gui := gui/wm.c gui/widgets.c gui/gui_demo.c tools/gui_tools.c \
@@ -716,7 +716,7 @@ apps/runtime.o tests/build/test_app_format: apps/examples/examples_json.h
 # beeper.json is the worked example for a capability call; it reaches the kernel
 # through the same generated header, and the audio self-test embeds it.
 apps/app_audio_selftest.o tests/build/test_app_audio: apps/examples/examples_json.h
-# lib/kfmt.c is the kernel's OWN vsnprintf. Under TALKOS_HOSTTEST it renames
+# lib/kfmt.c is the kernel's OWN vsnprintf. Under FABLEOS_HOSTTEST it renames
 # itself to kfmt_vsnprintf/kfmt_snprintf so it can be linked ALONGSIDE the host
 # libc, which is the entire point: the suite prints one format string through
 # both formatters and diffs them. Host suites otherwise only ever exercise the

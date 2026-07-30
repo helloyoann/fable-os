@@ -1,7 +1,7 @@
 /* app_selftest.c — launch the reference app document on real hardware, at boot.
  *
  * ============================================================================
- * COMPILED OUT OF EVERY NORMAL BUILD. Without -DTALKOS_APP_SELFTEST this file
+ * COMPILED OUT OF EVERY NORMAL BUILD. Without -DFABLEOS_APP_SELFTEST this file
  * compiles to nothing at all: no driver is registered, so nothing in the boot
  * path can reach it.
  * ============================================================================
@@ -17,12 +17,12 @@
  *
  *   So this file asks, through the same door the model uses:
  *
- *       make EXTRA_CFLAGS='-DTALKOS_APP_SELFTEST -DTALKOS_GUI_SELFTEST \
- *                          -DTALKOS_GUI_WATCH_MS=25000'
+ *       make EXTRA_CFLAGS='-DFABLEOS_APP_SELFTEST -DFABLEOS_GUI_SELFTEST \
+ *                          -DFABLEOS_GUI_WATCH_MS=25000'
  *       apps/probe/run_calc.sh            (drives the mouse, takes screenshots)
  *
- *   TALKOS_APP_SELFTEST launches apps/examples/calculator.json.
- *   TALKOS_GUI_SELFTEST (gui/wm.c) is what services a real mouse at the prompt:
+ *   FABLEOS_APP_SELFTEST launches apps/examples/calculator.json.
+ *   FABLEOS_GUI_SELFTEST (gui/wm.c) is what services a real mouse at the prompt:
  *   drivers/input/kbd.c drains 8042 bytes without testing the AUX bit, so the
  *   keyboard and the mouse race unless nothing else is polling — see DECISION 4
  *   in include/gui.h. The two flags are independent and compose.
@@ -43,7 +43,7 @@
  *   windows alone.
  */
 
-#if defined(TALKOS_APP_SELFTEST) && !defined(TALKOS_HOSTTEST)
+#if defined(FABLEOS_APP_SELFTEST) && !defined(FABLEOS_HOSTTEST)
 
 #include "app.h"
 #include "gui.h"
@@ -162,6 +162,6 @@ REGISTER_DRIVER(app_selftest_driver);
 
 /* Keeps this translation unit non-empty in a normal build, where the whole file
  * above compiles to nothing. */
-typedef int talkos_app_selftest_not_built_t;
+typedef int fableos_app_selftest_not_built_t;
 
 #endif

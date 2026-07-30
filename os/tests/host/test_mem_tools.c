@@ -20,7 +20,7 @@
  *      tool here and must parse back cleanly through json.h.
  *
  * Standing in for the linker: Mach-O has no __start_/__stop_ section symbols, so
- * mem_tools.c exports a named pointer per tool under TALKOS_HOSTTEST and this
+ * mem_tools.c exports a named pointer per tool under FABLEOS_HOSTTEST and this
  * file assembles the table core/tool.c expects.
  */
 
@@ -36,11 +36,11 @@
 /* stand in for the linker-collected tool table                          */
 /* ====================================================================== */
 
-extern const tool_t *const talkos_hosttool_heap_stats_tool;
-extern const tool_t *const talkos_hosttool_heap_check_tool;
-extern const tool_t *const talkos_hosttool_sys_uptime_tool;
-extern const tool_t *const talkos_hosttool_mem_map_tool;
-extern const tool_t *const talkos_hosttool_mem_read_tool;
+extern const tool_t *const fableos_hosttool_heap_stats_tool;
+extern const tool_t *const fableos_hosttool_heap_check_tool;
+extern const tool_t *const fableos_hosttool_sys_uptime_tool;
+extern const tool_t *const fableos_hosttool_mem_map_tool;
+extern const tool_t *const fableos_hosttool_mem_read_tool;
 
 /* Deliberately defined WITHOUT the inner const that core/tool.c's extern
  * declaration carries. In the kernel this table is emitted by the linker and is
@@ -68,11 +68,11 @@ _Static_assert(sizeof(__start_tool_table) == 40,
                "tool count changed: update the __stop_tool_table byte offset");
 
 static void install_tool_table(void) {
-    __start_tool_table[0] = talkos_hosttool_heap_stats_tool;
-    __start_tool_table[1] = talkos_hosttool_heap_check_tool;
-    __start_tool_table[2] = talkos_hosttool_sys_uptime_tool;
-    __start_tool_table[3] = talkos_hosttool_mem_map_tool;
-    __start_tool_table[4] = talkos_hosttool_mem_read_tool;
+    __start_tool_table[0] = fableos_hosttool_heap_stats_tool;
+    __start_tool_table[1] = fableos_hosttool_heap_check_tool;
+    __start_tool_table[2] = fableos_hosttool_sys_uptime_tool;
+    __start_tool_table[3] = fableos_hosttool_mem_map_tool;
+    __start_tool_table[4] = fableos_hosttool_mem_read_tool;
 }
 
 /* ---- non-static internals of mem_tools.c under test ---- */
@@ -548,7 +548,7 @@ static void region_init(void) {
     memset(rgn.front, 0xF1, sizeof rgn.front);
     memset(rgn.back,  0xB2, sizeof rgn.back);
     for (int i = 0; i < BODY_LEN; i++) rgn.body[i] = (unsigned char)i;
-    memcpy(rgn.body + 32, "talk-os", 7);
+    memcpy(rgn.body + 32, "fable-os", sizeof "fable-os" - 1);
     mem_tools_set_window(rgn.body, BODY_LEN);
 }
 
@@ -595,8 +595,8 @@ static void test_mem_read_happy_path(void) {
     /* Printable bytes must survive into the ASCII column. */
     out = body_call(32, 16, 1);
     CHECK_EQ(g_res.is_error, 0);
-    CHECK_CONTAINS(out, "|talk-os");
-    CHECK_CONTAINS(out, "74 61 6c 6b 2d 6f 73");   /* "talk-os" */
+    CHECK_CONTAINS(out, "|fable-os");
+    CHECK_CONTAINS(out, "66 61 62 6c 65 2d 6f 73");   /* "fable-os" */
 
     /* Default length is 64 and is exercised when "length" is omitted. */
     out = body_call(0, 0, 0);

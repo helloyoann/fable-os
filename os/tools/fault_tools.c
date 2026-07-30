@@ -127,9 +127,9 @@
  * expand. Export a named pointer per tool instead; tests/host/test_fault.c
  * stands in for the linker. Kernel builds are untouched. Same shim as
  * tools/mem_tools.c. */
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 #undef  REGISTER_TOOL
-#define REGISTER_TOOL(var) const tool_t *const talkos_hosttool_##var = &(var)
+#define REGISTER_TOOL(var) const tool_t *const fableos_hosttool_##var = &(var)
 #else
 #include "idt.h"
 #endif
@@ -137,7 +137,7 @@
 /* The IDT only exists in a kernel build; on the host, report it as absent so
  * the "no IDT" branch of fault_status is exercised by the tests too. */
 static int idt_is_installed(void) {
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
     return 0;
 #else
     return idt_installed();
@@ -148,7 +148,7 @@ static int idt_is_installed(void) {
  * actually handed to LIDT rather than from a compile-time constant — the same
  * discipline mem_map applies to the memory window. */
 static void idt_describe(tool_result_t *r) {
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     if (!idt_installed()) return;
     tool_result_printf(r,
         "  table      : 256 gates at 0x%016lx, limit %u, kernel code selector "

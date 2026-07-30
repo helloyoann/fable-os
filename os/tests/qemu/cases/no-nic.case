@@ -46,7 +46,7 @@ forbid-re: ^\s*\[\s*\d+\] eth0\s
 # The rest of the boot must be unaffected: power cycle and VFS still work.
 expect: --- power cycle: suspend all, then resume all ---
 expect: --- filesystem self-test (ramfs at /) ---
-expect: read /etc/motd (33 bytes): talk-os native filesystem online
+expect: read /etc/motd (34 bytes): fable-os native filesystem online
 expect-re: ^ls / :(?=.*\btmp\b)(?=.*\betc\b)
 
 # And networking gives up gracefully instead of hanging or faulting.

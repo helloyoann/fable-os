@@ -1,4 +1,4 @@
-/* mbedtls_config.h — mbedTLS 2.28 config for talk-os.
+/* mbedtls_config.h — mbedTLS 2.28 config for fable-os.
  *
  * Tuned for one job: a TLS 1.2 *client* that can complete a handshake with a
  * modern HTTPS server (ECDHE + AES-GCM / ChaCha20, P-256/P-384/X25519) from a
@@ -8,15 +8,15 @@
  *   - No filesystem, no sockets.
  *   - Entropy comes from mbedtls_hardware_poll() (RDRAND/TSC) — see libc_shim.c.
  *     That is NOT a vetted CSPRNG seed and this file does not fix it.
- *   - Certificate verification is a build-time choice. See the TALKOS_VERIFY_CERTS
+ *   - Certificate verification is a build-time choice. See the FABLEOS_VERIFY_CERTS
  *     block at the bottom: without the flag the kernel runs
  *     MBEDTLS_SSL_VERIFY_NONE and the certificate is parsed but not
  *     trust-checked (encrypted, not authenticated); with it, the chain is
  *     verified against include/tls_ca.h's pinned roots, the hostname is checked,
  *     and notBefore/notAfter are enforced against the CMOS clock.
  */
-#ifndef TALKOS_MBEDTLS_CONFIG_H
-#define TALKOS_MBEDTLS_CONFIG_H
+#ifndef FABLEOS_MBEDTLS_CONFIG_H
+#define FABLEOS_MBEDTLS_CONFIG_H
 
 /* ---- platform ---- */
 #define MBEDTLS_HAVE_ASM
@@ -86,13 +86,13 @@
 #define MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
 
 /* ====================================================================== */
-/* TALKOS_VERIFY_CERTS — real certificate verification, opt-in            */
+/* FABLEOS_VERIFY_CERTS — real certificate verification, opt-in            */
 /* ====================================================================== */
 /*
  * Everything above this line is the historical configuration and is what a
  * plain `make` still produces, byte for byte. Building with
  *
- *     make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS
+ *     make EXTRA_CFLAGS=-DFABLEOS_VERIFY_CERTS
  *
  * adds the four things mbedTLS needs before it will actually refuse a bad
  * certificate. (The fifth, MBEDTLS_SSL_VERIFY_REQUIRED, is set through lwIP's
@@ -116,7 +116,7 @@
  *     mbedTLS's default clock is the C library's time(). In this kernel that is
  *     port/time.h's stub, which counts seconds since boot, so every handshake
  *     would be evaluated as if it were January 1970 and every real certificate
- *     would look not-yet-valid. Redirect it to talkos_tls_time(), which reads
+ *     would look not-yet-valid. Redirect it to fableos_tls_time(), which reads
  *     the CMOS RTC. MBEDTLS_PLATFORM_C is a prerequisite of the two TIME macros
  *     (mbedtls/check_config.h enforces that); it pulls in library/platform.c,
  *     which with no *_ALT options selected compiles to almost nothing.
@@ -154,12 +154,12 @@
  *     both are cheap, and the live api.anthropic.com chain satisfies them
  *     (leaf: KU=digitalSignature, EKU=serverAuth; WE1: keyCertSign).
  */
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
 
 #define MBEDTLS_HAVE_TIME_DATE
 #define MBEDTLS_PLATFORM_C
 #define MBEDTLS_PLATFORM_TIME_TYPE_MACRO long
-#define MBEDTLS_PLATFORM_TIME_MACRO      talkos_tls_time
+#define MBEDTLS_PLATFORM_TIME_MACRO      fableos_tls_time
 #define MBEDTLS_PLATFORM_GMTIME_R_ALT
 #define MBEDTLS_PEM_PARSE_C
 #define MBEDTLS_BASE64_C
@@ -174,11 +174,11 @@
  * (mbedtls_platform_gmtime_r needs no declaration here: mbedTLS declares it
  * itself in mbedtls/platform_util.h.) */
 #ifndef __ASSEMBLER__
-long talkos_tls_time(long *tloc);
+long fableos_tls_time(long *tloc);
 #endif
 
-#endif /* TALKOS_VERIFY_CERTS */
+#endif /* FABLEOS_VERIFY_CERTS */
 
 #include "mbedtls/check_config.h"
 
-#endif /* TALKOS_MBEDTLS_CONFIG_H */
+#endif /* FABLEOS_MBEDTLS_CONFIG_H */

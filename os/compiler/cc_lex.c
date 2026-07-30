@@ -1078,17 +1078,17 @@ int cc_preprocess(cc_token_t *in, int nin, cc_token_t **out, int *nout) {
 /* built-in headers                                                      */
 /* ===================================================================== */
 
-/* <talkos.h> exists so that a model which habitually writes an #include finds
+/* <fableos.h> exists so that a model which habitually writes an #include finds
  * one, and so that the curated kernel declarations are READABLE from inside a
  * program. It declares nothing that is not already in scope: cc_declare_symbols()
  * predeclares every one of these before the unit is parsed, and a redeclaration
  * that matches is accepted. That is deliberate — the failure mode of "you must
  * include the right header" is a wasted turn. */
-static const char *const HDR_TALKOS =
-    "/* talkos.h - what a compiled program may call. All of this is already\n"
+static const char *const HDR_FABLEOS =
+    "/* fableos.h - what a compiled program may call. All of this is already\n"
     "   declared before your first line; this header exists to be read. */\n"
-    "#ifndef TALKOS_H\n"
-    "#define TALKOS_H\n"
+    "#ifndef FABLEOS_H\n"
+    "#define FABLEOS_H\n"
     "typedef unsigned char  uint8_t;\n"
     "typedef unsigned short uint16_t;\n"
     "typedef unsigned int   uint32_t;\n"
@@ -1104,7 +1104,7 @@ static const char *const HDR_EMPTY =
     "/* provided by the compiler itself; nothing to declare */\n";
 
 const char *cc_builtin_header(const char *name) {
-    if (strcmp(name, "talkos.h") == 0) return HDR_TALKOS;
+    if (strcmp(name, "fableos.h") == 0) return HDR_FABLEOS;
     /* stdint/stddef are habits, not dependencies: the types are predeclared. */
     if (strcmp(name, "stdint.h") == 0 || strcmp(name, "stddef.h") == 0 ||
         strcmp(name, "stdbool.h") == 0 || strcmp(name, "string.h") == 0)

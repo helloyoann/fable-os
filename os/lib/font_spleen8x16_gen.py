@@ -296,7 +296,7 @@ def main():
         if cp and cp not in glyphs:
             glyphs[cp] = ("CP437 0x%02X" % slot, bits)
     for cp, (name, bits) in HAND_DRAWN.items():
-        glyphs[cp] = (name + " (talk-os)", bits)
+        glyphs[cp] = (name + " (fable-os)", bits)
 
     # Glyph 0 is always the replacement character: an out-of-range lookup that
     # lands on index 0 then draws something visible rather than a stray 'A'.
@@ -341,7 +341,7 @@ def main():
     w = sys.stdout.write
     w("""/* font_spleen8x16.c — GENERATED. Do not edit; see lib/font_spleen8x16_gen.py.
  *
- * Spleen 8x16, %d glyphs, plus %d drawn for talk-os (see the generator).
+ * Spleen 8x16, %d glyphs, plus %d drawn for fable-os (see the generator).
  *
  *   Spleen 2.1.0, Copyright (c) 2018-2024, Frederic Cambus
  *   SPDX-License-Identifier: BSD-2-Clause
@@ -377,7 +377,7 @@ static const uint8_t spleen_bits[] = {
     .bits       = spleen_bits,
     .ranges     = spleen_ranges,
     .nranges    = %d,
-    .name       = "Spleen 8x16 (BSD-2-Clause) + talk-os additions",
+    .name       = "Spleen 8x16 (BSD-2-Clause) + fable-os additions",
 };
 
 /* --- the console's 256-slot code page --- */

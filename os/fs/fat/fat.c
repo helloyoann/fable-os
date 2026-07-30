@@ -594,7 +594,7 @@ int fat32_mount_disk(const char *mountpoint, block_device_t *bd, int allow_forma
         return rc;
     }
     kprintf("fat: %s is blank - formatting it as FAT32\n", bd->name);
-    rc = fat32_format(bd, "TALKOS");
+    rc = fat32_format(bd, "FABLEOS");
     if (rc != VFS_OK) return rc;
 
     pending_bd = bd;

@@ -130,8 +130,8 @@ def main(argv):
         if os.path.exists(p):
             os.unlink(p)
 
-    mon = tempfile.mktemp(prefix="talkos-live-mon-")
-    ppm = tempfile.mktemp(prefix="talkos-live-shot-")
+    mon = tempfile.mktemp(prefix="fableos-live-mon-")
+    ppm = tempfile.mktemp(prefix="fableos-live-shot-")
 
     qextra = [
         "-audiodev", "wav,id=snd0,path=%s,out.frequency=48000,"

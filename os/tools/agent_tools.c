@@ -118,7 +118,7 @@
  * host build uses the "__DATA,tool_table" spelling and tests/host/test_agency.c
  * supplies the matching boundary symbols. Same shim as tools/vfs_tools.c; the
  * kernel build takes the normal path untouched. */
-#if defined(TALKOS_HOSTTEST) && defined(__APPLE__)
+#if defined(FABLEOS_HOSTTEST) && defined(__APPLE__)
 #  define REGISTER_AGENT_TOOL(v)                                               \
       static const tool_t *const __toolptr_##v                                 \
           __attribute__((used, section("__DATA,tool_table"))) = &(v)

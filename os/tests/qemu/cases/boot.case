@@ -22,7 +22,7 @@
 #     nic           argument for qemu -nic (use "none" for no NIC at all)
 #     qemu-extra    extra qemu arguments
 #     build-cflags  EXTRA_CFLAGS this case needs, e.g.
-#                   -DTALKOS_AC97_REFERENCE. Almost no case should use it:
+#                   -DFABLEOS_AC97_REFERENCE. Almost no case should use it:
 #                   the suite exists to assert things about the kernel an
 #                   operator actually gets, and this boots a different one.
 #                   It is for code that must be assertable and must NOT
@@ -49,7 +49,7 @@
 #     [net]       only asserted when the network is up (skipped offline)
 #     [offline]   only asserted in offline mode
 #
-#   Offline mode is TALKOS_TEST_OFFLINE=1, or autodetected when
+#   Offline mode is FABLEOS_TEST_OFFLINE=1, or autodetected when
 #   api.anthropic.com is unreachable. Offline only ever *relaxes* the suite.
 # =========================================================================
 
@@ -71,11 +71,11 @@ expect: serial: COM1 up @ 115200
 
 # --- fw_cfg: the channel the API key arrives on --------------------------
 # The key is not a build input any more (there is no KEY= and no
-# -DTALKOS_API_KEY), so what boot has to prove is that the host->guest channel
+# -DFABLEOS_API_KEY), so what boot has to prove is that the host->guest channel
 # came up and that the kernel is honest about whether a key came with it. This
 # suite passes no key, so the second line is normally the "none" one — it is
 # pinned as a shape so that running the suite WITH
-# TALKOS_TEST_QEMU_EXTRA='-fw_cfg name=opt/talkos/apikey,file=...' does not turn
+# FABLEOS_TEST_QEMU_EXTRA='-fw_cfg name=opt/fableos/apikey,file=...' does not turn
 # a working machine into a failing case.
 expect-re: ^fwcfg: QEMU fw_cfg at 0x510/0x511, \d+ file\(s\), features 0x[0-9a-f]+$
 expect-re: ^fwcfg: (api key: \d+ bytes loaded from fw_cfg|no api key )
@@ -119,8 +119,8 @@ check: device_tree count=13 active=serial0,fwcfg0,pci0,kbd0,mouse0,eth0,rtc0
 
 # --- VFS self-test (ramfs mounted at /) ----------------------------------
 expect: --- filesystem self-test (ramfs at /) ---
-expect: read /etc/motd (33 bytes): talk-os native filesystem online
-expect-re: ^stat /etc/motd: type=file size=33 mode=0x[0-9a-f]+$
+expect: read /etc/motd (34 bytes): fable-os native filesystem online
+expect-re: ^stat /etc/motd: type=file size=34 mode=0x[0-9a-f]+$
 expect-re: ^ls / :(?=.*\btmp\b)(?=.*\betc\b)
 expect-re: ^-{41}$
 

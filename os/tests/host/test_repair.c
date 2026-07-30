@@ -84,21 +84,21 @@
 /* ====================================================================== */
 
 /* REGISTER_TOOL cannot expand on Mach-O, so each tool file exports a named
- * pointer under TALKOS_HOSTTEST and this file stands in for the linker, feeding
+ * pointer under FABLEOS_HOSTTEST and this file stands in for the linker, feeding
  * the REAL core/tool.c registry. It matters here more than usual: both
  * faultchat_apply_fix() and faultchat_apply_patch() reach the kernel through
  * tool_dispatch() rather than through the fault_* API, so with the tools
  * unregistered every "the model's proposal was applied" assertion would be
  * testing an error path. */
-extern const tool_t *const talkos_hosttool_fault_status_tool;
-extern const tool_t *const talkos_hosttool_fault_report_tool;
-extern const tool_t *const talkos_hosttool_fault_history_tool;
-extern const tool_t *const talkos_hosttool_fault_decode_tool;
-extern const tool_t *const talkos_hosttool_fault_recover_tool;
-extern const tool_t *const talkos_hosttool_fault_patch_tool;
-extern const tool_t *const talkos_hosttool_agenda_save_tool;
-extern const tool_t *const talkos_hosttool_agenda_list_tool;
-extern const tool_t *const talkos_hosttool_agenda_control_tool;
+extern const tool_t *const fableos_hosttool_fault_status_tool;
+extern const tool_t *const fableos_hosttool_fault_report_tool;
+extern const tool_t *const fableos_hosttool_fault_history_tool;
+extern const tool_t *const fableos_hosttool_fault_decode_tool;
+extern const tool_t *const fableos_hosttool_fault_recover_tool;
+extern const tool_t *const fableos_hosttool_fault_patch_tool;
+extern const tool_t *const fableos_hosttool_agenda_save_tool;
+extern const tool_t *const fableos_hosttool_agenda_list_tool;
+extern const tool_t *const fableos_hosttool_agenda_control_tool;
 
 /* A STAND-IN FOR power_off, and the whole reason it is here.
  *
@@ -154,15 +154,15 @@ _Static_assert(sizeof(__start_tool_table) == 88,
                "tool count changed: update the __stop_tool_table byte offset");
 
 static void tools_bind(void) {
-    __start_tool_table[0] = talkos_hosttool_fault_status_tool;
-    __start_tool_table[1] = talkos_hosttool_fault_report_tool;
-    __start_tool_table[2] = talkos_hosttool_fault_history_tool;
-    __start_tool_table[3] = talkos_hosttool_fault_decode_tool;
-    __start_tool_table[4] = talkos_hosttool_fault_recover_tool;
-    __start_tool_table[5] = talkos_hosttool_fault_patch_tool;
-    __start_tool_table[6] = talkos_hosttool_agenda_save_tool;
-    __start_tool_table[7] = talkos_hosttool_agenda_list_tool;
-    __start_tool_table[8] = talkos_hosttool_agenda_control_tool;
+    __start_tool_table[0] = fableos_hosttool_fault_status_tool;
+    __start_tool_table[1] = fableos_hosttool_fault_report_tool;
+    __start_tool_table[2] = fableos_hosttool_fault_history_tool;
+    __start_tool_table[3] = fableos_hosttool_fault_decode_tool;
+    __start_tool_table[4] = fableos_hosttool_fault_recover_tool;
+    __start_tool_table[5] = fableos_hosttool_fault_patch_tool;
+    __start_tool_table[6] = fableos_hosttool_agenda_save_tool;
+    __start_tool_table[7] = fableos_hosttool_agenda_list_tool;
+    __start_tool_table[8] = fableos_hosttool_agenda_control_tool;
     __start_tool_table[9] = &stub_power_off_tool;
     __start_tool_table[10] = &stub_power_reboot_tool;
 }

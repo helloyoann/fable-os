@@ -3,8 +3,8 @@
 # handed to the guest at boot over QEMU's fw_cfg channel. Nothing the build
 # produces can contain it, because the build is never told what it is.
 #
-# It used to be everywhere. `-DTALKOS_API_KEY='"$(KEY)"'` put the live key
-# inside net.o, kernel.elf, kernel.bin, talkos.iso and the .build-flags stamp
+# It used to be everywhere. `-DFABLEOS_API_KEY='"$(KEY)"'` put the live key
+# inside net.o, kernel.elf, kernel.bin, fableos.iso and the .build-flags stamp
 # (which recorded `KEY=sk-ant-...` in plain text), and this file was what kept
 # those five artifacts out of git. That is the wrong place for a safety
 # property: one `git add -f`, one CI cache, one shared build directory and the
@@ -42,7 +42,7 @@ disk.img
 *.img
 
 # Bootable media from `make iso` (a 4 MB ISO and its staging tree)
-talkos.iso
+fableos.iso
 os/build/
 
 # Scratch idea notes

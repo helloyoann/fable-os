@@ -1,4 +1,4 @@
-# talk-os (bare-metal OS)
+# fable-os (bare-metal OS)
 
 A from-scratch x86_64 kernel, built and run on macOS via QEMU. It boots into a
 prompt with no shell and no commands: you type a sentence, the kernel sends it to
@@ -37,7 +37,7 @@ which it has done, live, from one typed sentence.
 | DMA for driver programs — one 256 KiB guarded arena, kernel-set bus mastering | ✅ done, **not contained** (no IOMMU — see below) |
 | Audio service — PCM synthesis, one sink, device-agnostic | ✅ done |
 | A model-authored driver can *become* the audio output (`driver_install`) | ✅ done, proven live |
-| An AC'97 driver in the kernel tree | ⬜ **deliberately none** — test fixture only, `-DTALKOS_AC97_REFERENCE` |
+| An AC'97 driver in the kernel tree | ⬜ **deliberately none** — test fixture only, `-DFABLEOS_AC97_REFERENCE` |
 | Apps can call kernel capabilities (`{"call":"audio.tone"}`) | ✅ done |
 | The turn loop — 64 tools, 16 rounds, budget notes, retries, a journal | ✅ done |
 | Disk-backed filesystem (FAT32 read/write, VFAT long names, own mkfs) | ✅ done |
@@ -51,7 +51,7 @@ which it has done, live, from one typed sentence.
 | A C compiler: real C → native x86-64, at run time, in the kernel | ✅ done, proven live |
 | Compiled programs saved by name and recompiled on demand across a reboot | ✅ done, proven live |
 | An ELF loader, or any way to load code built somewhere else | ⬜ **none**, deliberately |
-| Certificate verification (pinned roots + hostname + expiry) | ✅ done, **off by default** — `-DTALKOS_VERIFY_CERTS` |
+| Certificate verification (pinned roots + hostname + expiry) | ✅ done, **off by default** — `-DFABLEOS_VERIFY_CERTS` |
 | CSPRNG entropy | ⬜ future (see caveat) |
 | Userspace, processes, memory protection, a scheduler | ⬜ none, by design so far |
 
@@ -70,8 +70,8 @@ Everything below is reproducible from a clean checkout on macOS + QEMU.
 | ...and with real cards on a real boot | `QEMU_EXTRA="-audiodev none,id=a0 -device AC97,audiodev=a0 -device intel-hda -device hda-duplex,audiodev=a0" ./capture.sh 20` | both enumerate, both `driver=-`, zero audio lines in the log |
 | The kernel's own `vsnprintf` matches C99 | `make test-host` (`kfmt`) | 9,472 assertions, differential against the host libc |
 | No format string outside what it implements | `make test-qemu` (runs the lint first) | `lint_printf.py`: clean |
-| Real audio out of the driver VM | `vm/programs/capture_audio.sh` | 440 Hz then 660 Hz, measured from the captured WAV — needs `-DTALKOS_AC97_REFERENCE` |
-| The hardening build | `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS` | links, boots, verifies a live certificate |
+| Real audio out of the driver VM | `vm/programs/capture_audio.sh` | 440 Hz then 660 Hz, measured from the captured WAV — needs `-DFABLEOS_AC97_REFERENCE` |
+| The hardening build | `make EXTRA_CFLAGS=-DFABLEOS_VERIFY_CERTS` | links, boots, verifies a live certificate |
 | The C compiler executes the machine code it emits | `make test-host` (`cc`) | 29,484 assertions; the host binary is built `-arch x86_64` so the emitted bytes are *called*, not inspected |
 | The root stack is guarded and its true depth is printed | any boot | `fiber: main [running] stack 5144/65280 bytes used (7%)` — a `.bss` high-water mark, not a sample |
 | The compiler's stack budget is checked against the real stack | any boot | `cc: compile-time stack budget 24576 bytes (+6144 reserve) against 64896 bytes below this frame - ok` |
@@ -164,13 +164,13 @@ take the key. Do not send anything sensitive.
 Real verification exists and works; it is opt-in:
 
 ```sh
-make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS
+make EXTRA_CFLAGS=-DFABLEOS_VERIFY_CERTS
 ```
 
 With the flag the kernel requires the chain to build to one of two **pinned**
 roots, requires the certificate to name the host it asked for, and enforces
 `notBefore`/`notAfter` against the CMOS clock. Details, and the reasons the flag
-is off by default, are in [`TALKOS_VERIFY_CERTS`](#tls-certificate-verification-talkos_verify_certs)
+is off by default, are in [`FABLEOS_VERIFY_CERTS`](#tls-certificate-verification-fableos_verify_certs)
 below.
 
 **Entropy is not fixed by any of this, and is the remaining weakness.** The
@@ -194,17 +194,17 @@ reply to the console, so the TLS path is verifiable even headlessly.
 
 ### The API key never enters the build
 
-There is no `KEY=` and no `-DTALKOS_API_KEY`. `make KEY=...` is a hard error.
+There is no `KEY=` and no `-DFABLEOS_API_KEY`. `make KEY=...` is a hard error.
 
 The key used to be compiled in, which put the live secret inside `net.o`,
-`kernel.elf`, `kernel.bin`, `talkos.iso` **and** `.build-flags` (that stamp
+`kernel.elf`, `kernel.bin`, `fableos.iso` **and** `.build-flags` (that stamp
 recorded the flag set verbatim, i.e. `KEY=sk-ant-...` in plain text). Five
 artifacts, kept out of git by a `.gitignore` — one `git add -f`, one CI cache,
 one shared build directory, and a live key is published. So the hazard was
 removed rather than ignored: the compiler is never told the key, and
 
 ```sh
-grep -rI 'sk-ant' *.o kernel.elf kernel.bin .build-flags talkos.iso build/ tests/build/
+grep -rI 'sk-ant' *.o kernel.elf kernel.bin .build-flags fableos.iso build/ tests/build/
 ```
 
 finds nothing after a keyed run.
@@ -220,7 +220,7 @@ make run
 `make run` reads the key out of `.env` (or `$ANTHROPIC_API_KEY`) inside the
 recipe's own shell, writes it to a mode-0600 temp file in `$TMPDIR` — outside the
 repository, and outside anything `make iso` copies into an image — passes
-`-fw_cfg name=opt/talkos/apikey,file=<temp>`, and deletes the temp file however
+`-fw_cfg name=opt/fableos/apikey,file=<temp>`, and deletes the temp file however
 the run ends: normal exit, a QEMU that would not start, or the Ctrl-C that is how
 you actually leave `make run`. `string=` is not used because that would put the
 key in QEMU's argv, where `ps` shows it to every user on the machine.
@@ -261,7 +261,7 @@ so a key containing a control character is refused outright), and reports one
 line:
 
 ```
-fwcfg: api key: 108 bytes loaded from fw_cfg (opt/talkos/apikey)
+fwcfg: api key: 108 bytes loaded from fw_cfg (opt/fableos/apikey)
 ```
 
 A byte count is the *only* thing the kernel will ever say about the key — not a
@@ -270,7 +270,7 @@ API answers `401`, which is the default developer experience and what the test
 suite assumes:
 
 ```
-fwcfg: no api key (opt/talkos/apikey: not supplied by the host) - requests will
+fwcfg: no api key (opt/fableos/apikey: not supplied by the host) - requests will
 go out unauthenticated and the API will answer 401
 ```
 
@@ -349,10 +349,10 @@ model claims. The console therefore carries two voices and tells them apart by
 shape:
 
 ```
-> put 'talk-os was here' in /etc/motd
+> put 'fable-os was here' in /etc/motd
 Writing that now.                                    <- the model: a claim
 [vfs_write /etc/motd mode=overwrite bytes=16 -> ok]  <- the kernel: what happened
-Done - /etc/motd now says 'talk-os was here'.        <- the model again
+Done - /etc/motd now says 'fable-os was here'.        <- the model again
 ```
 
 **A kernel trace line is a `[` in column zero.** Five things hold that up, and
@@ -638,7 +638,7 @@ table, no subclass branch — so the kernel can say *"there is a sound card here
 nobody drives it"* without knowing which one it is. Attach two cards to a default
 build and both sit at `driver=-` forever; `tests/qemu/cases/audio-unclaimed.case`
 asserts precisely that. The reference AC'97 bring-up still exists, but as a test
-fixture behind `-DTALKOS_AC97_REFERENCE`, and it will not compile into a normal
+fixture behind `-DFABLEOS_AC97_REFERENCE`, and it will not compile into a normal
 kernel.
 
 Everything else is a generic OS primitive, which is the line this design draws:
@@ -1024,7 +1024,7 @@ Observed live, with nothing typed: an agenda action divided by zero, the handler
 abandoned its call chain instead of halting, the kernel asked the model what
 happened, the model rewrote the faulting instruction in the running kernel's
 `.text`, and the next two scheduled runs completed without faulting. **That
-demonstration needs `-DTALKOS_REPAIR_DEMO`** — a machine whose only interface is a
+demonstration needs `-DFABLEOS_REPAIR_DEMO`** — a machine whose only interface is a
 sentence must not carry a function with a deliberate bug in it, one hallucination
 away from the model. A default build links neither the bug nor the demo tool.
 
@@ -1188,15 +1188,15 @@ serial and PCI come up before the devices that need them. Add the source path to
   almost nothing.
 - `libgcc` is linked for 128-bit division helpers used by the bignum code.
 - SNI is set per connection in `net.c` via `altcp_tls_context()` +
-  `mbedtls_ssl_set_hostname()`. Under `TALKOS_VERIFY_CERTS` that same name is
+  `mbedtls_ssl_set_hostname()`. Under `FABLEOS_VERIFY_CERTS` that same name is
   what the certificate is checked against.
 
-## TLS certificate verification (`TALKOS_VERIFY_CERTS`)
+## TLS certificate verification (`FABLEOS_VERIFY_CERTS`)
 
 Off by default. On with:
 
 ```sh
-make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS
+make EXTRA_CFLAGS=-DFABLEOS_VERIFY_CERTS
 ```
 
 ### What it turns on
@@ -1207,7 +1207,7 @@ make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS
 | Pinned CA bundle | `net/tls_ca.c`, installed by `net_init()` | the chain must build to a trusted root |
 | Hostname check | `mbedtls_ssl_set_hostname()` in `net/net.c` | the certificate must name `api.anthropic.com` |
 | `MBEDTLS_HAVE_TIME_DATE` | `include/mbedtls_config.h` | `notBefore`/`notAfter` are compared instead of merely parsed |
-| `mbedtls_time` → `talkos_tls_time` | `include/mbedtls_config.h` → `net/tls_ca.c` | the comparison uses the CMOS RTC, not seconds since boot |
+| `mbedtls_time` → `fableos_tls_time` | `include/mbedtls_config.h` → `net/tls_ca.c` | the comparison uses the CMOS RTC, not seconds since boot |
 | `MBEDTLS_PLATFORM_GMTIME_R_ALT` | `include/mbedtls_config.h` → `net/tls_ca.c` | supplies the `gmtime_r` a freestanding build does not have |
 
 Without `MBEDTLS_HAVE_TIME_DATE`, mbedTLS compiles `mbedtls_x509_time_is_past()`
@@ -1286,7 +1286,7 @@ the real API with the clock at 2030-01-01 / 2020-01-01:
   [tls] The certificate validity starts in the future
 ```
 
-The three `-DTALKOS_TLS_HOST` / `-DTALKOS_TLS_SNI` / `-DTALKOS_TLS_PORT` build
+The three `-DFABLEOS_TLS_HOST` / `-DFABLEOS_TLS_SNI` / `-DFABLEOS_TLS_PORT` build
 macros used to produce those runs are documented in `net/net.c` and only exist
 under the verification flag.
 
@@ -1361,7 +1361,7 @@ AC'97 driver from a sentence and playing a tone through it; writing, debugging a
 saving a capability, then reusing it after a power cycle; naming a capability it
 had saved *earlier in the same session* out of its own tool schema, with no listing
 tool; compiling and running real C and keeping it by name across a reboot;
-fetching a URL; and — under `-DTALKOS_REPAIR_DEMO` — diagnosing a `#DE` and
+fetching a URL; and — under `-DFABLEOS_REPAIR_DEMO` — diagnosing a `#DE` and
 patching the running kernel's `.text`.
 
 **Not** verified with a live model: an agenda item authored by the model that
@@ -1377,7 +1377,7 @@ fuzzers.
 **Never booted on physical hardware.** Everything here is QEMU. Several things
 would probably break on real silicon: e1000 MMIO goes through a write-back
 cacheable identity map with no PAT or MTRR, `fw_cfg` does not exist outside QEMU
-(so a machine booted from `talkos.iso` gets no key and 401s), and the framebuffer
+(so a machine booted from `fableos.iso` gets no key and 401s), and the framebuffer
 is obtained either from a multiboot tag or from the Bochs/QEMU VBE dispi
 registers. The pinned TLS roots also expire: 2036, and the endpoint's CA may
 change long before that.

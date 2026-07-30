@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""QEMU boot-assertion harness for talk-os.
+"""QEMU boot-assertion harness for fable-os.
 
 Boots kernel.bin under QEMU once per case file, captures the serial console to
 a scratch file, and asserts on it.  Exit status 0 = every case passed, 1 = at
@@ -14,16 +14,16 @@ line in that file.  See cases/boot.case for the syntax, and CHECKS below for
 the semantic (parse-the-numbers) assertions a case can invoke.
 
 Environment:
-    TALKOS_TEST_OFFLINE=1   skip network-dependent assertions (see "tags")
-    TALKOS_TEST_ONLINE=1    force network assertions on (disable autodetect)
-    TALKOS_TEST_TIMEOUT=N   override every case's timeout, in seconds
-    TALKOS_TEST_QEMU=path   qemu binary (default qemu-system-x86_64)
-    TALKOS_TEST_NIC=spec    override every case's -nic (e.g.
+    FABLEOS_TEST_OFFLINE=1   skip network-dependent assertions (see "tags")
+    FABLEOS_TEST_ONLINE=1    force network assertions on (disable autodetect)
+    FABLEOS_TEST_TIMEOUT=N   override every case's timeout, in seconds
+    FABLEOS_TEST_QEMU=path   qemu binary (default qemu-system-x86_64)
+    FABLEOS_TEST_NIC=spec    override every case's -nic (e.g.
                             user,model=e1000,restrict=on to fake no internet)
-    TALKOS_TEST_QEMU_EXTRA   extra QEMU arguments appended to every case, split
+    FABLEOS_TEST_QEMU_EXTRA   extra QEMU arguments appended to every case, split
                             like a shell word list (see qemu_args)
-    TALKOS_TEST_KEEPLOGS=1  keep the scratch dir even when everything passes
-    TALKOS_TEST_PYTHON=path  interpreter run.sh uses to start this file
+    FABLEOS_TEST_KEEPLOGS=1  keep the scratch dir even when everything passes
+    FABLEOS_TEST_PYTHON=path  interpreter run.sh uses to start this file
 """
 
 import atexit
@@ -44,7 +44,7 @@ OSDIR = os.path.abspath(os.path.join(HERE, "..", ".."))
 CASEDIR = os.path.join(HERE, "cases")
 KERNEL = os.path.join(OSDIR, "kernel.bin")
 
-QEMU = os.environ.get("TALKOS_TEST_QEMU", "qemu-system-x86_64")
+QEMU = os.environ.get("FABLEOS_TEST_QEMU", "qemu-system-x86_64")
 DEFAULT_TIMEOUT = 30.0
 POLL = 0.1
 
@@ -805,7 +805,7 @@ def qemu_diagnosis(errpath, early, hit):
 # Almost every case boots the tree's kernel.bin, and that is the point: the
 # assertions are about the kernel an operator actually gets. A few things must
 # be assertable and must NOT be in that kernel — the reference AC'97 bring-up
-# (tests/qemu/fixtures/ac97_boot.c) is one, because talk-os is supposed to know
+# (tests/qemu/fixtures/ac97_boot.c) is one, because fable-os is supposed to know
 # nothing about the sound card someone attaches. Those cases name the flags they
 # need with `build-cflags:` and get their own kernel.
 #
@@ -915,17 +915,17 @@ def build_variant_kernels(cases, workdir):
 def qemu_args(case, serial):
     """`serial` is a -serial chardev spec: file:<path> or unix:<sock>,...
 
-    TALKOS_TEST_NIC overrides the NIC of networked cases — handy for
+    FABLEOS_TEST_NIC overrides the NIC of networked cases — handy for
     reproducing a network-less CI box locally:
-        TALKOS_TEST_NIC=user,model=e1000,restrict=on
+        FABLEOS_TEST_NIC=user,model=e1000,restrict=on
     Cases that deliberately run with `nic: none` keep their own setting.
     """
     nic = case.nic or "none"
     if nic != "none":
-        nic = os.environ.get("TALKOS_TEST_NIC") or nic
+        nic = os.environ.get("FABLEOS_TEST_NIC") or nic
     return ([QEMU, "-kernel", case.kernel or KERNEL, "-display", "none",
              "-no-reboot", "-serial", serial, "-nic", nic] + case.qemu_extra +
-            shlex.split(os.environ.get("TALKOS_TEST_QEMU_EXTRA", "")))
+            shlex.split(os.environ.get("FABLEOS_TEST_QEMU_EXTRA", "")))
 
 
 def boot_interactive(case, logpath, timeout, offline):
@@ -1187,17 +1187,17 @@ def main(argv):
 
     # ---- mode --------------------------------------------------------
     reason = ""
-    if env_bool("TALKOS_TEST_OFFLINE"):
-        offline, reason = True, "TALKOS_TEST_OFFLINE=1"
-    elif env_bool("TALKOS_TEST_ONLINE"):
-        offline, reason = False, "TALKOS_TEST_ONLINE=1"
+    if env_bool("FABLEOS_TEST_OFFLINE"):
+        offline, reason = True, "FABLEOS_TEST_OFFLINE=1"
+    elif env_bool("FABLEOS_TEST_ONLINE"):
+        offline, reason = False, "FABLEOS_TEST_ONLINE=1"
     else:
         ok, err = network_available()
         offline = not ok
         reason = ("autodetected: api.anthropic.com reachable" if ok else
                   "autodetected: api.anthropic.com unreachable (%s)" % err)
 
-    override_timeout = os.environ.get("TALKOS_TEST_TIMEOUT")
+    override_timeout = os.environ.get("FABLEOS_TEST_TIMEOUT")
 
     # ---- cases -------------------------------------------------------
     paths = sorted(os.path.join(CASEDIR, f) for f in os.listdir(CASEDIR)
@@ -1219,9 +1219,9 @@ def main(argv):
         print(RED("no cases matched %s in %s" % (filters, CASEDIR)))
         return 1
 
-    workdir = tempfile.mkdtemp(prefix="talkos-qemu-%d-" % os.getpid())
+    workdir = tempfile.mkdtemp(prefix="fableos-qemu-%d-" % os.getpid())
 
-    print(BOLD("talk-os QEMU boot tests"))
+    print(BOLD("fable-os QEMU boot tests"))
     print("  kernel : %s (%d bytes)" % (KERNEL, os.path.getsize(KERNEL)))
     print("  qemu   : %s" % shutil.which(QEMU))
     print("  mode   : %s   (%s)" % (
@@ -1296,7 +1296,7 @@ def main(argv):
         if f:
             print("    %s %s (%d assertion%s)"
                   % (RED("FAIL"), case.name, len(f), "" if len(f) == 1 else "s"))
-    if nfail == 0 and not env_bool("TALKOS_TEST_KEEPLOGS"):
+    if nfail == 0 and not env_bool("FABLEOS_TEST_KEEPLOGS"):
         shutil.rmtree(workdir, ignore_errors=True)
     else:
         print("    serial logs kept in %s" % workdir)

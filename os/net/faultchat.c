@@ -94,7 +94,7 @@ static int in_range(uint64_t addr, uint64_t len, uint64_t lo, uint64_t hi) {
 /* ====================================================================== */
 
 static const char SYSTEM_PROMPT[] =
-    "You are the resident intelligence of talk-os, a bare-metal x86-64 kernel. "
+    "You are the resident intelligence of fable-os, a bare-metal x86-64 kernel. "
     "This is not an operator turn. The KERNEL is asking you, on its own "
     "initiative, about a CPU exception it just took and survived. Nobody typed "
     "anything; there is no conversation to continue and no follow-up question "

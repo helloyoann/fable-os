@@ -18,7 +18,7 @@
 
 #include "mouse.h"
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 #  include "io.h"
 #  include "kernel.h"
 #  include "driver.h"
@@ -70,7 +70,7 @@
 #define AUX_ID_PLAIN        0x00
 #define AUX_ID_WHEEL        0x03
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 static uint8_t port_status(void *c)             { (void)c; return inb(PS2_STATUS); }
 static uint8_t port_read_data(void *c)          { (void)c; return inb(PS2_DATA); }
 static void    port_write_data(void *c, uint8_t v) { (void)c; outb(PS2_DATA, v); }
@@ -119,7 +119,7 @@ void mouse_set_backend(const mouse_backend_t *b) {
  * leaves the iteration cap in charge, exactly as intended there. The decoder's
  * timeout does not use this: its timestamp is a parameter, so tests control it. */
 static uint64_t now_ms(void) {
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     return millis();
 #else
     return 0;
@@ -134,7 +134,7 @@ static uint64_t now_ms(void) {
  * forever; there it is the only bound, so it is small enough to keep a suite
  * that deliberately probes the "no device" path fast. */
 #define PS2_WAIT_MS 600u
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 #  define PS2_WAIT_SPINS 4096u
 #else
 #  define PS2_WAIT_SPINS 4000000u
@@ -597,7 +597,7 @@ int mouse_check_stale(mouse_state_t *m, uint64_t now) {
  * per call. */
 #define MOUSE_DRAIN_BUDGET 64
 
-#ifdef TALKOS_MOUSE_SELFTEST
+#ifdef FABLEOS_MOUSE_SELFTEST
 /* Deliberate byte loss, for proving resynchronisation against real hardware.
  * Compiled out of every normal build. See section 6. */
 static uint32_t g_drop_every;
@@ -666,7 +666,7 @@ int mouse_poll(void) {
         if (!(st & PS2_STAT_AUX)) break;
 
         uint8_t v = be()->read_data(be()->ctx);
-#ifdef TALKOS_MOUSE_SELFTEST
+#ifdef FABLEOS_MOUSE_SELFTEST
         if (g_drop_every && (++g_byte_seq % g_drop_every) == 0) {
             g_dropped_bytes++;
             continue;                /* pretend this byte never arrived */
@@ -694,7 +694,7 @@ int mouse_accept_byte(uint8_t b) {
 /* ====================================================================== */
 /* 6. the driver                                                          */
 /* ====================================================================== */
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 
 static const driver_t mouse_driver;
 
@@ -702,9 +702,9 @@ static const driver_t mouse_driver;
  * The one thing a host test cannot prove is that these bytes come from a real
  * controller. This does, and it is compiled out of every normal build:
  *
- *   make EXTRA_CFLAGS='-DTALKOS_MOUSE_SELFTEST'
- *   make EXTRA_CFLAGS='-DTALKOS_MOUSE_SELFTEST -DTALKOS_MOUSE_DROP_EVERY=7'
- *   make EXTRA_CFLAGS='-DTALKOS_MOUSE_SELFTEST -DTALKOS_MOUSE_WATCH_MS=20000'
+ *   make EXTRA_CFLAGS='-DFABLEOS_MOUSE_SELFTEST'
+ *   make EXTRA_CFLAGS='-DFABLEOS_MOUSE_SELFTEST -DFABLEOS_MOUSE_DROP_EVERY=7'
+ *   make EXTRA_CFLAGS='-DFABLEOS_MOUSE_SELFTEST -DFABLEOS_MOUSE_WATCH_MS=20000'
  *
  * It streams the mouse for a bounded window and prints every event it decodes,
  * so driving QEMU's monitor (mouse_move / mouse_button) shows the positions and
@@ -717,13 +717,13 @@ static const driver_t mouse_driver;
  * Mirrors drivers/acpi/power_selftest.c and arch/x86_64/fault_inject.c: a
  * diagnostic that has to run against hardware lives with the driver, behind a
  * flag, rather than in a test directory that cannot reach it. */
-#ifdef TALKOS_MOUSE_SELFTEST
+#ifdef FABLEOS_MOUSE_SELFTEST
 
-#ifndef TALKOS_MOUSE_WATCH_MS
-#  define TALKOS_MOUSE_WATCH_MS 12000u
+#ifndef FABLEOS_MOUSE_WATCH_MS
+#  define FABLEOS_MOUSE_WATCH_MS 12000u
 #endif
-#ifndef TALKOS_MOUSE_DROP_EVERY
-#  define TALKOS_MOUSE_DROP_EVERY 0u
+#ifndef FABLEOS_MOUSE_DROP_EVERY
+#  define FABLEOS_MOUSE_DROP_EVERY 0u
 #endif
 /* Serial is 115200 baud; a fast mouse can outrun it. Print the first N events
  * in full and count the rest, so the window is never spent on I/O. */
@@ -737,18 +737,18 @@ static void btn_str(uint8_t b, char out[4]) {
 }
 
 static void mouse_watch(void) {
-    g_drop_every = TALKOS_MOUSE_DROP_EVERY;
+    g_drop_every = FABLEOS_MOUSE_DROP_EVERY;
 
     kprintf("mouse: watch %u ms, drop 1 byte in %u (0 = none) - move the "
             "pointer and click\n",
-            (unsigned)TALKOS_MOUSE_WATCH_MS, (unsigned)g_drop_every);
+            (unsigned)FABLEOS_MOUSE_WATCH_MS, (unsigned)g_drop_every);
 
     if (mouse_start() != 0) {
         kprintf("mouse: watch: could not enable data reporting\n");
         return;
     }
 
-    uint64_t deadline = millis() + TALKOS_MOUSE_WATCH_MS;
+    uint64_t deadline = millis() + FABLEOS_MOUSE_WATCH_MS;
     uint32_t shown = 0, events = 0;
 
     while (millis() < deadline) {
@@ -787,7 +787,7 @@ static void mouse_watch(void) {
     g_drop_every = 0;
     (void)mouse_stop();
 }
-#endif /* TALKOS_MOUSE_SELFTEST */
+#endif /* FABLEOS_MOUSE_SELFTEST */
 
 static int mouse_init(void) {
     int rc = mouse_bringup();
@@ -816,7 +816,7 @@ static int mouse_init(void) {
             (int)g_state.plen, g_wheel ? ", wheel" : "",
             (int)g_state.w, (int)g_state.h);
 
-#ifdef TALKOS_MOUSE_SELFTEST
+#ifdef FABLEOS_MOUSE_SELFTEST
     mouse_watch();
 #endif
     return 0;
@@ -855,4 +855,4 @@ static const driver_t mouse_driver = {
 };
 REGISTER_DRIVER(mouse_driver);
 
-#endif /* !TALKOS_HOSTTEST */
+#endif /* !FABLEOS_HOSTTEST */

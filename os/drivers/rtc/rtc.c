@@ -38,7 +38,7 @@
 
 #include "rtc.h"
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 #  include "io.h"
 #  include "kernel.h"
 #  include "driver.h"
@@ -52,7 +52,7 @@
 #define CMOS_INDEX_PORT 0x70
 #define CMOS_DATA_PORT  0x71
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 /* Bit 7 of the index port is the NMI disable line. It is left CLEAR (NMIs
  * enabled) rather than saved and restored: nothing else in this kernel touches
  * 0x70, so there is no state to preserve, and masking NMIs around a read we
@@ -314,7 +314,7 @@ static int decode_snapshot(const cmos_snapshot_t *s, rtc_time_t *out) {
  * not, and return a constant — which disables the wall-clock bound and leaves
  * the iteration cap in charge, exactly as intended there. */
 static uint64_t now_ms(void) {
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     return millis();
 #else
     return 0;
@@ -424,7 +424,7 @@ size_t rtc_format_iso8601(const rtc_time_t *t, char *dst, size_t cap) {
 /* ====================================================================== */
 /* 6. the driver                                                          */
 /* ====================================================================== */
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 
 /* kprintf() has no 64-bit conversion (lib/base.c: %u is int-sized), and a Unix
  * timestamp outgrows 32 bits in 2106. Render it here and pass a string. */
@@ -450,11 +450,11 @@ static void fmt_i64(char *dst, int64_t v) {
  * reading is a legal calendar date and that time never runs backwards. A
  * diagnostic build
  *
- *     make EXTRA_CFLAGS=-DTALKOS_RTC_STRESS
+ *     make EXTRA_CFLAGS=-DFABLEOS_RTC_STRESS
  *
  * runs for over two seconds instead, which guarantees crossing at least two
  * second-boundaries — i.e. the update window this code exists to survive. */
-#ifdef TALKOS_RTC_STRESS
+#ifdef FABLEOS_RTC_STRESS
 #  define RTC_SELFCHECK_READS  2000000u
 #  define RTC_SELFCHECK_MS     2500u
 #else
@@ -567,4 +567,4 @@ static const driver_t rtc_driver = {
 };
 REGISTER_DRIVER(rtc_driver);
 
-#endif /* !TALKOS_HOSTTEST */
+#endif /* !FABLEOS_HOSTTEST */

@@ -252,7 +252,7 @@ static void test_format_writes_a_real_fat32_superblock(void) {
     disk_make(BIG_SECTORS);
     block_registry_reset();
     block_register(&bdev);
-    CHECK_EQ(fat32_format(&bdev, "TALKOS"), VFS_OK);
+    CHECK_EQ(fat32_format(&bdev, "FABLEOS"), VFS_OK);
 
     const uint8_t *bs = rd.bytes;
     CHECK_EQ(fat_rd16(bs + 510), 0xAA55);
@@ -265,7 +265,7 @@ static void test_format_writes_a_real_fat32_superblock(void) {
     CHECK_EQ(fat_rd32(bs + 44), 2);                         /* root cluster */
     CHECK_EQ(bs[16], 2);                                    /* two FATs */
     CHECK(memcmp(bs + 82, "FAT32   ", 8) == 0);
-    CHECK(memcmp(bs + 71, "TALKOS", 6) == 0);
+    CHECK(memcmp(bs + 71, "FABLEOS", 6) == 0);
 
     /* The backup boot sector other systems fall back to. */
     CHECK(memcmp(rd.bytes, rd.bytes + 6 * 512, 512) == 0);
@@ -881,7 +881,7 @@ static void sim_identify(void) {
     char model[41];
     memset(model, ' ', 40);
     model[40] = '\0';
-    memcpy(model, "TALKOS SYNTHETIC DISK", 21);
+    memcpy(model, "FABLEOS SYNTHETIC DISK", sizeof "FABLEOS SYNTHETIC DISK" - 1);
     for (int i = 0; i < 20; i++)
         sim.xfer[27 + i] = (uint16_t)(((uint8_t)model[i * 2] << 8)
                                       | (uint8_t)model[i * 2 + 1]);
@@ -1020,7 +1020,7 @@ static void test_ata_finds_and_reads_a_disk(void) {
     CHECK(bd != NULL);
     CHECK_STR(bd->name, "ata0");
     CHECK_EQ((int)bd->sectors, SIM_SECTORS);
-    CHECK_CONTAINS(bd->model, "TALKOS SYNTHETIC DISK");
+    CHECK_CONTAINS(bd->model, "FABLEOS SYNTHETIC DISK");
 
     uint8_t buf[BLOCK_SECTOR_SIZE * 3];
     CHECK_EQ(block_read(bd, 5, 3, buf), BLOCK_OK);

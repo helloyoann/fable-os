@@ -1,4 +1,4 @@
-/* harness.h — minimal host-native unit test harness for talk-os.
+/* harness.h — minimal host-native unit test harness for fable-os.
  *
  * Kernel modules that are pure logic (heap, JSON parsing, trace formatting, the
  * driver VM) are compiled against the HOST compiler and run natively, so the

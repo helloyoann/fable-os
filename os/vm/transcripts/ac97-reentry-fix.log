@@ -1,11 +1,11 @@
 make: host test flags changed; discarded every binary in tests/build so none of them is yesterday's
-note: api key passed to the guest over fw_cfg as opt/talkos/apikey
+note: api key passed to the guest over fw_cfg as opt/fableos/apikey
 qemu-system-x86_64: multiboot knows VBE. we don't
 qemu-system-x86_64: -device AC97,audiodev=snd0: audio: Can not open `ac97.pi' (no host audio driver)
 qemu-system-x86_64: -device AC97,audiodev=snd0: audio: Can not open `ac97.mc' (no host audio driver)
 qemu-system-x86_64: audio: Can not open `ac97.pi' (no host audio driver)
 qemu-system-x86_64: audio: Can not open `ac97.mc' (no host audio driver)
-[display 1024x768 32bpp via bochs-vbe -> 128x48 text, Spleen 8x16 (BSD-2-Clause) + talk-os additions]
+[display 1024x768 32bpp via bochs-vbe -> 128x48 text, Spleen 8x16 (BSD-2-Clause) + fable-os additions]
 [console utf-8: em—dash en–dash ‘curly’ “quotes” ellipsis… bullet• ✓ ✗]
 [console glyphs: ←↑→↓↔↕ ≈≡≤≥±÷∞√ áéíóú äöü ñ ç ß ° µ ¶ §]
 [console glyphs: box ┌──┬──┐ ├──┼──┤ └──┴──┘ ╔══╦══╗ ╠══╬══╣ ╚══╩══╝]
@@ -13,7 +13,7 @@ qemu-system-x86_64: audio: Can not open `ac97.mc' (no host audio driver)
 idt: 256 gates at 0x251000 (limit 4095), all verified; TSS with 3 IST stacks of 16 KiB (#DF=1 NMI=2 #MC=3); PIC remapped to 0x20/0x28 and fully masked
 serial: COM1 up @ 115200
 fwcfg: QEMU fw_cfg at 0x510/0x511, 14 file(s), features 0x3
-fwcfg: api key: 108 bytes loaded from fw_cfg (opt/talkos/apikey)
+fwcfg: api key: 108 bytes loaded from fw_cfg (opt/fableos/apikey)
 pci: 00:00.0  8086:1237  class 06:00
 pci: 00:01.0  8086:7000  class 06:01
 pci: 00:01.1  8086:7010  class 01:01
@@ -63,7 +63,7 @@ e1000: resume: rctl=0x0400801a tctl=0x000400fa (rx=on tx=on) phy=powered up link
 e1000: resume: status=0x80080783 link=up 1000 Mb/s full-duplex
 rtc: resumed, wall clock advanced 1s while suspended
 -------------------
-fat: ata0 FAT32, 128 MiB, 258016 clusters of 512 bytes, label "TALKOS"
+fat: ata0 FAT32, 128 MiB, 258016 clusters of 512 bytes, label "FABLEOS"
 fs: ata0 mounted at /disk - files written there survive a reboot
 
 --- persistence: /disk survives a reboot ---
@@ -76,7 +76,7 @@ ls /disk : boot.log cap data
 --------------------------------------------
 
 --- filesystem self-test (ramfs at /) ---
-read /etc/motd (33 bytes): talk-os native filesystem online
+read /etc/motd (33 bytes): fable-os native filesystem online
 stat /etc/motd: type=file size=33 mode=0x6
 ls / : tmp etc disk
 -----------------------------------------
@@ -87,7 +87,7 @@ net: api.anthropic.com -> 160.79.104.10, TLS ready
 
 --- self-test: HTTPS to api.anthropic.com ---
 [http] HTTP/1.1 200 OK
-talk-os online
+fable-os online
 fiber: that 1414 ms API call was not dead air - the ui fiber serviced the screen 292 times and fired 0 app tick handler(s) during it, across 681500 context switches
 ---------------------------------------------
 heap: 37/16384 KiB used (peak 81 KiB), 49 live / 2 free blocks, 15847 allocs 15798 frees
@@ -96,7 +96,7 @@ fiber:   main [running] boot stack, 656 bytes deep at the deepest measured, resu
 fiber:   ui [ready] stack 256/32768 bytes used (0%), resumed 349887 times
 
 ==============================================================
-  talk-os
+  fable-os
 ==============================================================
   tools  : 57 registered (48389 bytes of schema)
   model  : reachable over TLS

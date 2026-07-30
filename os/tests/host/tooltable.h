@@ -37,8 +37,8 @@
  *   a suite that links a tool source as a separate translation unit, because the
  *   descriptors are static to it.
  */
-#ifndef TALKOS_TEST_TOOLTABLE_H
-#define TALKOS_TEST_TOOLTABLE_H
+#ifndef FABLEOS_TEST_TOOLTABLE_H
+#define FABLEOS_TEST_TOOLTABLE_H
 
 #if defined(__has_feature)
 #  if __has_feature(address_sanitizer)
@@ -60,4 +60,4 @@ __asm__(".globl ___start_tool_table\n"
           __attribute__((used, section("__DATA,tool_table"))) = &(var)
 #endif
 
-#endif /* TALKOS_TEST_TOOLTABLE_H */
+#endif /* FABLEOS_TEST_TOOLTABLE_H */

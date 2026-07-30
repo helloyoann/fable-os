@@ -123,7 +123,7 @@
  *
  * HOST TESTABILITY
  *   A host process cannot write to a real console. The grid base, geometry and
- *   cursor are reached through three small accessors that, under TALKOS_HOSTTEST,
+ *   cursor are reached through three small accessors that, under FABLEOS_HOSTTEST,
  *   resolve to values a test injects (screen_tools_set_framebuffer /
  *   screen_tools_set_cursor) instead of to lib/base.c. The bounds logic, the
  *   parsing, the clipping and the exact cell bytes are then all verifiable
@@ -145,16 +145,16 @@
  * expand. Export a named pointer per tool instead; tests/host/test_screen_tools.c
  * stands in for the linker and builds the table from those. Kernel builds are
  * untouched. */
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 #undef  REGISTER_TOOL
-#define REGISTER_TOOL(var) const tool_t *const talkos_hosttool_##var = &(var)
+#define REGISTER_TOOL(var) const tool_t *const fableos_hosttool_##var = &(var)
 #endif
 
 /* ====================================================================== */
 /* the screen: base address, geometry, cursor                             */
 /* ====================================================================== */
 
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 
 /* Injected by the test. NULL means "no screen", which every tool must refuse
  * legibly rather than dereference. */

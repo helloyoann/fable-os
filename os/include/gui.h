@@ -536,7 +536,7 @@ uint32_t gui_demo_open(const char *name, const char **why);
 /* NUL-terminated list of built-in app names, for a schema and an error message. */
 const char *const *gui_demo_names(void);
 
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 /* The scroll heuristic in gui_tick() needs the console's cursor row, which on a
  * host has no console behind it. A test supplies it, exactly as
  * tools/screen_tools.c lets a test supply a framebuffer. Kernel builds read
@@ -548,7 +548,7 @@ void gui_test_set_console_cursor(int row, int col);
 void gui_test_console_scrolled(void);
 #endif
 
-#ifdef TALKOS_GUI_SELFTEST
+#ifdef FABLEOS_GUI_SELFTEST
 /* Diagnostic builds only: open the reference apps on the first tick so a real
  * mouse can be driven at them. See gui/gui_demo.c. */
 void gui_demo_selftest(void);

@@ -41,15 +41,15 @@ OUT_PREFIX="${OUT_PREFIX:-/tmp/os}"
 # No ".ppm" suffix: appending one would name a file mktemp did not create, and
 # the cleanup trap below would then remove the name while leaking the inode.
 # QEMU's screendump does not care about the extension.
-PPM="$(mktemp -t talkos-shot)"
-QLOG="$(mktemp -t talkos-qemu)"
+PPM="$(mktemp -t fableos-shot)"
+QLOG="$(mktemp -t fableos-qemu)"
 SERIAL="${OUT_PREFIX}.log"
 PNG="${OUT_PREFIX}.png"
 # The monitor used to be a TCP port derived from the PID (49152 + PID % 16000).
 # macOS PIDs run past 99000, so two shells 16000 apart got the same port — and
 # the loser's helper then connected to the WINNER's monitor and sent `quit`,
 # killing a VM it did not own. A unix socket under mktemp cannot alias.
-MON="$(mktemp -u -t talkos-mon)"
+MON="$(mktemp -u -t fableos-mon)"
 
 if [ "${KILL_OTHERS:-0}" = "1" ]; then
     pkill -f qemu-system-x86_64 2>/dev/null || true

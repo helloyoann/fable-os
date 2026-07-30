@@ -35,7 +35,7 @@
  *   NUL-terminated.
  *
  * Standing in for the linker: Mach-O has no __start_/__stop_ section symbols, so
- * power_tools.c exports a named pointer per tool under TALKOS_HOSTTEST and this
+ * power_tools.c exports a named pointer per tool under FABLEOS_HOSTTEST and this
  * file assembles the table core/tool.c expects. Same trick as test_mem_tools.c.
  */
 
@@ -52,9 +52,9 @@
 /* stand in for the linker-collected tool table                          */
 /* ====================================================================== */
 
-extern const tool_t *const talkos_hosttool_power_off_tool;
-extern const tool_t *const talkos_hosttool_power_reboot_tool;
-extern const tool_t *const talkos_hosttool_power_info_tool;
+extern const tool_t *const fableos_hosttool_power_off_tool;
+extern const tool_t *const fableos_hosttool_power_reboot_tool;
+extern const tool_t *const fableos_hosttool_power_info_tool;
 
 #if defined(__APPLE__)
 #  define SYMPFX "_"
@@ -73,9 +73,9 @@ _Static_assert(sizeof(__start_tool_table) == 24,
                "tool count changed: update the __stop_tool_table byte offset");
 
 static void install_tool_table(void) {
-    __start_tool_table[0] = talkos_hosttool_power_off_tool;
-    __start_tool_table[1] = talkos_hosttool_power_reboot_tool;
-    __start_tool_table[2] = talkos_hosttool_power_info_tool;
+    __start_tool_table[0] = fableos_hosttool_power_off_tool;
+    __start_tool_table[1] = fableos_hosttool_power_reboot_tool;
+    __start_tool_table[2] = fableos_hosttool_power_info_tool;
 }
 
 /* ====================================================================== */
@@ -228,7 +228,7 @@ static void hdr(uint8_t *p, const char *sig, uint32_t len, uint8_t rev) {
     memcpy(p, sig, 4);
     put32(p + 4, len);
     p[8] = rev;
-    memcpy(p + 10, "TALKOS", 6);          /* OEM ID    */
+    memcpy(p + 10, "FABLE ", 6);          /* OEM ID    */
     memcpy(p + 16, "TESTTBL0", 8);        /* OEM table */
     put32(p + 24, 1);                     /* OEM revision */
     memcpy(p + 28, "TEST", 4);
@@ -240,7 +240,7 @@ static void build_rsdp1(uint64_t at, uint32_t rsdt) {
     uint8_t *p = fake_mem + at;
     memset(p, 0, 36);
     memcpy(p, "RSD PTR ", 8);
-    memcpy(p + 9, "TALKOS", 6);
+    memcpy(p + 9, "FABLE ", 6);
     p[15] = 0;
     put32(p + 16, rsdt);
     fix_sum(p, 20, 8);
@@ -251,7 +251,7 @@ static void build_rsdp2(uint64_t at, uint32_t rsdt, uint64_t xsdt) {
     uint8_t *p = fake_mem + at;
     memset(p, 0, 36);
     memcpy(p, "RSD PTR ", 8);
-    memcpy(p + 9, "TALKOS", 6);
+    memcpy(p + 9, "FABLE ", 6);
     p[15] = 2;
     put32(p + 16, rsdt);
     put32(p + 20, 36);                 /* length */
@@ -414,7 +414,7 @@ static void test_rsdp_valid(void) {
     memset(&in, 0, sizeof in);
     CHECK_EQ(acpi_rsdp_check(fake_mem + AT_RSDP, 36, &in), ACPI_OK);
     CHECK_EQ(in.rsdp_revision, 0);
-    CHECK_STR(in.oem_id, "TALKOS");
+    CHECK_STR(in.oem_id, "FABLE ");
     CHECK_EQ(in.rsdt_phys, 0x12345678);
     CHECK_EQ(in.xsdt_phys, 0);          /* a 1.0 RSDP has no XSDT to trust */
     /* present is the caller's business, not the validator's. */
@@ -768,7 +768,7 @@ static void test_discovery_bios_window(void) {
     CHECK_EQ(in->present, 1);
     CHECK_EQ(in->rsdp_phys, AT_RSDP);
     CHECK_EQ(in->rsdp_revision, 0);
-    CHECK_STR(in->oem_id, "TALKOS");
+    CHECK_STR(in->oem_id, "FABLE ");
     CHECK_EQ(in->used_xsdt, 0);
     CHECK_EQ(in->rsdt_phys, AT_RSDT);
     CHECK_EQ(in->table_count, 1);
@@ -784,7 +784,7 @@ static void test_discovery_bios_window(void) {
 
     /* The boot summary has to say the numbers soft-off depends on, or the
      * operator cannot tell a working ACPI path from a lucky fallback. */
-    CHECK_CONTAINS(kcap_text(), "acpi: rev 0 \"TALKOS\"");
+    CHECK_CONTAINS(kcap_text(), "acpi: rev 0 \"FABLE \"");
     CHECK_CONTAINS(kcap_text(), "pm1a_cnt=0x604");
     CHECK_CONTAINS(kcap_text(), "s5=yes(a=0 b=0 from DSDT)");
 }
@@ -1723,7 +1723,7 @@ static void test_tool_power_info(void) {
     const char *out = call("power_info", "{}");
     CHECK_EQ(g_res.is_error, 0);
     CHECK_EQ(rec_n, 0);                       /* read-only: nothing was poked */
-    CHECK_CONTAINS(out, "ACPI: available (RSDP revision 0, OEM \"TALKOS\")");
+    CHECK_CONTAINS(out, "ACPI: available (RSDP revision 0, OEM \"FABLE \")");
     CHECK_CONTAINS(out, "RSDT");
     CHECK_CONTAINS(out, "PM1a_CNT:     0x604");
     CHECK_CONTAINS(out, "found in the DSDT: SLP_TYPa=0 SLP_TYPb=0");

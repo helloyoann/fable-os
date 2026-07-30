@@ -55,7 +55,12 @@ static void vfs_selftest(void) {
     vfs_mkdir("/etc");
     vfs_mkdir("/tmp");
 
-    const char *msg = "talk-os native filesystem online\n";
+    /* tests/qemu/cases/{boot,no-nic}.case assert this string AND its length in
+     * bytes, so editing it fails two cases until they are updated. Renaming the
+     * OS was enough: "talk-os" to "fable-os" is one character, which moved 33 to
+     * 34 and went red. The assertion is worth keeping — a motd that reads back
+     * the wrong SIZE means the VFS lied about a write. */
+    const char *msg = "fable-os native filesystem online\n";
     file_t *f = vfs_open("/etc/motd", O_CREAT | O_RDWR);
     if (!f) { kputs("open /etc/motd failed\n"); return; }
     vfs_write(f, msg, strlen(msg));
@@ -88,7 +93,7 @@ static void vfs_selftest(void) {
 static void ready_banner(int net_up) {
     kputs("\n");
     kputs("==============================================================\n");
-    kputs("  talk-os\n");
+    kputs("  fable-os\n");
     kputs("==============================================================\n");
     kprintf("  tools  : %d registered (%u bytes of schema)\n",
             tool_count(), (unsigned)chat_tools_bytes());
@@ -241,7 +246,7 @@ static void ui_inline(void) {
 
 /* THE SELF-REPAIR DEMONSTRATION, in diagnostic builds only.
  *
- *     make EXTRA_CFLAGS=-DTALKOS_REPAIR_DEMO run-nox
+ *     make EXTRA_CFLAGS=-DFABLEOS_REPAIR_DEMO run-nox
  *
  * Schedules a repeating agenda item that calls tools/agenda_tools.c's
  * `repair_demo` tool, which divides by zero. Watch the serial log with nobody
@@ -254,7 +259,7 @@ static void ui_inline(void) {
  * its only interface is natural language, and such a machine must not carry a
  * function with a deliberate bug in it — the same argument arch/x86_64/
  * fault_inject.c makes about not shipping a "crash yourself" verb. */
-#ifdef TALKOS_REPAIR_DEMO
+#ifdef FABLEOS_REPAIR_DEMO
 static void demo_copy(char *dst, size_t cap, const char *src) {
     size_t i = 0;
     for (; src[i] && i + 1 < cap; i++) dst[i] = src[i];
@@ -390,7 +395,7 @@ static int wait_for_sentence(char *buf, int cap) {
  * proof that the ui fiber runs during an API call. They are not a picture, and
  * "the screen keeps moving" is the thing an operator actually cares about.
  *
- *     make EXTRA_CFLAGS=-DTALKOS_CONCURRENCY_DEMO run
+ *     make EXTRA_CFLAGS=-DFABLEOS_CONCURRENCY_DEMO run
  *
  * opens apps/examples/clock.json at boot — a real document, through the real
  * app runtime, with a 500 ms tick handler — and leaves it up. Screenshot the
@@ -401,7 +406,7 @@ static int wait_for_sentence(char *buf, int cap) {
  * arch/x86_64/fault_inject.c and tests/qemu/fixtures/ac97_boot.c: a window this
  * kernel opens by itself is a window the operator did not ask for, and the
  * premise here is that the machine does what it is asked. */
-#ifdef TALKOS_CONCURRENCY_DEMO
+#ifdef FABLEOS_CONCURRENCY_DEMO
 static void concurrency_demo(void) {
     const char *doc = app_example_doc("clock");
     if (!doc) { kputs("fiber: demo: no clock example in this build\n"); return; }
@@ -517,7 +522,7 @@ void kernel_main(void) {
         uint64_t t0 = millis(), s0 = fiber_switches();
         uint64_t p0 = ui_passes, k0 = ui_ticks;
 
-        net_ask("Reply with exactly: talk-os online");
+        net_ask("Reply with exactly: fable-os online");
 
         uint64_t ms = millis() - t0;
         kprintf("fiber: that %u ms API call was not dead air - the ui fiber "

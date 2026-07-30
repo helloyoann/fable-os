@@ -964,7 +964,7 @@ static void test_sources_can_be_restored(void) {
 static void check_embedded(const char *file, const char *embedded) {
     char path[256];
     snprintf(path, sizeof path, "%s/apps/examples/%s",
-             getenv("TALKOS_SRCDIR") ? getenv("TALKOS_SRCDIR") : ".", file);
+             getenv("FABLEOS_SRCDIR") ? getenv("FABLEOS_SRCDIR") : ".", file);
     FILE *fh = fopen(path, "rb");
     if (!fh) {
         /* Run from another directory: skip rather than fail, but say so, because

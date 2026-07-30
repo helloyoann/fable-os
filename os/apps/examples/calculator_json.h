@@ -30,7 +30,7 @@
 #define APP_CALCULATOR_JSON \
 /* --- BEGIN GENERATED (do not edit by hand) --- */ \
     "{\n" \
-    "  \"note\": \"The hand-written reference app for talk-os: a working calculator, written by a human in the same document format the model emits, so that a model failure is attributable to the model and not to the runtime. Fixed point, six decimals, magnitude up to 9e9; division by zero and overflow produce the error value, which text() renders as the word error and which latches until C.\",\n" \
+    "  \"note\": \"The hand-written reference app for fable-os: a working calculator, written by a human in the same document format the model emits, so that a model failure is attributable to the model and not to the runtime. Fixed point, six decimals, magnitude up to 9e9; division by zero and overflow produce the error value, which text() renders as the word error and which latches until C.\",\n" \
     "  \"title\": \"Calculator\",\n" \
     "  \"width\": 216,\n" \
     "  \"height\": 266,\n" \

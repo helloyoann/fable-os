@@ -317,7 +317,7 @@ static cc_type_t *common_type(cc_type_t *a, cc_type_t *b) {
      *     int x = -6; unsigned char u = 2;  x / u   gave 2147483645, not -3
      *     uint8_t a=10, b=20;              (a-b)<0  gave 0, not 1
      * uint8_t and uint16_t are predeclared here (cc_sym.c) and advertised in the
-     * built-in <talkos.h>, so a model reached this immediately. */
+     * built-in <fableos.h>, so a model reached this immediately. */
     if (a->size < 4) a = cc_ty_int;
     if (b->size < 4) b = cc_ty_int;
     if (a->size != b->size) return (a->size > b->size) ? a : b;

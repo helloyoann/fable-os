@@ -297,7 +297,7 @@ int cc_preprocess(cc_token_t *in, int nin, cc_token_t **out, int *nout);
  * tokenized; see the pool's comment in cc_lex.c. */
 void cc_token_pool_reset(void);
 
-/* The built-in headers, so #include <talkos.h> resolves with no filesystem. */
+/* The built-in headers, so #include <fableos.h> resolves with no filesystem. */
 const char *cc_builtin_header(const char *name);
 
 /* ===================================================================== */

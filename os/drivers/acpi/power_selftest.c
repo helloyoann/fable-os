@@ -18,19 +18,19 @@
  *   So the flag exists, it goes through the REAL model-facing path, and QEMU's
  *   own exit status is the assertion:
  *
- *     make EXTRA_CFLAGS=-DTALKOS_POWER_TEST=power_off
+ *     make EXTRA_CFLAGS=-DFABLEOS_POWER_TEST=power_off
  *     qemu-system-x86_64 -kernel kernel.bin -display none -no-reboot \
  *                        -serial stdio ; echo $?
  *
  *   QEMU exiting on its own is proof of a genuine power-off: a hang would sit
  *   there until the timeout, and a triple fault would print the boot banner a
- *   second time instead. -DTALKOS_POWER_TEST=power_reboot proves the other one,
+ *   second time instead. -DFABLEOS_POWER_TEST=power_reboot proves the other one,
  *   by producing exactly that second banner in one serial log.
  *
  * HOW IT IS KEPT OUT OF REACH
  *   Mirrors arch/x86_64/fault_inject.c, which makes the same argument for
  *   deliberate faults:
- *     1. Everything here is inside #ifdef TALKOS_POWER_TEST. Without the flag
+ *     1. Everything here is inside #ifdef FABLEOS_POWER_TEST. Without the flag
  *        this file compiles to nothing at all — no driver is registered, so the
  *        driver manager never has anything to call.
  *     2. The flag's value is a tool name and nothing else, so the file cannot do
@@ -48,7 +48,7 @@
  *   serial log that ends in the right place.
  */
 
-#ifdef TALKOS_POWER_TEST
+#ifdef FABLEOS_POWER_TEST
 
 #include "acpi.h"
 #include "tool.h"
@@ -57,19 +57,19 @@
 #include "driver.h"
 #include "device.h"
 
-/* -DTALKOS_POWER_TEST=power_off  ->  "power_off" */
-#define TALKOS_STR2(x) #x
-#define TALKOS_STR(x)  TALKOS_STR2(x)
+/* -DFABLEOS_POWER_TEST=power_off  ->  "power_off" */
+#define FABLEOS_STR2(x) #x
+#define FABLEOS_STR(x)  FABLEOS_STR2(x)
 
 static int power_selftest_init(void) {
     static const char args[] =
-        "{\"confirm\":true,\"reason\":\"TALKOS_POWER_TEST boot self-test\"}";
-    const char *name = TALKOS_STR(TALKOS_POWER_TEST);
+        "{\"confirm\":true,\"reason\":\"FABLEOS_POWER_TEST boot self-test\"}";
+    const char *name = FABLEOS_STR(FABLEOS_POWER_TEST);
 
     size_t nargs = 0;
     while (args[nargs]) nargs++;
 
-    kputs("\n--- power self-test (TALKOS_POWER_TEST) ---\n");
+    kputs("\n--- power self-test (FABLEOS_POWER_TEST) ---\n");
     kprintf("power-selftest: dispatching the tool \"%s\" exactly as the model "
             "would\n", name);
     if (!tool_find(name)) {
@@ -116,6 +116,6 @@ REGISTER_DRIVER(power_selftest_driver);
 
 /* Keeps this translation unit non-empty in a normal build, where the whole file
  * above compiles to nothing. */
-typedef int talkos_power_selftest_not_built_t;
+typedef int fableos_power_selftest_not_built_t;
 
-#endif /* TALKOS_POWER_TEST */
+#endif /* FABLEOS_POWER_TEST */

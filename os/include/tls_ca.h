@@ -12,7 +12,7 @@
  *   kernel did not have: a set of trusted roots, and a wall clock.
  *
  *   It is deliberately inert unless the kernel is built with
- *   -DTALKOS_VERIFY_CERTS. See "THE BUILD FLAG" below.
+ *   -DFABLEOS_VERIFY_CERTS. See "THE BUILD FLAG" below.
  *
  * WHAT IS TRUSTED, AND HOW THAT WAS DETERMINED
  *   The bundle holds exactly two roots, both operated by Google Trust
@@ -89,7 +89,7 @@
  *
  * THE BUILD FLAG
  *   Everything here compiles into every build; nothing here is *used* unless
- *   TALKOS_VERIFY_CERTS is defined. Without the flag the kernel behaves exactly
+ *   FABLEOS_VERIFY_CERTS is defined. Without the flag the kernel behaves exactly
  *   as it always has (ALTCP_MBEDTLS_AUTHMODE 0, no CA chain installed, no date
  *   checking), because other work in this tree boots against that behaviour and
  *   a pinned root that stops working is a very effective way to block three
@@ -99,7 +99,7 @@
  *     net/net.c             passes tls_ca_bundle() to altcp_tls_create_config_client
  *     net/net.c             mbedtls_ssl_set_hostname() becomes the verified name
  *     mbedtls_config.h      MBEDTLS_HAVE_TIME_DATE, so notBefore/notAfter run
- *     mbedtls_config.h      mbedtls_time -> talkos_tls_time (below)
+ *     mbedtls_config.h      mbedtls_time -> fableos_tls_time (below)
  *     mbedtls_config.h      MBEDTLS_PLATFORM_GMTIME_R_ALT, so the epoch->calendar
  *                           conversion mbedTLS needs is ours (below)
  *     mbedtls_config.h      MBEDTLS_PEM_PARSE_C/BASE64_C, so the bundle parses
@@ -134,9 +134,9 @@
  *   Clock (pure given the RTC; this is what the host tests drive):
  *     tls_ca_now_unix                     seconds since the epoch, 0 = no clock
  *     tls_ca_gmtime_r                     epoch seconds -> struct tm (UTC)
- *   mbedTLS adapters (only compiled under TALKOS_VERIFY_CERTS, and only ever
+ *   mbedTLS adapters (only compiled under FABLEOS_VERIFY_CERTS, and only ever
  *   called by mbedTLS itself):
- *     talkos_tls_time                     MBEDTLS_PLATFORM_TIME_MACRO
+ *     fableos_tls_time                     MBEDTLS_PLATFORM_TIME_MACRO
  *     mbedtls_platform_gmtime_r           MBEDTLS_PLATFORM_GMTIME_R_ALT
  *
  * DEPENDENCIES

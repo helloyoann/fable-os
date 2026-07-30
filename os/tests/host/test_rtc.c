@@ -36,7 +36,7 @@
  *   4. The two tools survive hostile input with their result buffers intact.
  *
  * Standing in for the linker: Mach-O has no __start_/__stop_ section symbols,
- * so time_tools.c exports a named pointer per tool under TALKOS_HOSTTEST and
+ * so time_tools.c exports a named pointer per tool under FABLEOS_HOSTTEST and
  * this file assembles the table core/tool.c expects.
  */
 
@@ -53,8 +53,8 @@
 /* stand in for the linker-collected tool table                          */
 /* ====================================================================== */
 
-extern const tool_t *const talkos_hosttool_sys_time_tool;
-extern const tool_t *const talkos_hosttool_time_convert_tool;
+extern const tool_t *const fableos_hosttool_sys_time_tool;
+extern const tool_t *const fableos_hosttool_time_convert_tool;
 
 /* Deliberately defined WITHOUT the inner const that core/tool.c's extern
  * declaration carries: in the kernel the linker emits this table read-only,
@@ -77,8 +77,8 @@ _Static_assert(sizeof(__start_tool_table) == 16,
                "tool count changed: update the __stop_tool_table byte offset");
 
 static void install_tool_table(void) {
-    __start_tool_table[0] = talkos_hosttool_sys_time_tool;
-    __start_tool_table[1] = talkos_hosttool_time_convert_tool;
+    __start_tool_table[0] = fableos_hosttool_sys_time_tool;
+    __start_tool_table[1] = fableos_hosttool_time_convert_tool;
 }
 
 /* ====================================================================== */

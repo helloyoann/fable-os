@@ -50,7 +50,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#if defined(TALKOS_HOSTTEST)
+#if defined(FABLEOS_HOSTTEST)
 #  include <sys/mman.h>
 #  ifndef MAP_ANON
 #    define MAP_ANON MAP_ANONYMOUS
@@ -96,7 +96,7 @@ static uint64_t g_serial;
 /* the code buffer                                                       */
 /* ===================================================================== */
 
-#if defined(TALKOS_HOSTTEST)
+#if defined(FABLEOS_HOSTTEST)
 
 static uint8_t *g_code;
 

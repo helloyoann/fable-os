@@ -26,7 +26,7 @@
 #include "fwcfg.h"
 #include "kernel.h"
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 #  include "io.h"
 #  include "driver.h"
 #  include "device.h"
@@ -36,7 +36,7 @@
 /* 1. the port backend                                                    */
 /* ====================================================================== */
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 static void port_select(void *ctx, uint16_t key) {
     (void)ctx;
     outw(FWCFG_PORT_SEL, key);
@@ -353,7 +353,7 @@ void fwcfg_apikey_report(int rc) {
 /* 5. the driver                                                          */
 /* ====================================================================== */
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 
 static const driver_t fwcfg_driver;
 
@@ -395,4 +395,4 @@ static const driver_t fwcfg_driver = {
 };
 REGISTER_DRIVER(fwcfg_driver);
 
-#endif /* !TALKOS_HOSTTEST */
+#endif /* !FABLEOS_HOSTTEST */

@@ -53,7 +53,7 @@ int  app_tick(void) { return 0; }
 /* REGISTER_TOOL collects pointers in a linker section; Mach-O has no
  * __start_/__stop_ symbols, so alias them to the linker-generated ones. The
  * tools themselves are compiled as their own translation units (see the
- * TALKOS_HOSTTEST branch in tools/vfs_tools.c and tools/agent_tools.c), so what
+ * FABLEOS_HOSTTEST branch in tools/vfs_tools.c and tools/agent_tools.c), so what
  * this suite exercises is the same table the kernel's linker builds. */
 #ifdef __APPLE__
 __asm__(".globl ___start_tool_table\n"
@@ -180,7 +180,7 @@ static void test_system_prompt_states_this_machine(void) {
     CHECK(strlen(p) > 600);          /* a real briefing, not a slogan */
 
     /* what it is */
-    CHECK_CONTAINS(p, "You are the resident intelligence of talk-os");
+    CHECK_CONTAINS(p, "You are the resident intelligence of fable-os");
     CHECK_CONTAINS(p, "no shell");
     CHECK_CONTAINS(p, "ring 0");
     CHECK_CONTAINS(p, "single-threaded");

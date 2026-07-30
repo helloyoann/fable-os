@@ -13,14 +13,14 @@
  *                                        believed. Encrypted, not
  *                                        authenticated, and MITM-able by
  *                                        anything that can answer on 443.
- *   `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS`
+ *   `make EXTRA_CFLAGS=-DFABLEOS_VERIFY_CERTS`
  *                                        the chain must build to one of the
  *                                        roots pinned in net/tls_ca.c, the
  *                                        certificate must name the host we
  *                                        asked for, and notBefore/notAfter must
  *                                        contain the CMOS clock's idea of now.
  *
- * Every TALKOS_VERIFY_CERTS block below is additive; with the flag absent this
+ * Every FABLEOS_VERIFY_CERTS block below is additive; with the flag absent this
  * file compiles to exactly what it did before. See include/tls_ca.h for which
  * roots are trusted, why those, and what breaks when they rotate.
  *
@@ -87,7 +87,7 @@
 
 #include <stdio.h>      /* snprintf, for the one-line TLS verdict */
 
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
 #include "rtc.h"
 #include "mbedtls/x509_crt.h"
 
@@ -95,16 +95,16 @@
  * by lwIP's altcp_tls_mbedtls.c. Refuse to build a kernel that claims to verify
  * while that knob says otherwise, so the two cannot drift apart quietly. */
 #if !defined(ALTCP_MBEDTLS_AUTHMODE) || ALTCP_MBEDTLS_AUTHMODE != MBEDTLS_SSL_VERIFY_REQUIRED
-#error "TALKOS_VERIFY_CERTS requires ALTCP_MBEDTLS_AUTHMODE == MBEDTLS_SSL_VERIFY_REQUIRED (see port/lwipopts.h)"
+#error "FABLEOS_VERIFY_CERTS requires ALTCP_MBEDTLS_AUTHMODE == MBEDTLS_SSL_VERIFY_REQUIRED (see port/lwipopts.h)"
 #endif
 #endif
 
-/* Streaming is opt-in at build time (`make EXTRA_CFLAGS=-DTALKOS_STREAM`).
+/* Streaming is opt-in at build time (`make EXTRA_CFLAGS=-DFABLEOS_STREAM`).
  * Without it this file behaves exactly as it always has: one buffered response,
  * printed when it is complete. With it, the request carries "stream":true and
  * the response is a text/event-stream that net/sse.c turns back into the same
  * response body while printing the model's text deltas as they land. Every
- * TALKOS_STREAM block below is additive; the default path is untouched (proven
+ * FABLEOS_STREAM block below is additive; the default path is untouched (proven
  * by compiling this file with and without the streaming source and diffing the
  * generated code — identical).
  *
@@ -112,17 +112,17 @@
  * text the transport already streamed, but net/chat.c cannot — it needs the
  * same one-line sse_http_streamed() guard in print_text_block(), and chat.c is
  * not this change's to edit. See the SCOPE section of include/sse.h. */
-#ifdef TALKOS_STREAM
+#ifdef FABLEOS_STREAM
 #include "sse.h"
 #endif
 
-/* THE API KEY IS NOT COMPILED IN. There is no -DTALKOS_API_KEY and there is no
+/* THE API KEY IS NOT COMPILED IN. There is no -DFABLEOS_API_KEY and there is no
  * KEY= in the Makefile, on purpose: a key that reaches the compiler reaches
- * net.o, kernel.elf, kernel.bin, talkos.iso and the .build-flags stamp, and a
+ * net.o, kernel.elf, kernel.bin, fableos.iso and the .build-flags stamp, and a
  * .gitignore is the wrong place to keep a secret out of five build artifacts.
  *
  * The key arrives at RUN time over QEMU's fw_cfg channel (drivers/fwcfg/, read
- * at boot from opt/talkos/apikey) and lives only in RAM. With no key,
+ * at boot from opt/fableos/apikey) and lives only in RAM. With no key,
  * fwcfg_apikey() is "" — the header goes out empty, Anthropic answers 401, and
  * that is the documented default: it still proves DNS, TLS and HTTP worked.
  *
@@ -134,14 +134,14 @@
 /* The endpoint. Both names are overridable, but ONLY in a verification build,
  * because their only purpose is to prove that the verifier rejects things:
  *
- *   -DTALKOS_TLS_HOST='"example.com"'    resolve and connect somewhere else, so
+ *   -DFABLEOS_TLS_HOST='"example.com"'    resolve and connect somewhere else, so
  *                                        the presented chain is anchored in a
  *                                        root this kernel does not trust
  *                                        -> MBEDTLS_X509_BADCERT_NOT_TRUSTED
- *   -DTALKOS_TLS_SNI='"wrong.invalid"'   ask the verifier for a name the
+ *   -DFABLEOS_TLS_SNI='"wrong.invalid"'   ask the verifier for a name the
  *                                        certificate does not carry
  *                                        -> MBEDTLS_X509_BADCERT_CN_MISMATCH
- *   -DTALKOS_TLS_PORT=8443               with TALKOS_TLS_HOST='"10.0.2.2"',
+ *   -DFABLEOS_TLS_PORT=8443               with FABLEOS_TLS_HOST='"10.0.2.2"',
  *                                        point the kernel at a TLS server on
  *                                        the QEMU host — the offline way to
  *                                        present a self-signed certificate and
@@ -152,25 +152,25 @@
  * A verifier that has never been watched saying no is not known to work, and
  * these three lines are how that gets watched. In the default build none of the
  * macros can have any effect: the #ifdefs collapse to the original literals. */
-#if defined(TALKOS_VERIFY_CERTS) && defined(TALKOS_TLS_HOST)
-#define API_HOST   TALKOS_TLS_HOST
+#if defined(FABLEOS_VERIFY_CERTS) && defined(FABLEOS_TLS_HOST)
+#define API_HOST   FABLEOS_TLS_HOST
 #else
 #define API_HOST   "api.anthropic.com"
 #endif
 
 /* The name the certificate must carry. Sent as SNI in every build; under
- * TALKOS_VERIFY_CERTS it is additionally the name mbedTLS matches the
+ * FABLEOS_VERIFY_CERTS it is additionally the name mbedTLS matches the
  * certificate's CN/subjectAltName against, which is the half of verification
  * that a CA bundle alone does not give you — a valid certificate for some
  * other host is still the wrong certificate. */
-#if defined(TALKOS_VERIFY_CERTS) && defined(TALKOS_TLS_SNI)
-#define API_SNI    TALKOS_TLS_SNI
+#if defined(FABLEOS_VERIFY_CERTS) && defined(FABLEOS_TLS_SNI)
+#define API_SNI    FABLEOS_TLS_SNI
 #else
 #define API_SNI    API_HOST
 #endif
 
-#if defined(TALKOS_VERIFY_CERTS) && defined(TALKOS_TLS_PORT)
-#define API_PORT   TALKOS_TLS_PORT
+#if defined(FABLEOS_VERIFY_CERTS) && defined(FABLEOS_TLS_PORT)
+#define API_PORT   FABLEOS_TLS_PORT
 #else
 #define API_PORT   443
 #endif
@@ -336,7 +336,7 @@ static int dns_lookup(const char *host, ip_addr_t *out, uint32_t timeout_ms) {
  * invoke conn->err and only then close/free), so the context is still alive
  * inside err_cb — and nowhere else. Nothing outside this file may touch it.
  *
- * Not under TALKOS_VERIFY_CERTS: record_tls_state() below needs it in EVERY
+ * Not under FABLEOS_VERIFY_CERTS: record_tls_state() below needs it in EVERY
  * build, because the honest answer to "was this peer authenticated?" is exactly
  * the question a general fetch has to answer for the model, and in the default
  * build that answer is no. */
@@ -354,7 +354,7 @@ static char xc_tls_note[FETCH_NOTE_MAX];
 
 /* WHAT THIS CONNECTION ACTUALLY PROVED — asked of mbedTLS, never inferred.
  *
- * "Compiled with TALKOS_VERIFY_CERTS" is not the same claim as "this handshake
+ * "Compiled with FABLEOS_VERIFY_CERTS" is not the same claim as "this handshake
  * verified anything", and the two live in different object files:
  * ALTCP_MBEDTLS_AUTHMODE is consumed by lwIP's altcp_tls_mbedtls.c, and one
  * stale object is enough to separate them. Worse, under VERIFY_NONE mbedTLS
@@ -384,14 +384,14 @@ static void record_tls_state(mbedtls_ssl_context *ssl) {
         xc_tls_state = FETCH_TLS_UNVERIFIED;
         snprintf(xc_tls_note, sizeof xc_tls_note,
                  "ENCRYPTED BUT NOT AUTHENTICATED: this kernel was built "
-                 "without TALKOS_VERIFY_CERTS (mbedTLS authmode %d), so the "
+                 "without FABLEOS_VERIFY_CERTS (mbedTLS authmode %d), so the "
                  "certificate %s presented was parsed and then believed. "
                  "Anything able to answer on this port could be the far end.",
                  mode, xc_sni ? xc_sni : "the peer");
     }
 }
 
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
 /* ---------------------------------------------------------------------- */
 /* certificate verification: setup and reporting                           */
 /* ---------------------------------------------------------------------- */
@@ -440,7 +440,7 @@ static int tls_verify_init(void) {
      * is enough to separate the claim from the behaviour. Ask a question whose
      * answer can only be yes: is 1971 in the past?
      *
-     * (Not decorative. `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS` in a tree that
+     * (Not decorative. `make EXTRA_CFLAGS=-DFABLEOS_VERIFY_CERTS` in a tree that
      * was already built does not rebuild mbedTLS, so this is the difference
      * between finding out at boot and finding out never.) */
     {
@@ -557,7 +557,7 @@ static void tls_report_verify_success(mbedtls_ssl_context *ssl) {
     }
     kputc('\n');
 }
-#endif /* TALKOS_VERIFY_CERTS */
+#endif /* FABLEOS_VERIFY_CERTS */
 
 int net_init(void) {
     /* ARM THE CREDENTIAL GUARD FIRST, before anything below can fail and take an
@@ -585,7 +585,7 @@ int net_init(void) {
 
     /* The TLS client config. Either way this is where the CTR_DRBG is seeded
      * from mbedtls_hardware_poll() — see the entropy caveat in the READMEs. */
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
     if (tls_verify_init() != 0) return -1;
 #else
     /* No CA -> handshake but no trust check. */
@@ -676,7 +676,7 @@ static const char  *tls_err = "";
  *
  *   xc_stream  feed received bytes to the SSE machine instead of the raw buffer.
  *              Only the model transport ever sets it, and only under
- *              TALKOS_STREAM; a fetch is always buffered.
+ *              FABLEOS_STREAM; a fetch is always buffered.
  *   xc_probe   there is no request and no response — the question is only
  *              "does anything complete a TCP handshake here?", so the attempt
  *              finishes the moment connected_cb fires.
@@ -739,7 +739,7 @@ static void tls_drop(struct altcp_pcb *pcb) {
     altcp_abort(pcb);
 }
 
-#ifdef TALKOS_STREAM
+#ifdef FABLEOS_STREAM
 /* ~20 KiB of parser state. Static on purpose: the kernel stack is 64 KiB. */
 static sse_http_t stream;
 
@@ -771,7 +771,7 @@ static err_t recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t err
     }
     for (struct pbuf *q = p; q; q = q->next) {
         const char *d = q->payload;
-#ifdef TALKOS_STREAM
+#ifdef FABLEOS_STREAM
         /* Straight into the state machine: it prints text deltas as they land
          * and reassembles the response body in place. Segments split an event
          * at arbitrary byte boundaries, which is sse.c's whole job.
@@ -817,7 +817,7 @@ static void err_cb(void *arg, err_t err) {
      * tear down — and following the pointer again would be a use-after-free. */
     cur_pcb = (struct altcp_pcb *)0;
     xc_lwip_err = err;
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
     /* A refused certificate arrives here as a bare ERR_CLSD, which is
      * indistinguishable from the peer hanging up. Ask mbedTLS what it decided
      * before lwIP tears the context down; if it was a trust failure, that
@@ -882,7 +882,7 @@ static err_t connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
      * builds, because "not authenticated" is a fact a fetch has to report just
      * as loudly as "authenticated". */
     if (cur_ssl) record_tls_state(cur_ssl);
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
     /* Reaching here under VERIFY_REQUIRED means the chain built to a pinned
      * root, the name matched, and the validity period contained now. */
     if (cur_ssl) tls_report_verify_success(cur_ssl);
@@ -900,7 +900,7 @@ static err_t connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
     return ERR_OK;
 }
 
-#ifndef TALKOS_STREAM
+#ifndef FABLEOS_STREAM
 /* Find `needle` in [p, p+n). Returns the offset, or -1. (No strstr: the buffer
  * is network data and may legitimately contain NUL bytes.) */
 static int find(const char *p, int n, const char *needle, int nlen) {
@@ -948,7 +948,7 @@ static int split_http(char *buf, int len, model_response_t *out) {
     out->body_len = (size_t)blen;
     return MODEL_OK;
 }
-#endif /* !TALKOS_STREAM — sse.c does the splitting on the streaming path */
+#endif /* !FABLEOS_STREAM — sse.c does the splitting on the streaming path */
 
 /* ====================================================================== */
 /* the connection engine — shared by the model transport and every fetch   */
@@ -1007,7 +1007,7 @@ static int http_exchange(const xchg_t *x) {
     xc_lwip_err  = ERR_OK;
     xc_tls_state = FETCH_TLS_NONE;
     xc_tls_note[0] = '\0';
-#ifdef TALKOS_STREAM
+#ifdef FABLEOS_STREAM
     if (xc_stream)
         sse_http_init(&stream, x->rx, (size_t)x->rx_cap, stream_text, (void *)0);
 #endif
@@ -1027,13 +1027,13 @@ static int http_exchange(const xchg_t *x) {
     altcp_arg(pcb, (void *)tls_gen);
 
     /* Send SNI so CDN-fronted hosts present the right certificate. Under
-     * TALKOS_VERIFY_CERTS this same string is what mbedTLS matches the
+     * FABLEOS_VERIFY_CERTS this same string is what mbedTLS matches the
      * certificate's CN/subjectAltName against, so a failure to set it would
      * quietly downgrade verification to "signed by someone we trust, for
      * whatever name they liked" — hence the hard failure below. */
     if (x->sni) {
         mbedtls_ssl_context *ssl = (mbedtls_ssl_context *)altcp_tls_context(pcb);
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
         if (!ssl || mbedtls_ssl_set_hostname(ssl, x->sni) != 0) {
             tls_drop(pcb);
             cur_pcb = (struct altcp_pcb *)0;
@@ -1138,7 +1138,7 @@ static int tls_send(model_transport_t *t,
         "content-type: application/json\r\n"
         "connection: close\r\n"
         "content-length: ");
-#ifdef TALKOS_STREAM
+#ifdef FABLEOS_STREAM
     /* Ask for Server-Sent Events. net/model.c owns the body and must not learn
      * that transports exist, so the flag is spliced in as the first member of
      * the object it already built — the smallest change that leaves model.c
@@ -1173,14 +1173,14 @@ static int tls_send(model_transport_t *t,
     x.rx         = resp_buf;
     x.rx_cap     = (int)(resp_cap > 0x7FFFFFFF ? 0x7FFFFFFF : resp_cap);
     x.timeout_ms = 90000;                   /* handshake + model latency */
-#ifdef TALKOS_STREAM
+#ifdef FABLEOS_STREAM
     x.stream     = 1;
 #endif
 
     int xrc = http_exchange(&x);
     if (xrc != MODEL_OK) return xrc;
 
-#ifdef TALKOS_STREAM
+#ifdef FABLEOS_STREAM
     /* The body was consumed as it arrived; all that is left is to close the
      * reassembled document and hand up the same model_response_t the buffered
      * path produces. A non-SSE response (a 401, an error page) was buffered
@@ -1385,7 +1385,7 @@ static int backend_ifstat(fetch_ifstat_t *out) {
     out->api_resolved = api_resolved;
     if (api_resolved) put_ip(out->api_ip, sizeof out->api_ip, &server_ip);
 
-#ifdef TALKOS_VERIFY_CERTS
+#ifdef FABLEOS_VERIFY_CERTS
     out->verify_build = 1;
 #else
     out->verify_build = 0;
@@ -1475,7 +1475,7 @@ int net_ask(const char *question) {
     int prc = json_parse(r.body, r.body_len, &root);
     int trc = prc == JSON_OK ? json_msg_text(&root, text, sizeof text, NULL)
                              : prc;
-#ifdef TALKOS_STREAM
+#ifdef FABLEOS_STREAM
     /* Already on screen, delta by delta, as it arrived. */
     if (sse_http_streamed(&stream)) { kputc('\n'); return 0; }
 #endif

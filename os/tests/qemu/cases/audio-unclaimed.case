@@ -1,7 +1,7 @@
 # =========================================================================
 # THE KERNEL KNOWS NOTHING ABOUT SOUND CARDS.
 #
-# This is the case that keeps the project's premise true. talk-os is supposed to
+# This is the case that keeps the project's premise true. fable-os is supposed to
 # be handed an audio device it has never heard of and be able to say only "here
 # is an unclaimed PCI function, here are its BARs" — everything about how that
 # chip works has to come from the model, at run time, through the driver VM.
@@ -9,7 +9,7 @@
 # The kernel used to ship a hand-written AC'97 driver (a DRV_LEVEL_LATE driver
 # that claimed the device, reset the codec and played a tone before anyone could
 # type a sentence). That is now a test fixture, built only by cases/ac97.case
-# under -DTALKOS_AC97_REFERENCE, and THIS case boots the kernel an operator
+# under -DFABLEOS_AC97_REFERENCE, and THIS case boots the kernel an operator
 # actually gets with the same hardware attached and asserts the opposite:
 #
 #   * two audio-class devices are enumerated (AC'97 is class 04:01, Intel HDA is

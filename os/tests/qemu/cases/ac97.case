@@ -1,7 +1,7 @@
 # =========================================================================
 # A driver written in the driver VM's ISA, driving real hardware.
 #
-# THIS CASE BOOTS A KERNEL THE OPERATOR DOES NOT GET. talk-os must know nothing
+# THIS CASE BOOTS A KERNEL THE OPERATOR DOES NOT GET. fable-os must know nothing
 # about an attached sound card — that is the premise, and a shipped AC'97 driver
 # would both contradict it and pre-empt the experiment by claiming the device
 # before anyone can type a sentence. So the reference bring-up lives in
@@ -51,7 +51,7 @@ qemu-extra: -audiodev none,id=snd0 -device AC97,audiodev=snd0
 
 # The fixture build. Without this the kernel has no audio driver whatsoever and
 # every assertion below is absent, which is exactly the point of the flag.
-build-cflags: -DTALKOS_AC97_REFERENCE
+build-cflags: -DFABLEOS_AC97_REFERENCE
 
 ready: ^> 
 ready [offline]: \[net init failed

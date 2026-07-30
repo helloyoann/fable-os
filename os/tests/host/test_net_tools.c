@@ -93,7 +93,7 @@ static struct {
  * the WRONG reason, and then the verbatim-key half of the guard would be
  * untested. Both halves are exercised separately below. */
 static const char *FAKE_KEY =
-    "TALKOS-TEST-SECRET-0000-not-a-real-credential-0000";
+    "FABLEOS-TEST-SECRET-0000-not-a-real-credential-0000";
 static int key_installed = 1;
 
 static const char *fake_secret(void) { return key_installed ? FAKE_KEY : ""; }
@@ -600,7 +600,7 @@ static void test_secret_never_sent(void) {
     CHECK_EQ(fake.sends, before);
 
     /* THE REFUSAL MUST NOT BE AN ORACLE: no fragment of the key comes back. */
-    CHECK(strstr(res_buf, "TALKOS-TEST-SECRET") == NULL);
+    CHECK(strstr(res_buf, "FABLEOS-TEST-SECRET") == NULL);
 
     /* and the cumulative leak counter has never moved */
     CHECK_EQ(fake.leaked, 0);

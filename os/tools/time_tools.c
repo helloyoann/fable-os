@@ -59,9 +59,9 @@
  * expand. Export a named pointer per tool instead; tests/host/test_rtc.c stands
  * in for the linker and builds the table from those. Kernel builds are
  * untouched. */
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 #undef  REGISTER_TOOL
-#define REGISTER_TOOL(var) const tool_t *const talkos_hosttool_##var = &(var)
+#define REGISTER_TOOL(var) const tool_t *const fableos_hosttool_##var = &(var)
 #endif
 
 /* ====================================================================== */

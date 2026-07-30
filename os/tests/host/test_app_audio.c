@@ -68,7 +68,7 @@
 /* Only the app tool: action=caps is the page that teaches this statement, and its
  * result has to fit CHAT_TOOL_RESULT_CAP or the model reads half a specification.
  * That is asserted below, through the real tool_dispatch(). */
-extern const tool_t *const talkos_hosttool_app_tool;
+extern const tool_t *const fableos_hosttool_app_tool;
 
 #if defined(__APPLE__)
 #  define SYMPFX "_"
@@ -201,7 +201,7 @@ static void fixture(void) {
     kcap_reset();
     trace_reset();
     base = *app_stats();
-    __start_tool_table[0] = talkos_hosttool_app_tool;
+    __start_tool_table[0] = fableos_hosttool_app_tool;
 }
 
 static app_error_t g_err;
@@ -323,7 +323,7 @@ static void test_the_capability_statement_compiles(void) {
 /* The .json on disk and the string the kernel embeds must be the same bytes, or
  * the example a model is shown is not the example that was tested. */
 static void test_the_example_matches_the_file_on_disk(void) {
-    const char *root = getenv("TALKOS_SRCDIR") ? getenv("TALKOS_SRCDIR") : ".";
+    const char *root = getenv("FABLEOS_SRCDIR") ? getenv("FABLEOS_SRCDIR") : ".";
     char        path[512];
     snprintf(path, sizeof path, "%s/apps/examples/beeper.json", root);
 

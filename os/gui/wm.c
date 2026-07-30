@@ -42,7 +42,7 @@
 #include "fb.h"
 #include "font.h"
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 #include "kernel.h"
 #endif
 
@@ -100,7 +100,7 @@ const gui_stats_t *gui_stats(void) { return &st; }
 /* ---- the console's cursor and its scroll counter -------------------------
  * In the kernel both come from lib/base.c; on the host a test supplies them,
  * which is what makes the scroll case assertable without a console at all. */
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 static int      host_cur_row, host_cur_col;
 static uint64_t host_scrolls;
 void gui_test_set_console_cursor(int row, int col) {
@@ -302,7 +302,7 @@ static void set_pointer_visible(int v) {
     v = !!v;
     if (v == !!ptr_visible) return;
     ptr_visible = v;
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     if (!v && mouse_present()) (void)mouse_stop();
 #endif
     damage_rect(cursor_rect());
@@ -647,7 +647,7 @@ static void set_title(gui_window_t *w, const char *title) {
 static void pointer_first_use(void) {
     if (pointer_announced) return;
     pointer_announced = 1;
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     if (dst) {
         /* The driver's clamp box defaults to the VGA text geometry (720x400),
          * which is wrong for this framebuffer: without this the pointer could
@@ -843,7 +843,7 @@ static int deliver(gui_window_t *w, gui_widget_t *wd, gui_event_t *ev) {
     if (!w) return 0;
     ev->window = w->id;
     ev->widget = wd ? wd->id : 0;
-#if defined(TALKOS_GUI_SELFTEST) && !defined(TALKOS_HOSTTEST)
+#if defined(FABLEOS_GUI_SELFTEST) && !defined(FABLEOS_HOSTTEST)
     /* Diagnostic builds only: this is how a click from a real mouse is shown to
      * have reached the right widget. The label comes from the app, never from
      * the model, and kprintf puts "gui: " in column zero, so this can never be
@@ -937,7 +937,7 @@ static void on_press(int32_t x, int32_t y, uint8_t buttons) {
         if (!(wd->state & (GUI_W_READONLY | GUI_W_DISABLED))) {
             grab_win = id;
             grab_idx = press_idx;
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
             kprintf("gui: the next line you type goes into \"%s\", not to the "
                     "model - one line only, then the prompt is yours again\n",
                     w->title);
@@ -1129,7 +1129,7 @@ int gui_take_line(const char *line, int len) {
     gui_invalidate_widget(w->id, wd);
     disarm_grab();
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     /* Deliberately does NOT echo the line: it is operator text, and the one
      * thing nothing may do is put characters of someone else's choosing at the
      * start of a line that could be read as a kernel trace line (trace.h). */
@@ -1265,14 +1265,14 @@ static void console_sync(void) {
  * prompt. Nothing else polls during this window, so what it measures is the
  * click path rather than the race. See DECISION 4 in include/gui.h — the race is
  * a one-line fix in a file this module does not own. */
-#if defined(TALKOS_GUI_SELFTEST) && !defined(TALKOS_HOSTTEST)
-#ifndef TALKOS_GUI_WATCH_MS
-#  define TALKOS_GUI_WATCH_MS 15000u
+#if defined(FABLEOS_GUI_SELFTEST) && !defined(FABLEOS_HOSTTEST)
+#ifndef FABLEOS_GUI_WATCH_MS
+#  define FABLEOS_GUI_WATCH_MS 15000u
 #endif
 static void selftest_watch(void) {
     kprintf("gui: watch %u ms - move the pointer and click; nothing else polls "
-            "the 8042 while this runs\n", (unsigned)TALKOS_GUI_WATCH_MS);
-    uint64_t deadline = millis() + TALKOS_GUI_WATCH_MS;
+            "the 8042 while this runs\n", (unsigned)FABLEOS_GUI_WATCH_MS);
+    uint64_t deadline = millis() + FABLEOS_GUI_WATCH_MS;
     while (millis() < deadline) {
         mouse_event_t ev;
         for (int i = 0; i < GUI_EVENT_BUDGET && mouse_next_event(&ev); i++)
@@ -1298,7 +1298,7 @@ void gui_sync(void) {
 void gui_tick(void) {
     if (!dst) return;
 
-#if defined(TALKOS_GUI_SELFTEST) && !defined(TALKOS_HOSTTEST)
+#if defined(FABLEOS_GUI_SELFTEST) && !defined(FABLEOS_HOSTTEST)
     /* Open the reference apps once, here rather than in kernel/main.c, so a
      * diagnostic build needs no edit to the boot path at all — and so the
      * windows appear after every line of boot output, at the prompt. */
@@ -1313,7 +1313,7 @@ void gui_tick(void) {
 #endif
 
     if (gui_active()) {
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
         /* Gated on the pointer being SHOWN, not merely on a window existing, so
          * that gui_pointer_show(0) really does stop all AUX traffic. That is the
          * operator's escape hatch from the kbd.c hazard in DECISION 4: with the
@@ -1333,7 +1333,7 @@ void gui_tick(void) {
 /* kernel bring-up                                                        */
 /* ====================================================================== */
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 
 void gui_init(void) {
     fb_surface_t *s = fb_back();

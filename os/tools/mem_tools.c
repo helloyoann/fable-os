@@ -160,9 +160,9 @@
  * expand. Export a named pointer per tool instead; tests/host/test_mem_tools.c
  * stands in for the linker and builds the table from those. Kernel builds are
  * untouched. */
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 #undef  REGISTER_TOOL
-#define REGISTER_TOOL(var) const tool_t *const talkos_hosttool_##var = &(var)
+#define REGISTER_TOOL(var) const tool_t *const fableos_hosttool_##var = &(var)
 #endif
 
 /* ====================================================================== */
@@ -174,7 +174,7 @@
 #define MEM_ADDR_TEXT_MAX   34    /* "0x" + 16 hex digits + slack + NUL  */
 #define MEM_TAIL_RESERVE   160u   /* room kept free for the truncation notice */
 
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 /* Host builds have no kernel image to point at. The window starts empty (every
  * read refused) and a test aims it at a canary-guarded buffer, so the real
  * bounds logic is what the tests exercise. */
@@ -193,7 +193,7 @@ extern char __bss_end[];
 #endif
 
 static void mem_window(uint64_t *lo, uint64_t *hi) {
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
     *lo = host_win_lo;
     *hi = host_win_hi;
 #else
@@ -516,7 +516,7 @@ static int t_mem_map(const tool_call_t *call, tool_result_t *r) {
     fmt_addr(a_lo, lo);
     fmt_addr(a_hi, hi);
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     char a_bss[MEM_ADDR_TEXT_MAX];
     fmt_addr(a_bss, (uint64_t)(uintptr_t)__bss_start);
     tool_result_printf(r,

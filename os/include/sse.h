@@ -84,8 +84,8 @@
  *   caller's static, never on the 64 KiB kernel stack.
  *
  * BUILD
- *   Compiled into the kernel always; only *used* under -DTALKOS_STREAM (see the
- *   TALKOS_STREAM blocks in net/net.c). The default build sends no
+ *   Compiled into the kernel always; only *used* under -DFABLEOS_STREAM (see the
+ *   FABLEOS_STREAM blocks in net/net.c). The default build sends no
  *   "stream":true and takes the buffered path, byte for byte as before.
  *
  * SCOPE, AND THE ONE THING STILL OWED
@@ -109,7 +109,7 @@
  *   reassembly, the HTTP sniff and the byte-at-a-time equivalence are proven
  *   exhaustively there. LIVE streaming against api.anthropic.com is UNPROVEN
  *   and has never been run: the streaming path is only reachable under
- *   -DTALKOS_STREAM, no build target sets it, and the keyless boot every test
+ *   -DFABLEOS_STREAM, no build target sets it, and the keyless boot every test
  *   uses gets a 401, which is not an event stream. The 401 does exercise the
  *   content-type sniff and the verbatim buffering fallback end to end, which is
  *   the half of the path a keyless build can reach.

@@ -401,7 +401,7 @@ static int dma_reachable(char *why, size_t cap) {
                  (unsigned long)AUDIO_PCM_BYTES);
         return 0;
     }
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     if (audio_dma_reachable(base, audio_region_bytes())) return 1;
     snprintf(why, cap,
              "the DMA arena is at 0x%lx, which a 32-bit bus master cannot reach; "
@@ -1059,7 +1059,7 @@ static int audio_service_init(void) {
  * host toolchain. Nothing is lost — the only thing behind the macro is the boot
  * line, whose whole claim is about a finished boot, and `make test-qemu` is what
  * proves that. Everything the host suite tests is above this point. */
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 static const driver_t audio_service_driver = {
     .name  = "audio",
     .level = DRV_LEVEL_LATE,

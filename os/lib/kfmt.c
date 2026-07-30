@@ -55,11 +55,11 @@
 
 /* A host test cannot define a second `vsnprintf` alongside the platform libc's
  * — the declarations collide and the linker would pick one arbitrarily. Under
- * TALKOS_HOSTTEST the kernel formatter therefore takes a private name, so a
+ * FABLEOS_HOSTTEST the kernel formatter therefore takes a private name, so a
  * suite can link BOTH and print the same format string through each. The kernel
  * build is untouched by this: there the symbols are plain vsnprintf/snprintf,
  * which is what mbedTLS and lwIP link against. */
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 #define vsnprintf kfmt_vsnprintf
 #define snprintf  kfmt_snprintf
 #endif

@@ -6,8 +6,8 @@
  *   exactly one of them — the Anthropic API key — and needs it to arrive
  *   WITHOUT ever being part of a build artifact.
  *
- *   Before this existed the key was compiled in (`-DTALKOS_API_KEY`), which put
- *   it inside net.o, kernel.elf, kernel.bin, talkos.iso and the .build-flags
+ *   Before this existed the key was compiled in (`-DFABLEOS_API_KEY`), which put
+ *   it inside net.o, kernel.elf, kernel.bin, fableos.iso and the .build-flags
  *   stamp. That is a secret in five files that a `git add -f`, a CI cache or a
  *   shared build directory publishes. A .gitignore is not a safety property.
  *   Now the key travels host -> guest at RUN time, over I/O ports, into RAM
@@ -28,7 +28,7 @@
  *     u32be count
  *     count x { u32be size; u16be select; u16 reserved; char name[56]; }
  *
- *   Custom blobs (`qemu -fw_cfg name=opt/talkos/apikey,file=...`) are required
+ *   Custom blobs (`qemu -fw_cfg name=opt/fableos/apikey,file=...`) are required
  *   by QEMU to live under "opt/", which is exactly the namespace reserved for
  *   things firmware does not define. No leading slash.
  *
@@ -74,13 +74,13 @@
  *   tests/host/test_fwcfg.c drives a synthetic fw_cfg with no QEMU.
  *
  * FUTURE EXTENSION POINTS
- *   - fwcfg_read_file() is generic: any future blob under opt/talkos (a static
+ *   - fwcfg_read_file() is generic: any future blob under opt/fableos (a static
  *     IP, a system prompt, a DVM program to run at boot) is one call, no code.
  *   - The DMA interface belongs here if a blob ever gets big enough to care —
  *     it is a strictly additive fast path behind the same function.
  *   - Writable fw_cfg entries would let the guest hand results back to the
  *     host; nothing needs that yet and it is a channel out, so it stays shut.
- *   - REAL HARDWARE HAS NO fw_cfg. A physical machine booted from talkos.iso
+ *   - REAL HARDWARE HAS NO fw_cfg. A physical machine booted from fableos.iso
  *     reports "no fw_cfg interface", gets no key, and every request it makes
  *     is answered 401. Giving it one needs a different channel — a prompt on
  *     the console (which puts the key in the scrollback of a machine whose only
@@ -116,7 +116,7 @@
 
 /* The key blob and the buffer it lands in. Anthropic keys are ~108 characters;
  * 512 leaves room for a longer scheme without leaving room for a mistake. */
-#define FWCFG_APIKEY_FILE "opt/talkos/apikey"
+#define FWCFG_APIKEY_FILE "opt/fableos/apikey"
 #define FWCFG_KEY_MAX     512
 
 /* Status codes. Negative is a failure, and every one of them is a sentence the

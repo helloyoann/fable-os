@@ -67,9 +67,9 @@
 /* On the host, Mach-O rejects a bare section name, so REGISTER_TOOL cannot
  * expand. Export a named pointer instead; tests/host/test_app.c stands in for
  * the linker. Kernel builds are untouched. */
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 #undef  REGISTER_TOOL
-#define REGISTER_TOOL(var) const tool_t *const talkos_hosttool_##var = &(var)
+#define REGISTER_TOOL(var) const tool_t *const fableos_hosttool_##var = &(var)
 #endif
 
 #define COORD_LIMIT  100000

@@ -37,7 +37,7 @@
  * TOLD.
  * ============================================================================
  *   Certificate verification in this kernel is flag-gated to a handful of roots
- *   pinned for api.anthropic.com (net/tls_ca.c, TALKOS_VERIFY_CERTS). Neither
+ *   pinned for api.anthropic.com (net/tls_ca.c, FABLEOS_VERIFY_CERTS). Neither
  *   available state is right for an arbitrary host: the default build trusts
  *   nothing and verifies nothing, and the verifying build trusts only Anthropic's
  *   issuers, so a fetch of example.com fails there with BADCERT_NOT_TRUSTED.
@@ -260,7 +260,7 @@ typedef struct fetch_ifstat {
     char     api_host[FETCH_HOST_MAX];
     int      api_resolved;
     char     api_ip[FETCH_IP_MAX];
-    int      verify_build;      /* was this kernel built with TALKOS_VERIFY_CERTS? */
+    int      verify_build;      /* was this kernel built with FABLEOS_VERIFY_CERTS? */
     int      trust_roots;       /* how many roots the trust store carries       */
 } fetch_ifstat_t;
 

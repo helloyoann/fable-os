@@ -44,7 +44,7 @@
 #include <string.h>
 #include <limits.h>
 
-/* lib/kfmt.c renames itself under TALKOS_HOSTTEST so it can be linked next to
+/* lib/kfmt.c renames itself under FABLEOS_HOSTTEST so it can be linked next to
  * the platform libc. These are the real kernel entry points. */
 int kfmt_vsnprintf(char *str, size_t size, const char *fmt, va_list ap);
 int kfmt_snprintf(char *str, size_t size, const char *fmt, ...);

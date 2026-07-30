@@ -73,7 +73,7 @@
  *
  * DEPENDENCIES
  *   font.h for glyphs and UTF-8. io.h and the multiboot info structure only
- *   inside the hardware half, which is compiled out under TALKOS_HOSTTEST so the
+ *   inside the hardware half, which is compiled out under FABLEOS_HOSTTEST so the
  *   drawing half is testable natively.
  *
  * FUTURE EXTENSION POINTS

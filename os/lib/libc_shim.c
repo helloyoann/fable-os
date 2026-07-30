@@ -34,10 +34,10 @@ char *strchr(const char *s, int c) {
 /* NOT dead code, however it looks from a default build. mbedTLS's PEM decoder
  * (mbedtls_pem_read_buffer) and mbedtls_x509_crt_parse call strstr to find the
  * "-----BEGIN ..." delimiters, and include/mbedtls_config.h only defines
- * MBEDTLS_PEM_PARSE_C under TALKOS_VERIFY_CERTS. So `nm -u` over a default
+ * MBEDTLS_PEM_PARSE_C under FABLEOS_VERIFY_CERTS. So `nm -u` over a default
  * build's objects reports no caller, deleting this looks safe, every
  * translation unit still compiles because port/string.h declares it — and
- * `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS` fails at LINK time with three
+ * `make EXTRA_CFLAGS=-DFABLEOS_VERIFY_CERTS` fails at LINK time with three
  * undefined references. That happened. The documented security-hardening build
  * is the one thing an unbounded-by-construction primitive earns its place for;
  * if it is ever removed again, remove MBEDTLS_PEM_PARSE_C's users first. */

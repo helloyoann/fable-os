@@ -1,13 +1,13 @@
 /* app_audio_selftest.c — an app asks the kernel for a sound, on real hardware.
  *
  * ============================================================================
- * COMPILED OUT OF EVERY NORMAL BUILD. Without -DTALKOS_APP_AUDIO_SELFTEST this
+ * COMPILED OUT OF EVERY NORMAL BUILD. Without -DFABLEOS_APP_AUDIO_SELFTEST this
  * file compiles to nothing at all: no driver is registered, so nothing in the
  * boot path can reach it, and the null sink below cannot exist in a shipped
  * kernel.
  * ============================================================================
  *
- *     make EXTRA_CFLAGS=-DTALKOS_APP_AUDIO_SELFTEST && ./capture.sh 14
+ *     make EXTRA_CFLAGS=-DFABLEOS_APP_AUDIO_SELFTEST && ./capture.sh 14
  *
  * WHY IT HAS TO EXIST
  *   apps/cap.c is provable on the host: the statement compiles, the bounds hold,
@@ -48,7 +48,7 @@
  *   it with no edit, because this file supplies nothing but a sink.
  */
 
-#if defined(TALKOS_APP_AUDIO_SELFTEST) && !defined(TALKOS_HOSTTEST)
+#if defined(FABLEOS_APP_AUDIO_SELFTEST) && !defined(FABLEOS_HOSTTEST)
 
 #include "app.h"
 #include "audio.h"
@@ -302,6 +302,6 @@ REGISTER_DRIVER(app_audio_selftest_driver);
 
 /* Keeps this translation unit non-empty in a normal build, where the whole file
  * above compiles to nothing. */
-typedef int talkos_app_audio_selftest_not_built_t;
+typedef int fableos_app_audio_selftest_not_built_t;
 
 #endif

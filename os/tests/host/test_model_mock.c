@@ -20,7 +20,7 @@
 
 static const char *REPLY_OK =
     "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\","
-    "\"content\":[{\"type\":\"text\",\"text\":\"talk-os online\"}],"
+    "\"content\":[{\"type\":\"text\",\"text\":\"fable-os online\"}],"
     "\"stop_reason\":\"end_turn\"}";
 
 static const char *REPLY_401 =
@@ -63,7 +63,7 @@ static void test_queue_and_send(void) {
     char text[128];
     CHECK_EQ(json_parse(r.body, r.body_len, &root), JSON_OK);
     CHECK_EQ(json_msg_text(&root, text, sizeof text, NULL), JSON_OK);
-    CHECK_STR(text, "talk-os online");
+    CHECK_STR(text, "fable-os online");
 }
 
 static void test_error_statuses_are_not_transport_errors(void) {

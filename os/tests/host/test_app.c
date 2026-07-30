@@ -58,11 +58,11 @@
 /* stand in for the linker-collected tool table                           */
 /* ====================================================================== */
 
-extern const tool_t *const talkos_hosttool_app_tool;
-extern const tool_t *const talkos_hosttool_gui_list_tool;
-extern const tool_t *const talkos_hosttool_gui_open_tool;
-extern const tool_t *const talkos_hosttool_gui_window_tool;
-extern const tool_t *const talkos_hosttool_gui_click_tool;
+extern const tool_t *const fableos_hosttool_app_tool;
+extern const tool_t *const fableos_hosttool_gui_list_tool;
+extern const tool_t *const fableos_hosttool_gui_open_tool;
+extern const tool_t *const fableos_hosttool_gui_window_tool;
+extern const tool_t *const fableos_hosttool_gui_click_tool;
 
 #if defined(__APPLE__)
 #  define SYMPFX "_"
@@ -83,11 +83,11 @@ _Static_assert(sizeof(__start_tool_table) == 40,
 /* gui_click is linked in so the transcript can press the app's keys exactly as
  * the model would; the other GUI tools come with it in one file. */
 static void install_tool_table(void) {
-    __start_tool_table[0] = talkos_hosttool_app_tool;
-    __start_tool_table[1] = talkos_hosttool_gui_list_tool;
-    __start_tool_table[2] = talkos_hosttool_gui_open_tool;
-    __start_tool_table[3] = talkos_hosttool_gui_window_tool;
-    __start_tool_table[4] = talkos_hosttool_gui_click_tool;
+    __start_tool_table[0] = fableos_hosttool_app_tool;
+    __start_tool_table[1] = fableos_hosttool_gui_list_tool;
+    __start_tool_table[2] = fableos_hosttool_gui_open_tool;
+    __start_tool_table[3] = fableos_hosttool_gui_window_tool;
+    __start_tool_table[4] = fableos_hosttool_gui_click_tool;
 }
 
 /* ====================================================================== */

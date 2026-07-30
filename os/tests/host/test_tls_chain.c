@@ -9,11 +9,11 @@
  *
  * The consequence was that the entire opt-in verified configuration had zero
  * automated coverage of any kind — not even a compile check. Nothing in the tree
- * built with -DTALKOS_VERIFY_CERTS: no host test, no QEMU case, no target. You
+ * built with -DFABLEOS_VERIFY_CERTS: no host test, no QEMU case, no target. You
  * could turn a path-validation check off and `make test` stayed green.
  *
  * This suite links the REAL vendored mbedTLS, with the kernel's own
- * include/mbedtls_config.h and TALKOS_VERIFY_CERTS defined, against the REAL
+ * include/mbedtls_config.h and FABLEOS_VERIFY_CERTS defined, against the REAL
  * net/tls_ca.c bundle and the REAL RTC driver, and asks mbedTLS for verdicts.
  * Fixtures are a small PKI generated once and embedded, so there is no network,
  * no openssl at test time, and no live certificate to expire.

@@ -621,7 +621,7 @@ fault_fix_t fault_apply_plan(fault_frame_t *frame,
  *
  * On the host build the same array holds a jmp_buf instead, which is why it is
  * sized generously there — see fault_guard_enter(). */
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 #define FAULT_GUARD_SLOTS 128
 #else
 #define FAULT_GUARD_SLOTS 8        /* rip, rsp, rbx, rbp, r12, r13, r14, r15 */

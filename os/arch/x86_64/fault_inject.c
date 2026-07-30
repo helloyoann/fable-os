@@ -21,8 +21,8 @@
  *        says so; the model cannot reach any of this.
  *     2. Nothing calls fault_inject() in a normal build. The only call site is
  *        fault_inject_selftest(), which is compiled out entirely unless
- *        TALKOS_FAULT_TEST is defined on the command line
- *        (`make EXTRA_CFLAGS=-DTALKOS_FAULT_TEST=FAULT_INJECT_PF_WRITE`).
+ *        FABLEOS_FAULT_TEST is defined on the command line
+ *        (`make EXTRA_CFLAGS=-DFABLEOS_FAULT_TEST=FAULT_INJECT_PF_WRITE`).
  *     3. Even with the flag, the self-test announces itself first, so a log can
  *        never be mistaken for a real crash.
  *
@@ -183,9 +183,9 @@ void fault_inject(fault_inject_kind_t kind) {
 /* the build-flag-gated boot self-test                                    */
 /* ====================================================================== */
 
-#ifdef TALKOS_FAULT_TEST
+#ifdef FABLEOS_FAULT_TEST
 /* Compiled in ONLY for a deliberate diagnostic build:
- *     make EXTRA_CFLAGS=-DTALKOS_FAULT_TEST=FAULT_INJECT_PF_WRITE
+ *     make EXTRA_CFLAGS=-DFABLEOS_FAULT_TEST=FAULT_INJECT_PF_WRITE
  * A normal build contains none of the code below and registers nothing.
  *
  * The hook is a DRV_LEVEL_LATE driver rather than a call bolted into
@@ -202,7 +202,7 @@ void fault_inject(fault_inject_kind_t kind) {
  *     being raised from the top of kernel_main.
  *
  * RECOVERY SCENARIOS
- *   Adding -DTALKOS_FAULT_RECOVER=N arms a plan before the injection, so the
+ *   Adding -DFABLEOS_FAULT_RECOVER=N arms a plan before the injection, so the
  *   whole Phase 3b path — arm, fault, validate, patch the live frame, IRETQ,
  *   keep booting — can be watched end to end on real hardware. Each N exists to
  *   demonstrate exactly one claim, and the claim it demonstrates is printed
@@ -245,13 +245,13 @@ void fault_inject(fault_inject_kind_t kind) {
  */
 #include "driver.h"
 
-#ifndef TALKOS_FAULT_RECOVER
-#define TALKOS_FAULT_RECOVER 0
+#ifndef FABLEOS_FAULT_RECOVER
+#define FABLEOS_FAULT_RECOVER 0
 #endif
 
-#if TALKOS_FAULT_RECOVER != 0
+#if FABLEOS_FAULT_RECOVER != 0
 static void announce(const char *claim) {
-    kprintf("\n[fault-recover] SCENARIO %d: %s\n", (int)TALKOS_FAULT_RECOVER,
+    kprintf("\n[fault-recover] SCENARIO %d: %s\n", (int)FABLEOS_FAULT_RECOVER,
             claim);
 }
 
@@ -264,7 +264,7 @@ static void arm(const fault_plan_t *p, const char *what) {
                 fault_fix_name(rc), fault_fix_desc(rc));
 }
 
-#if TALKOS_FAULT_RECOVER == 5
+#if FABLEOS_FAULT_RECOVER == 5
 #include "tool.h"
 
 /* Invoke a real tool through the real registry, into a caller-owned buffer, so
@@ -295,9 +295,9 @@ static size_t call_report(uint32_t seq, char *buf, size_t cap) {
 
 static char ring_buf_a[2048];
 static char ring_buf_b[2048];
-#endif  /* TALKOS_FAULT_RECOVER == 5 */
+#endif  /* FABLEOS_FAULT_RECOVER == 5 */
 
-#if TALKOS_FAULT_RECOVER == 6 || TALKOS_FAULT_RECOVER == 7
+#if FABLEOS_FAULT_RECOVER == 6 || FABLEOS_FAULT_RECOVER == 7
 #include "faultchat.h"
 #include "model.h"
 
@@ -437,25 +437,25 @@ static void show_plan(const char *when) {
             p->any_vector ? "any" : fault_vector_name(p->vector),
             (unsigned)p->uses);
 }
-#endif  /* TALKOS_FAULT_RECOVER == 6 || 7 */
-#endif  /* TALKOS_FAULT_RECOVER != 0 */
+#endif  /* FABLEOS_FAULT_RECOVER == 6 || 7 */
+#endif  /* FABLEOS_FAULT_RECOVER != 0 */
 
 static int fault_inject_driver_init(void) {
-    kputs("\n[fault-inject] TALKOS_FAULT_TEST build: raising one fault on "
+    kputs("\n[fault-inject] FABLEOS_FAULT_TEST build: raising one fault on "
           "purpose to exercise the IDT.\n");
 
-#if TALKOS_FAULT_RECOVER == 1
+#if FABLEOS_FAULT_RECOVER == 1
     announce("a #PF is SKIPPED and the machine keeps booting to the prompt");
     {
         fault_plan_t p = { .action = FAULT_ACT_SKIP, .any_vector = 0,
                            .vector = 14, .uses = 1 };
         arm(&p, "skip #PF once");
     }
-    fault_inject(TALKOS_FAULT_TEST);
+    fault_inject(FABLEOS_FAULT_TEST);
     kputs("[fault-recover] RESULT: control returned past the faulting "
           "instruction. Boot continues.\n");
 
-#elif TALKOS_FAULT_RECOVER == 2
+#elif FABLEOS_FAULT_RECOVER == 2
     announce("a register is WRITTEN in the live frame, then the instruction "
              "is skipped");
     {
@@ -464,11 +464,11 @@ static int fault_inject_driver_init(void) {
                            .uses = 1, .value = 0x00000000CAFEBABEULL };
         arm(&p, "set rax=0xCAFEBABE then skip");
     }
-    fault_inject(TALKOS_FAULT_TEST);
+    fault_inject(FABLEOS_FAULT_TEST);
     kputs("[fault-recover] RESULT: control returned past the faulting "
           "instruction. Boot continues.\n");
 
-#elif TALKOS_FAULT_RECOVER == 3
+#elif FABLEOS_FAULT_RECOVER == 3
     announce("a set_rip target OUTSIDE the kernel image must be REFUSED");
     {
         const fault_window_t *w = fault_window();
@@ -494,10 +494,10 @@ static int fault_inject_driver_init(void) {
         kputs("[fault-recover] plan cleared; the injected fault must now "
               "HALT.\n");
     }
-    fault_inject(TALKOS_FAULT_TEST);
+    fault_inject(FABLEOS_FAULT_TEST);
     kputs("[fault-recover] BUG: this line must never be reached.\n");
 
-#elif TALKOS_FAULT_RECOVER == 4
+#elif FABLEOS_FAULT_RECOVER == 4
     announce("a recovery that does not work must NOT loop forever");
     {
         /* Put the same unmapped address back into the register the faulting
@@ -512,10 +512,10 @@ static int fault_inject_driver_init(void) {
         kprintf("[fault-recover] the kernel must give up after %d attempts at "
                 "one address.\n", (int)FAULT_REFAULT_MAX);
     }
-    fault_inject(TALKOS_FAULT_TEST);
+    fault_inject(FABLEOS_FAULT_TEST);
     kputs("[fault-recover] BUG: this line must never be reached.\n");
 
-#elif TALKOS_FAULT_RECOVER == 5
+#elif FABLEOS_FAULT_RECOVER == 5
     announce("a fault during a fault_report call must not rewrite the record "
              "being reported");
     {
@@ -523,7 +523,7 @@ static int fault_inject_driver_init(void) {
                            .uses = FAULT_PLAN_USES_MAX };
         arm(&p, "skip, 16 uses");
     }
-    fault_inject(TALKOS_FAULT_TEST);              /* fault #1 */
+    fault_inject(FABLEOS_FAULT_TEST);              /* fault #1 */
     {
         size_t na = call_report(1, ring_buf_a, sizeof ring_buf_a);
         kprintf("[fault-recover] read report of fault #1 (%u bytes) and held "
@@ -548,7 +548,7 @@ static int fault_inject_driver_init(void) {
                 (unsigned)na, (unsigned)nb);
     }
 
-#elif TALKOS_FAULT_RECOVER == 6
+#elif FABLEOS_FAULT_RECOVER == 6
     announce("the kernel SURVIVES a fault, ASKS the model what it was, and "
              "arms the fix that comes back");
     {
@@ -565,7 +565,7 @@ static int fault_inject_driver_init(void) {
         arm(&boot, "bootstrap: skip one #PF, purely to survive long enough to "
                    "ask");
     }
-    fault_inject(TALKOS_FAULT_TEST);              /* fault #1 */
+    fault_inject(FABLEOS_FAULT_TEST);              /* fault #1 */
     show_plan("after the bootstrap plan was spent");
 
     kputs("\n[fault-diagnose] back in normal kernel context. The exception "
@@ -593,7 +593,7 @@ static int fault_inject_driver_init(void) {
             (unsigned)fault_count(), (unsigned)faultchat_diagnoses(),
             (unsigned)faultchat_fixes_armed());
 
-#elif TALKOS_FAULT_RECOVER == 7
+#elif FABLEOS_FAULT_RECOVER == 7
     announce("a fault raised WHILE a diagnosis is in flight must not recurse "
              "into the network stack");
     {
@@ -605,7 +605,7 @@ static int fault_inject_driver_init(void) {
                            .uses = FAULT_PLAN_USES_MAX };
         arm(&p, "skip, 16 uses");
     }
-    fault_inject(TALKOS_FAULT_TEST);              /* fault #1 */
+    fault_inject(FABLEOS_FAULT_TEST);              /* fault #1 */
     {
         int rc = faultchat_pump();
         kprintf("\n[fault-diagnose] pump returned %d (%s)\n", rc,
@@ -638,7 +638,7 @@ static int fault_inject_driver_init(void) {
     }
 
 #else
-    fault_inject(TALKOS_FAULT_TEST);
+    fault_inject(FABLEOS_FAULT_TEST);
 #endif
     return 0;
 }

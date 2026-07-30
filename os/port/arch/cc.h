@@ -1,4 +1,4 @@
-/* arch/cc.h — lwIP compiler/architecture abstraction for talk-os. */
+/* arch/cc.h — lwIP compiler/architecture abstraction for fable-os. */
 #ifndef LWIP_ARCH_CC_H
 #define LWIP_ARCH_CC_H
 

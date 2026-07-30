@@ -1,4 +1,4 @@
-/* ramfs.c — talk-os native filesystem, RAM-backed.
+/* ramfs.c — fable-os native filesystem, RAM-backed.
  *
  * PURPOSE
  *   The first real filesystem behind the VFS: a genuine implementation with its

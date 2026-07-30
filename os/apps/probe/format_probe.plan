@@ -1,10 +1,10 @@
 # Prove the format additions on real hardware: the examples render, and a tick
 # handler really advances over several seconds.
 #
-#   make EXTRA_CFLAGS=-DTALKOS_APP_FORMAT_SELFTEST
-#   TALKOS_ENV=/nonexistent gui/gui_probe.sh apps/probe/format_probe.plan /tmp/appfmt
+#   make EXTRA_CFLAGS=-DFABLEOS_APP_FORMAT_SELFTEST
+#   FABLEOS_ENV=/nonexistent gui/gui_probe.sh apps/probe/format_probe.plan /tmp/appfmt
 #
-# TALKOS_ENV points at a file that does not exist on purpose: this probe needs no
+# FABLEOS_ENV points at a file that does not exist on purpose: this probe needs no
 # API key (nothing here talks to the model), and a probe that reads the operator's
 # key when it does not need it is a probe that can lose it.
 #

@@ -1348,12 +1348,12 @@ static const struct { uint16_t lo, hi; const char *why; } port_deny[] = {
  * 0xB8000 (which shares a 2 MiB huge page with page 0 and so can never be
  * unmapped), the kernel image, and the heap arena in .bss. Rounded up to a huge
  * page. No MMIO window may start below this. */
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 extern char __bss_end[];                 /* provided by linker.ld */
 #endif
 
 static uint64_t kernel_top(void) {
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     uint64_t e = (uint64_t)(uintptr_t)__bss_end;
     e = (e + 0x1FFFFFull) & ~0x1FFFFFull;
     return e < 0x1000000ull ? 0x1000000ull : e;
@@ -1663,7 +1663,7 @@ dvm_status_t dvm_policy_check(const dvm_policy_t *p, char *msg, size_t cap) {
                     (unsigned long)abase, (unsigned long)asize);
             return DVM_TRAP_POLICY;
         }
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
         /* Only the low 4 GiB is mapped, and a 32-bit bus master cannot address
          * anything else, so an arena that landed higher would be a buffer no
          * device could reach — silence, with no error anywhere. It is placed in
@@ -3271,7 +3271,7 @@ dvm_status_t dvm_run(const dvm_program_t *p, const dvm_policy_t *pol,
 /* 7. the hardware backend                                                */
 /* ====================================================================== */
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 
 #include "io.h"
 #include "pci.h"

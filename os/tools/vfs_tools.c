@@ -104,7 +104,7 @@
  * and has no __start_/__stop_ symbols, so the host build uses the equivalent
  * "__DATA,tool_table" spelling and tests/host/test_vfs_tools.c supplies the
  * matching boundary symbols. The kernel build takes the normal path untouched. */
-#if defined(TALKOS_HOSTTEST) && defined(__APPLE__)
+#if defined(FABLEOS_HOSTTEST) && defined(__APPLE__)
 #  define REGISTER_VFS_TOOL(v)                                                 \
       static const tool_t *const __toolptr_##v                                 \
           __attribute__((used, section("__DATA,tool_table"))) = &(v)

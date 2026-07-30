@@ -169,12 +169,12 @@ static void install(const fdev_t *dev) {
     g_off = 0;
 }
 
-/* The common case: a QEMU that offers one blob under opt/talkos/apikey. */
+/* The common case: a QEMU that offers one blob under opt/fableos/apikey. */
 static void install_key(const char *raw) {
     fdev_t d = { "QEMU", 0x3, 0, -1, {
         { "etc/e820",           "\x01\x02\x03\x04", 4, 0, 0, 0 },
         { FWCFG_APIKEY_FILE,    raw,               -1, 0, 0, 0 },
-        { "opt/talkos/unused",  "later",           -1, 0, 0, 0 },
+        { "opt/fableos/unused",  "later",           -1, 0, 0, 0 },
         { 0, 0, 0, 0, 0, 0 },
     } };
     install(&d);
@@ -195,7 +195,7 @@ static void test_absent_device(void) {
 
     char buf[16];
     uint32_t n = 123;
-    CHECK_EQ(fwcfg_read_file("opt/talkos/apikey", buf, sizeof buf, &n), FWCFG_ENODEV);
+    CHECK_EQ(fwcfg_read_file("opt/fableos/apikey", buf, sizeof buf, &n), FWCFG_ENODEV);
     CHECK_EQ((int)n, 0);
 
     CHECK_EQ(fwcfg_apikey_load(), FWCFG_ENODEV);
@@ -262,7 +262,7 @@ static void test_read_found(void) {
 
     /* An entry that is not the first one, to prove the walk advances. */
     memset(buf, '?', sizeof buf);
-    CHECK_EQ(fwcfg_read_file("opt/talkos/unused", buf, sizeof buf, &n), FWCFG_OK);
+    CHECK_EQ(fwcfg_read_file("opt/fableos/unused", buf, sizeof buf, &n), FWCFG_OK);
     CHECK_EQ((int)n, 5);
     CHECK_EQ(memcmp(buf, "later", 5), 0);
 
@@ -291,15 +291,15 @@ static void test_read_missing(void) {
 
     char buf[32];
     uint32_t n = 7;
-    CHECK_EQ(fwcfg_read_file("opt/talkos/nothing", buf, sizeof buf, &n),
+    CHECK_EQ(fwcfg_read_file("opt/fableos/nothing", buf, sizeof buf, &n),
              FWCFG_ENOENT);
     CHECK_EQ((int)n, 0);
 
     /* A prefix of a real name is not that name. */
-    CHECK_EQ(fwcfg_read_file("opt/talkos/apike", buf, sizeof buf, &n),
+    CHECK_EQ(fwcfg_read_file("opt/fableos/apike", buf, sizeof buf, &n),
              FWCFG_ENOENT);
     /* Nor is a name that extends one. */
-    CHECK_EQ(fwcfg_read_file("opt/talkos/apikey2", buf, sizeof buf, &n),
+    CHECK_EQ(fwcfg_read_file("opt/fableos/apikey2", buf, sizeof buf, &n),
              FWCFG_ENOENT);
 }
 
@@ -359,7 +359,7 @@ static void test_dir_truncated(void) {
     fdev_t d = { "QEMU", 0x1, 6, 2, {
         { "etc/e820",        "\x01",     1, 0, 0, 0 },
         { FWCFG_APIKEY_FILE, "notkey-t", -1, 0, 0, 0 },
-        { "opt/talkos/gone", "nope",     -1, 0, 0, 0 },
+        { "opt/fableos/gone", "nope",     -1, 0, 0, 0 },
         { 0, 0, 0, 0, 0, 0 },
     } };
     install(&d);
@@ -371,7 +371,7 @@ static void test_dir_truncated(void) {
     uint32_t n = 0;
     CHECK_EQ(fwcfg_read_file(FWCFG_APIKEY_FILE, buf, sizeof buf, &n), FWCFG_OK);
     CHECK_EQ((int)n, 8);
-    CHECK_EQ(fwcfg_read_file("opt/talkos/gone", buf, sizeof buf, &n),
+    CHECK_EQ(fwcfg_read_file("opt/fableos/gone", buf, sizeof buf, &n),
              FWCFG_ENOENT);
 }
 

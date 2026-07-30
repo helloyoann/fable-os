@@ -34,7 +34,7 @@
 #include "gui.h"
 #include "widgets.h"
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 #include "kernel.h"
 #endif
 
@@ -426,8 +426,8 @@ uint32_t gui_demo_open(const char *name, const char **why) {
 /* The one thing a host test cannot prove is that a click from a REAL PS/2 mouse
  * reaches the right widget:
  *
- *   make EXTRA_CFLAGS=-DTALKOS_GUI_SELFTEST
- *   make EXTRA_CFLAGS='-DTALKOS_GUI_SELFTEST -DTALKOS_GUI_WATCH_MS=30000'
+ *   make EXTRA_CFLAGS=-DFABLEOS_GUI_SELFTEST
+ *   make EXTRA_CFLAGS='-DFABLEOS_GUI_SELFTEST -DFABLEOS_GUI_WATCH_MS=30000'
  *
  * On the first gui_tick() (i.e. at the prompt, after every line of boot output)
  * this opens the calculator and the notepad and prints the screen centre of
@@ -441,7 +441,7 @@ uint32_t gui_demo_open(const char *name, const char **why) {
  * Mirrors drivers/input/mouse.c's watch mode and drivers/acpi/power_selftest.c:
  * a diagnostic that has to run against hardware lives with the code it proves,
  * behind a flag, not in a test directory that cannot reach it. */
-#if defined(TALKOS_GUI_SELFTEST) && !defined(TALKOS_HOSTTEST)
+#if defined(FABLEOS_GUI_SELFTEST) && !defined(FABLEOS_HOSTTEST)
 
 static void print_hit_targets(uint32_t id) {
     gui_window_t *w = gui_window(id);
@@ -469,7 +469,7 @@ void gui_demo_selftest(void) {
     print_hit_targets(n);
 }
 
-#elif defined(TALKOS_GUI_SELFTEST)
+#elif defined(FABLEOS_GUI_SELFTEST)
 
 void gui_demo_selftest(void) { }
 

@@ -77,7 +77,7 @@
  * expand as it does in a kernel link. tests/host/tooltable.h supplies the same
  * table through the section$start builtins; including it here would drag the
  * test harness into the kernel, so the suite includes this .c file instead. */
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 #include "tooltable.h"
 #endif
 

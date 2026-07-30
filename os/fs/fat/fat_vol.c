@@ -514,7 +514,7 @@ int fat32_format(block_device_t *bd, const char *label) {
     fat_wr32(sec + BS_VolID, (uint32_t)millis() ^ 0x54414C4Bu);
     memset(sec + BS_VolLab, ' ', 11);
     {
-        const char *l = label ? label : "TALKOS";
+        const char *l = label ? label : "FABLEOS";
         for (int i = 0; i < 11 && l[i]; i++) {
             char c = l[i];
             if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
@@ -552,7 +552,7 @@ int fat32_format(block_device_t *bd, const char *label) {
     memset(sec, 0, sizeof sec);
     memset(sec, ' ', 11);
     {
-        const char *l = label ? label : "TALKOS";
+        const char *l = label ? label : "FABLEOS";
         for (int i = 0; i < 11 && l[i]; i++) {
             char c = l[i];
             if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');

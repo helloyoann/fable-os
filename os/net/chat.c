@@ -134,7 +134,7 @@
  * tests/host/test_chat.c pins as "the machine tells the model what it is".
  */
 static const char SYSTEM_PROMPT[] =
-    "You are the resident intelligence of talk-os, a bare-metal x86-64 kernel. "
+    "You are the resident intelligence of fable-os, a bare-metal x86-64 kernel. "
     "You are not an assistant running on the machine: you ARE its user "
     "interface. There is no shell, no commands, no filesystem browser and no "
     "other way for the operator to drive this computer. A sentence typed at the "
@@ -883,7 +883,7 @@ static void print_stop_warning(const json_value_t *root) {
  *
  * EVERY BYTE IN HERE IS CHOSEN BY THE FAR END, so all three of them go through
  * print_untrusted_n. That is not paranoia about Anthropic: certificate
- * verification is off unless TALKOS_VERIFY_CERTS is set, so "the far end" is
+ * verification is off unless FABLEOS_VERIFY_CERTS is set, so "the far end" is
  * anything that can answer on 443 — and this is the path the machine takes on
  * every keyless boot, since a missing key is a 401.
  *

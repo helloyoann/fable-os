@@ -15,7 +15,7 @@
  *     - the console's scroll moves the right pixels and blanks the right band.
  *
  *   The hardware half (multiboot tag, Bochs VBE, present) is compiled out under
- *   TALKOS_HOSTTEST and is covered by booting: tests/qemu and ./capture.sh.
+ *   FABLEOS_HOSTTEST and is covered by booting: tests/qemu and ./capture.sh.
  *
  * THE FONT IS PINNED BY VALUE, NOT BY REFERENCE
  *   Several checks hardcode glyph bitmaps (em dash, box vertical, 'A'). Asking

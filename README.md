@@ -1,4 +1,4 @@
-# talk-os
+# fable-os
 
 A from-scratch x86_64 kernel whose **only human interface is a sentence**. There
 is no shell, no commands, no `ls` and no `cat` — there is not one `strcmp` on the
@@ -150,11 +150,11 @@ Without a key (just `make run` with no `.env`), the kernel still completes the
 TLS handshake and the API returns `401` — which proves HTTPS works, just without
 an answer.
 
-**The key is not a build input.** There is no `KEY=` and no `-DTALKOS_API_KEY`;
+**The key is not a build input.** There is no `KEY=` and no `-DFABLEOS_API_KEY`;
 `make KEY=...` is a hard error. `os/.env` is gitignored and is the only file that
 holds it. `make run` hands it to the guest at boot over QEMU's `fw_cfg` channel,
 via a mode-0600 temp file outside the repository that is deleted however the run
-ends, so no build artifact — not `net.o`, not `kernel.bin`, not `talkos.iso` —
+ends, so no build artifact — not `net.o`, not `kernel.bin`, not `fableos.iso` —
 can contain it. The kernel reports how many bytes arrived and never the bytes.
 See [`os/README.md`](os/README.md#the-api-key-never-enters-the-build).
 
@@ -168,7 +168,7 @@ anything that can answer on port 443. Don't send anything sensitive.
 Real verification is implemented and works, behind a build flag:
 
 ```sh
-cd os && make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS
+cd os && make EXTRA_CFLAGS=-DFABLEOS_VERIFY_CERTS
 ```
 
 That requires the chain to build to one of two **pinned** Google Trust Services

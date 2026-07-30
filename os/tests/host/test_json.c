@@ -35,7 +35,7 @@ static const char *SAMPLE =
     "{\"id\":\"msg_01ABC\",\"type\":\"message\",\"role\":\"assistant\","
     "\"model\":\"claude-opus-4-8\","
     "\"content\":["
-      "{\"type\":\"text\",\"text\":\"talk-os online\"},"
+      "{\"type\":\"text\",\"text\":\"fable-os online\"},"
       "{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"vfs_read\","
        "\"input\":{\"path\":\"/etc/motd\",\"max\":128,\"flags\":{\"raw\":true}}},"
       "{\"type\":\"text\",\"text\":\" and ready\"}"
@@ -385,7 +385,7 @@ static void test_truncation_never_overruns(void) {
     CHECK_EQ(json_count(&c), 3);
     char text[64];
     CHECK_EQ(json_msg_text(&root, text, sizeof text, NULL), JSON_OK);
-    CHECK_STR(text, "talk-os online and ready");
+    CHECK_STR(text, "fable-os online and ready");
     free(exact);
 }
 
@@ -584,8 +584,8 @@ static void test_message_helpers(void) {
 
     /* text blocks are concatenated, tool_use blocks skipped */
     CHECK_EQ(json_msg_text(&root, buf, sizeof buf, &n), JSON_OK);
-    CHECK_STR(buf, "talk-os online and ready");
-    CHECK_EQ(n, strlen("talk-os online and ready"));
+    CHECK_STR(buf, "fable-os online and ready");
+    CHECK_EQ(n, strlen("fable-os online and ready"));
 
     CHECK_EQ(json_msg_stop_reason(&root, buf, sizeof buf), JSON_OK);
     CHECK_STR(buf, "tool_use");

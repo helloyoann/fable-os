@@ -1,7 +1,7 @@
 # Prove the document-authored calculator works on real hardware.
 #
-#   make EXTRA_CFLAGS='-DTALKOS_APP_SELFTEST -DTALKOS_GUI_SELFTEST \
-#                      -DTALKOS_GUI_WATCH_MS=30000'
+#   make EXTRA_CFLAGS='-DFABLEOS_APP_SELFTEST -DFABLEOS_GUI_SELFTEST \
+#                      -DFABLEOS_GUI_WATCH_MS=30000'
 #   gui/gui_probe.sh apps/probe/calc_probe.plan /tmp/appcalc
 #
 # The coordinates below are the screen centres the kernel itself printed

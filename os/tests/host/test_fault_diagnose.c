@@ -50,17 +50,17 @@
 /* ====================================================================== */
 
 /* REGISTER_TOOL cannot expand on Mach-O, so tools/fault_tools.c exports a named
- * pointer per tool under TALKOS_HOSTTEST and this file stands in for the
+ * pointer per tool under FABLEOS_HOSTTEST and this file stands in for the
  * linker, feeding the REAL core/tool.c registry. Identical arrangement to
  * tests/host/test_fault.c — and it matters here, because faultchat_apply_fix()
  * reaches the plan through tool_dispatch("fault_recover") rather than through
  * fault_plan_arm(). If the tool is not registered, nothing is armed, and the
  * suite would be proving the wrong thing. */
-extern const tool_t *const talkos_hosttool_fault_status_tool;
-extern const tool_t *const talkos_hosttool_fault_report_tool;
-extern const tool_t *const talkos_hosttool_fault_history_tool;
-extern const tool_t *const talkos_hosttool_fault_decode_tool;
-extern const tool_t *const talkos_hosttool_fault_recover_tool;
+extern const tool_t *const fableos_hosttool_fault_status_tool;
+extern const tool_t *const fableos_hosttool_fault_report_tool;
+extern const tool_t *const fableos_hosttool_fault_history_tool;
+extern const tool_t *const fableos_hosttool_fault_decode_tool;
+extern const tool_t *const fableos_hosttool_fault_recover_tool;
 
 #if defined(__APPLE__)
 #  define SYMPFX "_"
@@ -79,11 +79,11 @@ _Static_assert(sizeof(__start_tool_table) == 40,
                "tool count changed: update the __stop_tool_table byte offset");
 
 static void tools_bind(void) {
-    __start_tool_table[0] = talkos_hosttool_fault_status_tool;
-    __start_tool_table[1] = talkos_hosttool_fault_report_tool;
-    __start_tool_table[2] = talkos_hosttool_fault_history_tool;
-    __start_tool_table[3] = talkos_hosttool_fault_decode_tool;
-    __start_tool_table[4] = talkos_hosttool_fault_recover_tool;
+    __start_tool_table[0] = fableos_hosttool_fault_status_tool;
+    __start_tool_table[1] = fableos_hosttool_fault_report_tool;
+    __start_tool_table[2] = fableos_hosttool_fault_history_tool;
+    __start_tool_table[3] = fableos_hosttool_fault_decode_tool;
+    __start_tool_table[4] = fableos_hosttool_fault_recover_tool;
 }
 
 /* ====================================================================== */

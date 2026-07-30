@@ -61,7 +61,7 @@
 #include <stdarg.h>
 #include <stdio.h>       /* vsnprintf / snprintf; port/stdio.h freestanding */
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 #include "rtc.h"         /* the default wall clock; see wall_default() below  */
 /* The machine's entropy source, already used to seed TLS (lib/libc_shim.c). It
  * is declared here rather than through an mbedTLS header because this file must
@@ -123,7 +123,7 @@ static app_ms_fn   src_ms;
 static app_wall_fn src_wall;
 static app_rand_fn src_rand;
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 static int wall_default(app_wall_t *out) {
     rtc_time_t t;
     if (rtc_read(&t) != RTC_OK) return -1;

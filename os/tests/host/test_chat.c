@@ -434,7 +434,7 @@ static void test_plain_answer(void) {
      * sentence — escaped, in a single user turn */
     CHECK_EQ(model_mock_request_count(), 1);
     const char *req = model_mock_request(0);
-    CHECK_CONTAINS(req, "\"system\":\"You are the resident intelligence of talk-os");
+    CHECK_CONTAINS(req, "\"system\":\"You are the resident intelligence of fable-os");
     CHECK_CONTAINS(req, "\"tools\":[");
     CHECK_CONTAINS(req, "\"name\":\"echo_tool\"");
     CHECK_CONTAINS(req, "\"input_schema\":{");

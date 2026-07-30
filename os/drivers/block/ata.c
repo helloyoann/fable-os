@@ -43,7 +43,7 @@
 #include "driver.h"
 #include <string.h>
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 #  include "io.h"
 #endif
 
@@ -58,7 +58,7 @@ typedef struct ata_io_ops {
     void    (*out16_rep)(uint16_t port, const void *buf, uint32_t words);
 } ata_io_ops_t;
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 static uint8_t hw_in8(uint16_t p) { return inb(p); }
 static void    hw_out8(uint16_t p, uint8_t v) { outb(p, v); }
 static void    hw_in16_rep(uint16_t p, void *buf, uint32_t words) {

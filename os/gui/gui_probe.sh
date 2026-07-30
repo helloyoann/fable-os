@@ -40,11 +40,11 @@ set -eu
 PLAN="${1:?usage: gui_probe.sh <plan-file> [out-prefix]}"
 OUT="${2:-/tmp/gui}"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-ENVFILE="${TALKOS_ENV:-$DIR/.env}"
+ENVFILE="${FABLEOS_ENV:-$DIR/.env}"
 
 MPORT=$(( 40000 + ($$ % 9000) ))
 SPORT=$(( 50000 + ($$ % 9000) ))
-QLOG="$(mktemp -t talkos-gui-qemu)"
+QLOG="$(mktemp -t fableos-gui-qemu)"
 SERIAL="$OUT.log"
 rm -f "$SERIAL"
 
@@ -67,11 +67,11 @@ fi
 
 set --
 if [ -n "$key" ]; then
-    KEYFILE=$(mktemp "${TMPDIR:-/tmp}/talkos-fwcfg.XXXXXXXX")
+    KEYFILE=$(mktemp "${TMPDIR:-/tmp}/fableos-fwcfg.XXXXXXXX")
     chmod 600 "$KEYFILE"
     printf '%s' "$key" > "$KEYFILE"
     key=
-    set -- -fw_cfg "name=opt/talkos/apikey,file=$KEYFILE"
+    set -- -fw_cfg "name=opt/fableos/apikey,file=$KEYFILE"
     echo "probe: api key handed to the guest over fw_cfg (never printed)"
 else
     echo "probe: no api key; the API will answer 401"

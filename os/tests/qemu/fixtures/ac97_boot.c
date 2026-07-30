@@ -2,7 +2,7 @@
  *               hardware. NOT PART OF ANY DEFAULT BUILD.
  *
  * WHY THIS FILE LIVES UNDER tests/ AND BEHIND A FLAG
- *   talk-os must be genuinely ignorant of the sound card an operator attaches.
+ *   fable-os must be genuinely ignorant of the sound card an operator attaches.
  *   That is the whole experiment: hand the model an unclaimed audio device and
  *   ask it to write the driver. A kernel that ships a hand-written AC'97 driver
  *   cannot run that experiment and cannot honestly claim the ignorance — the
@@ -13,7 +13,7 @@
  *     1. it is not in vm/ or drivers/ any more, it is under tests/qemu/, so no
  *        source list in the kernel build even mentions the path; and
  *     2. os/Makefile adds it to KERNEL_SRCS only when EXTRA_CFLAGS contains
- *        -DTALKOS_AC97_REFERENCE, and the #error below refuses to compile it
+ *        -DFABLEOS_AC97_REFERENCE, and the #error below refuses to compile it
  *        without that define, so it cannot arrive in an image by accident.
  *
  *   The default kernel therefore contains no audio driver at all: an attached
@@ -24,8 +24,8 @@
  *   `build-cflags:` line; tests/qemu/cases/audio-unclaimed.case asserts the
  *   opposite for the default build. Nothing else should ever define the flag.
  *
- *       make EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE
- *       make run EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE \
+ *       make EXTRA_CFLAGS=-DFABLEOS_AC97_REFERENCE
+ *       make run EXTRA_CFLAGS=-DFABLEOS_AC97_REFERENCE \
  *                QEMU_EXTRA="-device AC97,audiodev=a0 -audiodev coreaudio,id=a0"
  *
  *   (Both on ONE command line: EXTRA_CFLAGS is recorded in .build-flags, so
@@ -106,8 +106,8 @@
 /* Belt and braces with the Makefile's source-list gate. If this file is ever
  * added to a build without the flag, the build stops here rather than quietly
  * putting an audio driver into a kernel that is supposed to have none. */
-#ifndef TALKOS_AC97_REFERENCE
-#error "tests/qemu/fixtures/ac97_boot.c is a TEST FIXTURE: it is only built with EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE (see tests/qemu/cases/ac97.case). A default kernel must contain no audio driver."
+#ifndef FABLEOS_AC97_REFERENCE
+#error "tests/qemu/fixtures/ac97_boot.c is a TEST FIXTURE: it is only built with EXTRA_CFLAGS=-DFABLEOS_AC97_REFERENCE (see tests/qemu/cases/ac97.case). A default kernel must contain no audio driver."
 #endif
 
 #include "kernel.h"
@@ -297,7 +297,7 @@ static int ac97_init(void) {
     pci_dev_t d;
 
     /* THE ONLY WAY TO REACH THIS CODE is a build that asked for it by name.
-     * There used to be a -DTALKOS_AC97_UNCLAIMED escape hatch here that turned
+     * There used to be a -DFABLEOS_AC97_UNCLAIMED escape hatch here that turned
      * the bring-up OFF, which had the polarity backwards: the shipped kernel
      * drove the card and an opt-in flag made it behave. The gate is now the
      * other way round and lives in the Makefile, so the shipped kernel does not

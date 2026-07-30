@@ -219,7 +219,7 @@ static const char STREAM_TEXT[] =
 "data: {\"type\": \"ping\"}\n"
 "\n"
 "event: content_block_delta\n"
-"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"talk\"}}\n"
+"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"fable\"}}\n"
 "\n"
 "event: content_block_delta\n"
 "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"-os \"}}\n"
@@ -567,11 +567,11 @@ static void test_reassemble_text_turn(void) {
      * difference. */
     char text[512];
     CHECK_EQ(body_text(g_drv.out, len, text, sizeof text), JSON_OK);
-    CHECK_STR(text, "talk-os online");
+    CHECK_STR(text, "fable-os online");
 
     /* ...and the same text was echoed to the console as it arrived. */
-    CHECK_STR(g_drv.echo, "talk-os online");
-    CHECK_EQ((long long)sse_msg_text_bytes(&g_drv.m), 14);
+    CHECK_STR(g_drv.echo, "fable-os online");
+    CHECK_EQ((long long)sse_msg_text_bytes(&g_drv.m), (long long)strlen("fable-os online"));
     CHECK_EQ((long long)sse_msg_blocks(&g_drv.m), 1);
     CHECK_STR(sse_msg_stop_reason(&g_drv.m), "end_turn");
     CHECK(sse_msg_complete(&g_drv.m));
@@ -1052,8 +1052,8 @@ static void test_http_sse_response(void) {
 
         char text[256];
         CHECK_EQ(body_text(r.body, r.body_len, text, sizeof text), JSON_OK);
-        CHECK_STR(text, "talk-os online");
-        CHECK_STR(g_h.echo, "talk-os online");
+        CHECK_STR(text, "fable-os online");
+        CHECK_STR(g_h.echo, "fable-os online");
 
         if (c == 0) {
             memcpy(ref_body, r.body, r.body_len + 1);

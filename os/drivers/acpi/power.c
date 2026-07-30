@@ -54,7 +54,7 @@
 
 #include <stdio.h>          /* snprintf */
 
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 void kputs(const char *s);
 void kprintf(const char *fmt, ...);
 #else
@@ -127,7 +127,7 @@ static void prepare_default(acpi_power_op_t op, const char *reason) {
           "everything written this boot is lost\n");
     kputs("power: bringing drivers down through the lifecycle "
           "(drivers_suspend_all)\n");
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     drivers_suspend_all();
 #endif
     kprintf("power: drivers suspended. This machine is going %s now.\n",
@@ -150,7 +150,7 @@ static void unprepare(void) {
     kputs("power: nothing took effect, so this machine is still running with "
           "every driver suspended. Bringing them back up (drivers_resume_all) "
           "- otherwise the model could not be reached to be told.\n");
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
     drivers_resume_all();
 #endif
 }
@@ -304,7 +304,7 @@ int acpi_reboot(const char *reason)    { return power_go(ACPI_POWER_REBOOT, reas
 /* the driver                                                             */
 /* ====================================================================== */
 
-#ifndef TALKOS_HOSTTEST
+#ifndef FABLEOS_HOSTTEST
 /* Table discovery at BUS level: it needs the serial console (EARLY) to report
  * anything and nothing else at all. No device_create() call — ACPI is not a
  * device, and inventing a node for it would change the device tree every boot

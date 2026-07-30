@@ -2,7 +2,7 @@
  *                         periodic app actually tick, at boot.
  *
  * ============================================================================
- * COMPILED OUT OF EVERY NORMAL BUILD. Without -DTALKOS_APP_FORMAT_SELFTEST this
+ * COMPILED OUT OF EVERY NORMAL BUILD. Without -DFABLEOS_APP_FORMAT_SELFTEST this
  * file compiles to nothing at all: no driver is registered, so nothing in the
  * boot path can reach it.
  * ============================================================================
@@ -29,8 +29,8 @@
  *   at intervals, so "the clock advanced" is checkable from the log as well as
  *   from two PNGs, and a wrong value can be attributed without reading pixels.
  *
- *       make EXTRA_CFLAGS=-DTALKOS_APP_FORMAT_SELFTEST
- *       TALKOS_ENV=/nonexistent gui/gui_probe.sh apps/probe/format_probe.plan \
+ *       make EXTRA_CFLAGS=-DFABLEOS_APP_FORMAT_SELFTEST
+ *       FABLEOS_ENV=/nonexistent gui/gui_probe.sh apps/probe/format_probe.plan \
  *           /tmp/appfmt
  *
  * WHY IT IS A DRIVER AT DRV_LEVEL_LATE
@@ -48,7 +48,7 @@
  *   integration is done.
  */
 
-#if defined(TALKOS_APP_FORMAT_SELFTEST) && !defined(TALKOS_HOSTTEST)
+#if defined(FABLEOS_APP_FORMAT_SELFTEST) && !defined(FABLEOS_HOSTTEST)
 
 #include "app.h"
 #include "gui.h"
@@ -58,8 +58,8 @@
 /* Milliseconds of ticking to give the periodic apps. Long enough that two
  * screenshots several seconds apart must differ, short enough that the boot still
  * reaches the prompt. */
-#ifndef TALKOS_APP_FORMAT_MS
-#  define TALKOS_APP_FORMAT_MS 14000u
+#ifndef FABLEOS_APP_FORMAT_MS
+#  define FABLEOS_APP_FORMAT_MS 14000u
 #endif
 
 /* Where each window goes. Side by side rather than cascaded, because a screenshot
@@ -190,7 +190,7 @@ static int app_format_selftest_init(void) {
     for (int i = 0; i < NLAYOUT; i++) dump(ids[i]);
     gui_sync();
 
-    pump(TALKOS_APP_FORMAT_MS, "a clock and a stopwatch have to be seen moving");
+    pump(FABLEOS_APP_FORMAT_MS, "a clock and a stopwatch have to be seen moving");
     for (int i = 0; i < NLAYOUT; i++) dump(ids[i]);
 
     /* Stop the stopwatch: the display must then hold still while the clock beside
@@ -233,6 +233,6 @@ REGISTER_DRIVER(app_format_selftest_driver);
 
 /* Keeps this translation unit non-empty in a normal build, where the whole file
  * above compiles to nothing. */
-typedef int talkos_app_format_selftest_not_built_t;
+typedef int fableos_app_format_selftest_not_built_t;
 
 #endif

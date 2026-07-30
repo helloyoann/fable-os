@@ -1381,7 +1381,7 @@ _Static_assert(__builtin_offsetof(fault_guard_t, slot) == 0,
 _Static_assert(FAULT_GUARD_SLOTS >= 8,
                "the x86-64 context needs eight slots");
 
-#ifdef TALKOS_HOSTTEST
+#ifdef FABLEOS_HOSTTEST
 
 /* The host is a hosted environment on some other architecture entirely (this
  * tree is developed on arm64), so the transfer is libc's. The saved x86-64
@@ -1724,7 +1724,7 @@ static uint32_t      g_patch_live;
 
 static const fault_mem_ops_t *g_mem;
 
-#if !defined(TALKOS_HOSTTEST) && defined(__x86_64__)
+#if !defined(FABLEOS_HOSTTEST) && defined(__x86_64__)
 /* The kernel's default accessor. Legal because boot.asm identity-maps the low
  * 4 GiB, so a virtual address below 4 GiB IS its physical address, and because
  * every caller has already proved the span lies inside .text. volatile so the

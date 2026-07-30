@@ -1,6 +1,6 @@
-note: api key passed to the guest over fw_cfg as opt/talkos/apikey
+note: api key passed to the guest over fw_cfg as opt/fableos/apikey
 qemu-system-x86_64: multiboot knows VBE. we don't
-[display 1024x768 32bpp via bochs-vbe -> 128x48 text, Spleen 8x16 (BSD-2-Clause) + talk-os additions]
+[display 1024x768 32bpp via bochs-vbe -> 128x48 text, Spleen 8x16 (BSD-2-Clause) + fable-os additions]
 [console utf-8: em—dash en–dash ‘curly’ “quotes” ellipsis… bullet• ✓ ✗]
 [console glyphs: ←↑→↓↔↕ ≈≡≤≥±÷∞√ áéíóú äöü ñ ç ß ° µ ¶ §]
 [console glyphs: box ┌──┬──┐ ├──┼──┤ └──┴──┘ ╔══╦══╗ ╠══╬══╣ ╚══╩══╝]
@@ -8,7 +8,7 @@ qemu-system-x86_64: multiboot knows VBE. we don't
 idt: 256 gates at 0x217000 (limit 4095), all verified; TSS with 3 IST stacks of 16 KiB (#DF=1 NMI=2 #MC=3); PIC remapped to 0x20/0x28 and fully masked
 serial: COM1 up @ 115200
 fwcfg: QEMU fw_cfg at 0x510/0x511, 14 file(s), features 0x3
-fwcfg: api key: 108 bytes loaded from fw_cfg (opt/talkos/apikey)
+fwcfg: api key: 108 bytes loaded from fw_cfg (opt/fableos/apikey)
 pci: 00:00.0  8086:1237  class 06:00
 pci: 00:01.0  8086:7000  class 06:01
 pci: 00:01.1  8086:7010  class 01:01
@@ -54,7 +54,7 @@ rtc: resumed, wall clock advanced 0s while suspended
 -------------------
 
 --- filesystem self-test (ramfs at /) ---
-read /etc/motd (33 bytes): talk-os native filesystem online
+read /etc/motd (33 bytes): fable-os native filesystem online
 stat /etc/motd: type=file size=33 mode=0x6
 ls / : tmp etc
 -----------------------------------------
@@ -64,12 +64,12 @@ net: api.anthropic.com -> 160.79.104.10, TLS ready
 
 --- self-test: HTTPS to api.anthropic.com ---
 [http] HTTP/1.1 200 OK
-talk-os online
+fable-os online
 ---------------------------------------------
 heap: 3/16384 KiB used (peak 47 KiB), 32 live / 2 free blocks, 15854 allocs 15822 frees
 
 ==============================================================
-  talk-os
+  fable-os
 ==============================================================
   tools  : 48 registered (39312 bytes of schema)
   model  : reachable over TLS

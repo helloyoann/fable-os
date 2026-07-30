@@ -1,7 +1,7 @@
 /* input.h — input sources: turning bytes from anywhere into a line of text.
  *
  * PURPOSE
- *   talk-os has no shell and no commands. The only way a human drives this
+ *   fable-os has no shell and no commands. The only way a human drives this
  *   machine is by typing a sentence and pressing Enter, so "a completed line of
  *   natural-language text" is a first-class kernel primitive — not a detail of
  *   some REPL. This header is that primitive, and it is deliberately decoupled

@@ -4,8 +4,8 @@
  * unconditionally (include/mbedtls_config.h), so in the DEFAULT build
  * mbedtls_time() IS the time() below, counting seconds since boot — fine for
  * session timestamps, and the reason certificate dates cannot be judged in that
- * build. With -DTALKOS_VERIFY_CERTS, MBEDTLS_PLATFORM_TIME_MACRO redirects
- * mbedTLS to talkos_tls_time() (net/tls_ca.c, reading the CMOS RTC) and
+ * build. With -DFABLEOS_VERIFY_CERTS, MBEDTLS_PLATFORM_TIME_MACRO redirects
+ * mbedTLS to fableos_tls_time() (net/tls_ca.c, reading the CMOS RTC) and
  * MBEDTLS_HAVE_TIME_DATE makes notBefore/notAfter enforced against it — so in
  * that build nothing here is on the validation path. See the long argument in
  * include/mbedtls_config.h; net/tls_ca.c is the authority on which clock is
