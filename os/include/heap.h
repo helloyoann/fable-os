@@ -58,7 +58,9 @@ typedef struct heap_stats {
     size_t   peak_in_use;   /* high-water mark of bytes_in_use */
     size_t   free_blocks;   /* number of free blocks (fragmentation proxy) */
     size_t   used_blocks;   /* number of live allocations */
-    uint64_t total_allocs;  /* lifetime kmalloc/krealloc-grow count */
+    uint64_t total_allocs;  /* lifetime kmalloc count. A krealloc served in
+                             * place (grown or shrunk) touches neither counter;
+                             * only the copy path, which calls kmalloc, does. */
     uint64_t total_frees;   /* lifetime kfree count */
 } heap_stats_t;
 

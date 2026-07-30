@@ -19,14 +19,21 @@
  *   files, directories, metadata, mounting, file handles, read/write/seek, and
  *   a permission field carried now for future enforcement.
  *
+ * PATHS ARE REJECTED, NEVER TRUNCATED
+ *   Every path handed to this API must be absolute. A path longer than
+ *   VFS_PATH_MAX, or a single component longer than VFS_NAME_MAX, is an error —
+ *   the VFS never silently shortens one, because a shortened path names a
+ *   *different* file and "created the wrong thing and said ok" is the one
+ *   failure a caller cannot detect.
+ *
  * DEPENDENCIES
  *   kobject.h (identity/lifetime for vnodes/mounts/handles), heap, kernel.h.
  *
  * FUTURE EXTENSION POINTS
- *   The mount table supports several mounts (longest-prefix resolution), so
- *   mounting a disk filesystem under /mnt later needs no API change. Permission
- *   bits and owner ids can be enforced once processes/users exist. A block
- *   device layer will let on-disk filesystems reuse this exact vnode_ops_t.
+ *   The mount table supports several mounts (longest whole-component prefix
+ *   wins), so mounting a disk filesystem under /mnt later needs no API change.
+ *   Owner ids can be enforced once processes/users exist. A block device layer
+ *   will let on-disk filesystems reuse this exact vnode_ops_t.
  */
 #ifndef VFS_H
 #define VFS_H
@@ -43,7 +50,12 @@
 #define VFS_EINVAL   -22   /* bad argument               */
 #define VFS_ENOSPC   -28   /* out of space               */
 
-/* ---- open() flags ---- */
+/* ---- open() flags ----
+ * The low two bits are the access mode and ARE enforced: vfs_read() on an
+ * O_WRONLY handle and vfs_write() on an O_RDONLY handle both return
+ * VFS_EINVAL. (The per-vnode VFS_PERM_* bits below are not enforced yet — they
+ * need an owner to check against.) */
+#define O_ACCMODE 0x0003
 #define O_RDONLY 0x0000
 #define O_WRONLY 0x0001
 #define O_RDWR   0x0002
@@ -61,7 +73,12 @@
 #define VFS_PERM_W 0x2
 #define VFS_PERM_X 0x1
 
+/* Longest single path component, and longest whole path, both excluding the
+ * NUL. Anything longer is VFS_EINVAL. Callers that build paths of their own
+ * (tools/vfs_tools.c) size their buffers against VFS_PATH_MAX rather than
+ * against a number copied out of fs/vfs/vfs.c. */
 #define VFS_NAME_MAX 63
+#define VFS_PATH_MAX 127
 
 typedef enum { VNODE_FILE = 1, VNODE_DIR = 2 } vnode_type_t;
 
@@ -86,6 +103,12 @@ typedef struct vnode_ops {
     int64_t (*write)(struct vnode *n, const void *buf, uint64_t off, uint64_t len);
     int     (*readdir)(struct vnode *dir, uint32_t index, char *name_out, size_t cap);
     int     (*truncate)(struct vnode *n, uint64_t size);
+    /* Release a vnode whose last reference has just gone away: free the
+     * fs-private state AND the vnode itself. Called by the VFS from
+     * vfs_close() only when kobject_put() reports 0, i.e. the name is already
+     * gone and this was the final open handle. Optional — a filesystem whose
+     * vnodes are immortal leaves it NULL. */
+    void    (*reclaim)(struct vnode *n);
 } vnode_ops_t;
 
 /* An in-core node (inode). fs-private state hangs off `priv`. */

@@ -43,6 +43,10 @@ int vfs_mount(const char *mountpoint, const char *fstype) {
     while (t && strcmp(t->name, fstype) != 0) t = t->next;
     if (!t) return VFS_ENOENT;
 
+    if (!mountpoint || mountpoint[0] != '/') return VFS_EINVAL;
+    if (strlen(mountpoint) >= sizeof ((vfs_mount_t *)0)->mountpoint)
+        return VFS_EINVAL;
+
     vfs_mount_t *m = kmalloc(sizeof *m);
     memset(m, 0, sizeof *m);
     kobject_init(&m->obj, KOBJ_MOUNT, fstype);
@@ -50,35 +54,47 @@ int vfs_mount(const char *mountpoint, const char *fstype) {
     m->fstype = t;
 
     int rc = t->mount(m);
-    if (rc != VFS_OK) return rc;
+    if (rc != VFS_OK) { kfree(m); return rc; }
 
     m->next = mounts;
     mounts  = m;
     return VFS_OK;
 }
 
-/* Pick the mount whose mountpoint is the longest prefix of `path`. */
-static vfs_mount_t *mount_for(const char *path) {
+/* Pick the mount whose mountpoint is the longest WHOLE-COMPONENT prefix of
+ * `path`, and report how many bytes of `path` it accounts for. Matching raw
+ * bytes would route "/dataset/f" into a mount at "/data", so the byte after the
+ * prefix has to be a separator or the end of the path. The root mount accounts
+ * for zero bytes, not one: stripping its '/' unconditionally is what used to
+ * make "Xetc/motd" resolve to /etc/motd. */
+static vfs_mount_t *mount_for(const char *path, size_t *prefix_len) {
     vfs_mount_t *best = NULL;
     size_t best_len = 0;
     for (vfs_mount_t *m = mounts; m; m = m->next) {
         size_t len = strlen(m->mountpoint);
-        int is_root = (len == 1 && m->mountpoint[0] == '/');
-        if (is_root || strncmp(path, m->mountpoint, len) == 0) {
-            if (len >= best_len) { best = m; best_len = len; }
+        if (len == 1 && m->mountpoint[0] == '/') {
+            len = 0;                       /* the root mount strips nothing */
+        } else {
+            if (strncmp(path, m->mountpoint, len) != 0) continue;
+            if (path[len] != '\0' && path[len] != '/') continue;
         }
+        if (!best || len >= best_len) { best = m; best_len = len; }
     }
+    if (best) *prefix_len = best_len;
     return best;
 }
 
-/* Copy the next '/'-delimited component of *pp into comp (bounded), advancing
- * *pp past it. Returns 0 when no component remains. */
+/* Copy the next '/'-delimited component of *pp into comp, advancing *pp past
+ * it. Returns 1 on a component, 0 when none remains, -1 if the component is
+ * longer than the buffer — truncating would look up a *different* name, and
+ * ramfs_create() rejects over-long names on the store side for the same
+ * reason, so the two layers agree. */
 static int next_component(const char **pp, char *comp, size_t cap) {
     const char *p = *pp;
     while (*p == '/') p++;
     if (!*p) { *pp = p; return 0; }
     size_t n = 0;
-    while (*p && *p != '/') { if (n < cap - 1) comp[n++] = *p; p++; }
+    while (*p && *p != '/') { if (n >= cap - 1) return -1; comp[n++] = *p; p++; }
     comp[n] = '\0';
     *pp = p;
     return 1;
@@ -86,24 +102,36 @@ static int next_component(const char **pp, char *comp, size_t cap) {
 
 /* Resolve an absolute path to its vnode, or NULL. */
 static vnode_t *resolve(const char *path) {
-    vfs_mount_t *m = mount_for(path);
+    if (!path || path[0] != '/') return NULL;   /* absolute paths only */
+    if (strlen(path) > VFS_PATH_MAX) return NULL;
+
+    size_t plen = 0;
+    vfs_mount_t *m = mount_for(path, &plen);
     if (!m) return NULL;
 
-    const char *rel = path + strlen(m->mountpoint);
+    const char *rel = path + plen;
     vnode_t *cur = m->root;
     char comp[VFS_NAME_MAX + 1];
-    while (next_component(&rel, comp, sizeof comp)) {
+    int rc;
+    while ((rc = next_component(&rel, comp, sizeof comp)) == 1) {
         if (strcmp(comp, ".") == 0) continue;
         if (cur->type != VNODE_DIR || !cur->ops->lookup) return NULL;
         vnode_t *next = NULL;
         if (cur->ops->lookup(cur, comp, &next) != VFS_OK) return NULL;
         cur = next;
     }
+    if (rc < 0) return NULL;                    /* component too long */
     return cur;
 }
 
-/* Split `path` into its parent directory vnode and the final component. */
+/* Split `path` into its parent directory vnode and the final component. Both
+ * halves are bounded and neither is ever truncated: a truncated parent would
+ * resolve to some *other* directory and the create would silently land in the
+ * wrong place. */
 static int resolve_parent(const char *path, vnode_t **parent, char *leaf, size_t cap) {
+    if (!path || path[0] != '/') return VFS_EINVAL;
+    if (strlen(path) > VFS_PATH_MAX) return VFS_EINVAL;
+
     /* Find the last '/'. */
     const char *slash = NULL;
     for (const char *p = path; *p; p++) if (*p == '/') slash = p;
@@ -113,15 +141,15 @@ static int resolve_parent(const char *path, vnode_t **parent, char *leaf, size_t
     const char *name = slash + 1;
     if (!*name) return VFS_EINVAL;
     size_t n = 0;
-    while (name[n]) { if (n < cap - 1) leaf[n] = name[n]; n++; }
-    leaf[n < cap ? n : cap - 1] = '\0';
+    while (name[n]) { if (n >= cap - 1) return VFS_EINVAL; leaf[n] = name[n]; n++; }
+    leaf[n] = '\0';
 
-    /* Parent path is everything up to and including the slash (or "/" itself). */
-    char dir[128];
+    /* Parent path is everything up to the slash (or "/" itself). */
+    char dir[VFS_PATH_MAX + 1];
     size_t dlen = (size_t)(slash - path);
     if (dlen == 0) { dir[0] = '/'; dir[1] = '\0'; }
     else {
-        if (dlen >= sizeof dir) dlen = sizeof dir - 1;
+        if (dlen >= sizeof dir) return VFS_EINVAL;
         memcpy(dir, path, dlen);
         dir[dlen] = '\0';
     }
@@ -160,19 +188,29 @@ file_t *vfs_open(const char *path, int flags) {
 
 void vfs_close(file_t *f) {
     if (!f) return;
-    kobject_put(&f->node->obj);
+    vnode_t *v = f->node;
     kfree(f);
+    /* Dropping the last reference means the name is already gone (an unlink
+     * happened while this handle was open) and we are the last owner, so the
+     * filesystem gets to reclaim the storage. Ignoring this return is how a
+     * refcount becomes decorative. */
+    if (v && kobject_put(&v->obj) == 0 && v->ops && v->ops->reclaim)
+        v->ops->reclaim(v);
 }
 
 int64_t vfs_read(file_t *f, void *buf, uint64_t len) {
-    if (!f || !f->node->ops->read) return VFS_EINVAL;
+    if (!f || !f->node || !buf) return VFS_EINVAL;
+    if (!f->node->ops->read) return VFS_EINVAL;
+    if ((f->flags & O_ACCMODE) == O_WRONLY) return VFS_EINVAL;
     int64_t n = f->node->ops->read(f->node, buf, f->pos, len);
     if (n > 0) f->pos += (uint64_t)n;
     return n;
 }
 
 int64_t vfs_write(file_t *f, const void *buf, uint64_t len) {
-    if (!f || !f->node->ops->write) return VFS_EINVAL;
+    if (!f || !f->node || !buf) return VFS_EINVAL;
+    if (!f->node->ops->write) return VFS_EINVAL;
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return VFS_EINVAL;
     if (f->flags & O_APPEND) f->pos = f->node->size;
     int64_t n = f->node->ops->write(f->node, buf, f->pos, len);
     if (n > 0) f->pos += (uint64_t)n;
@@ -180,7 +218,7 @@ int64_t vfs_write(file_t *f, const void *buf, uint64_t len) {
 }
 
 int64_t vfs_seek(file_t *f, int64_t off, int whence) {
-    if (!f) return VFS_EINVAL;
+    if (!f || !f->node) return VFS_EINVAL;
     int64_t base;
     switch (whence) {
         case SEEK_SET: base = 0; break;
@@ -206,6 +244,7 @@ int vfs_mkdir(const char *path) {
 }
 
 int vfs_stat(const char *path, vfs_stat_t *out) {
+    if (!out) return VFS_EINVAL;
     vnode_t *v = resolve(path);
     if (!v) return VFS_ENOENT;
     out->type     = v->type;
@@ -216,6 +255,9 @@ int vfs_stat(const char *path, vfs_stat_t *out) {
 }
 
 int vfs_readdir(const char *path, uint32_t index, char *name_out, size_t cap) {
+    /* cap == 0 would reach the filesystem as a `cap - 1` bound that underflows
+     * to SIZE_MAX, i.e. an unbounded copy into the caller's buffer. */
+    if (!name_out || cap == 0) return VFS_EINVAL;
     vnode_t *v = resolve(path);
     if (!v) return VFS_ENOENT;
     if (v->type != VNODE_DIR || !v->ops->readdir) return VFS_ENOTDIR;

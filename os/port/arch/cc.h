@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdarg.h>
 
 /* x86 is little-endian. */
 #ifndef LITTLE_ENDIAN
@@ -33,11 +34,35 @@
 #define PACK_STRUCT_STRUCT __attribute__((packed))
 #define PACK_STRUCT_FIELD(x) x
 
-/* Diagnostics + assertions routed to the kernel console. */
+/* Diagnostics + assertions routed to the kernel console.
+ *
+ * NOT kprintf. The kernel's kprintf (lib/base.c) implements a deliberately
+ * reduced grammar — %s %c %d %u %x %p with a 0/width — and on any conversion
+ * outside it prints the two characters verbatim and consumes NO vararg, so
+ * every remaining argument on that line is read from the wrong slot and a later
+ * %s dereferences a non-pointer. lwIP's own format strings use SZT_F, which is
+ * "lu" above, so the first lwIP diagnostic to print a size_t would do exactly
+ * that — in the middle of debugging a network problem, which is the one moment
+ * the console has to be trustworthy. libc_shim.c's vsnprintf does implement the
+ * l/ll/z modifiers, width and precision, so format there and print the bytes.
+ *
+ * 256 bytes: longer than any format string in the vendored tree, and this runs
+ * on the kernel's 64 KiB stack. */
 extern void kprintf(const char *fmt, ...);
+extern void kputs(const char *s);
 extern void panic(const char *msg);
+extern int  vsnprintf(char *str, size_t size, const char *fmt, va_list ap);
 
-#define LWIP_PLATFORM_DIAG(x)   do { kprintf x; } while (0)
+static inline void lwip_diag(const char *fmt, ...) {
+    char b[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    kputs(b);
+}
+
+#define LWIP_PLATFORM_DIAG(x)   do { lwip_diag x; } while (0)
 #define LWIP_PLATFORM_ASSERT(x) do { kprintf("\nlwIP ASSERT: %s\n", x); panic("lwip assert"); } while (0)
 
 /* Randomness for TCP ISN / DNS txids. */
