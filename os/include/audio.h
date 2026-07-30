@@ -372,7 +372,18 @@ _Static_assert(AUDIO_NARGS <= DVM_NREGS,
     "while the device is still reading corrupts the next one. On any failure, "   \
     "`abort \"reason\"` - the reason goes back to whoever asked for the sound. "  \
     "This runs once per sound, so everything in it must be safe to do again; "    \
-    "leave one-time bring-up in the program you ran with driver_run."
+    "leave one-time bring-up in the program you ran with driver_run.\n"           \
+    "HOW TO WAIT, because the budgets are real and a spin loop hits them. Every "  \
+    "device read costs one access against the run's access budget, and `delay` "   \
+    "spends the delay budget. For a play run the kernel raises both to fit this "  \
+    "sound: the delay budget covers r11 ms plus a quarter-second of margin, and "  \
+    "the access budget covers about two reads per millisecond of r11. So put a "   \
+    "`delay` INSIDE the poll loop and read the status register ONCE per pass - "   \
+    "roughly `delay 1000` (1 ms) per read, giving about r11 iterations. A tight "  \
+    "loop with no delay, or a retry cap in the tens of thousands, will trap with "  \
+    "IO_LIMIT or DELAY_LIMIT before the sound has finished. Cap the loop at a few "\
+    "times r11, and if it runs out, `abort` with what the status register said - " \
+    "that is a far more useful answer than halting early."
 
 /* Register a native driver as the audio output. `name` identifies it in reports
  * and in the device tree (copied, bounded, must be non-empty and printable).

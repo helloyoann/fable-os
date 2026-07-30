@@ -1459,9 +1459,72 @@ static int run_ticks(void) {
 
     env_begin();
 
-    for (int i = 0; i < APP_MAX_INSTANCES; i++) {
+    /* ROUND ROBIN, AND IT IS LOAD-BEARING RATHER THAN TIDY.
+     *
+     * This loop used to start at slot 0 every time. Combined with two facts, that
+     * made a permanent, exact priority order rather than a mild bias:
+     *
+     *   - a new handler's first due time is 0 (see the launch path), so every
+     *     handler in the machine is due on the very first pass; and
+     *   - a due handler's next due time is computed from ONE shared env_ms
+     *     reading, so two handlers with equal periods stay phase-locked to the
+     *     same millisecond for ever.
+     *
+     * So with two documents each holding a periodic handler that asks for a
+     * sound, the one in the lower pool slot won the single machine-wide pending
+     * slot on every pass, for ever. Measured: two identical documents over 66 s,
+     * app A got 132 sounds and app B got ZERO — not a race, an exact outcome. It
+     * was not limited to greedy documents either: two well-behaved 1000 ms
+     * tickers, i.e. spare capacity every second, gave the same 66/0.
+     *
+     * Worse, the refusal the starved app received said "still busy" or "too
+     * soon", which read as transient, so a model was told to back off — and
+     * backing off provably could not help, because the winner was not going away.
+     * That is the project rule ("every failure becomes an error precise enough
+     * for the model to fix itself") being broken by a fairness bug.
+     *
+     * THE ROTATION ADVANCES WHEN THE SCARCE THING IS GRANTED, NOT PER PASS OR PER
+     * EVENT. Two simpler versions were written first and both were MEASURED still
+     * starving one document, because any fixed stride aliases against some other
+     * period in the machine:
+     *
+     *   - advancing one slot per CALL aliases against the poll rate: this loop is
+     *     called thousands of times a second while APP_TICK_MIN_MS is 50, so the
+     *     cursor moved ~50 slots between two due times and 50 % 4 == 2 — the same
+     *     document won every time;
+     *   - advancing one slot per PASS THAT RAN A HANDLER aliases against the rate
+     *     limit: handlers come due every 50 ms but a sound is only allowed every
+     *     APP_CAP_GAP_MS, so the cursor moved 10 positions between two grants and
+     *     10 % 2 == 0 — again the same document won every time.
+     *
+     * What cannot alias is rotating on the grant itself: whoever wins the pending
+     * slot is moved to LAST place for the next pass, so a document that has just
+     * been heard cannot be heard again until every other asker has had its turn.
+     * The scarce resource drives its own fairness, which needs no knowledge of any
+     * period. The win is detected by watching app_cap_pending() go from 0 to 1
+     * across one instance's handlers — apps/cap.c owns that slot and this file does
+     * not need to see inside it.
+     *
+     * The rotation also walks the USED instances rather than the raw pool, so a
+     * closed window in slot 1 does not give slot 0 a free extra turn.
+     *
+     * Measured, two identical 50 ms tickers over 66 s of virtual time: 66 and 66,
+     * where before the fix it was 132 and 0. Four documents: 33 each. */
+    int used_idx[APP_MAX_INSTANCES];
+    int nused = 0;
+    for (int i = 0; i < APP_MAX_INSTANCES; i++)
+        if (pool[i].used) used_idx[nused++] = i;
+    if (!nused) return 0;
+
+    static unsigned rr_cursor;
+    unsigned start = rr_cursor % (unsigned)nused;
+
+    for (int n = 0; n < nused; n++) {
+        unsigned      pos = (start + (unsigned)n) % (unsigned)nused;
+        int           i   = used_idx[pos];
         app_inst_t   *in  = &pool[i];
         gui_window_t *win;
+        int           had_pending = app_cap_pending();
         if (!in->used) continue;
         win = gui_window(in->win);
         if (!win) continue;
@@ -1481,17 +1544,34 @@ static int run_ticks(void) {
             (void)exec_block(in, win, &key, h->first, h->count, 0, &budget);
             ran++;
         }
+
+        /* Did THIS instance take the one pending slot? If so it goes last next
+         * time. Nothing else moves the cursor, which is what makes the rotation
+         * immune to the aliasing described above. */
+        if (!had_pending && app_cap_pending())
+            rr_cursor = pos + 1;
     }
     return ran;
 }
 
-/* The idle loop's one call, and it stays one call: the periodic handlers first
- * (they may ask for a sound), then the pump that performs at most one request.
- * The return value is still the number of TICK HANDLERS that ran — a caller that
- * counts ticks must not start counting sounds — and app_service() is public for a
- * loop that would rather call it itself. */
+/* Run the periodic handlers ONLY. Arithmetic and widget text, no device, no
+ * blocking — safe to call from anywhere, including a fiber that is running
+ * inside a network wait.
+ *
+ * This is the half of the old app_tick() that kernel/main.c's ui fiber wants.
+ * The two were split because they have opposite safety properties and were being
+ * called as one: see app_service() below. */
+int app_tick_handlers(void) {
+    return run_ticks();
+}
+
+/* Handlers, then the pump. Kept as the one call an idle loop makes, so a request
+ * a tick handler just made is performed on the same pass.
+ *
+ * DO NOT call this from a fiber that runs inside a network wait — call
+ * app_tick_handlers() there instead. The reason is in app_service(). */
 int app_tick(void) {
-    int ran = run_ticks();
+    int ran = app_tick_handlers();
     (void)app_service();
     return ran;
 }
@@ -1500,15 +1580,46 @@ int app_tick(void) {
 /* app_service — the capability pump                                      */
 /* ====================================================================== */
 
-/* Called at the END of app_tick(), so a request a tick handler just made is
- * performed on the same pass and the loop in kernel/main.c needs no edit. The
- * clock is read only when something is actually waiting: with nothing queued this
- * is one flag test, which is what makes it safe to call as often as the idle loop
- * likes. */
+/* THE ONLY PLACE apps/ TOUCHES HARDWARE, AND THE ONE CALL WITH A PLACE IT MUST
+ * NOT BE CALLED FROM.
+ *
+ * apps/cap.c's safety argument, and include/app.h's promise to the operator,
+ * both rest on the sentence "no sound starts while the machine is inside a model
+ * turn". That was true while app_tick() was reached only from
+ * wait_for_sentence(). It stopped being true the moment app_tick() also became
+ * the body of kernel/main.c's ui fiber, because net/net.c's net_service() yields
+ * to that fiber on every pass of every network wait — DNS and the model turn
+ * included. app_tick() ended with app_service(), so the one hardware action in
+ * apps/ began firing inside TLS round trips: measured at ~2000 ui-fiber passes
+ * during a single 657 ms API call, with an [app_call cap=audio.tone ...] line
+ * printed between "net: resolving api.anthropic.com" and "TLS ready".
+ *
+ * That is not cosmetic. audio.h's play contract is synchronous, so performing a
+ * capability call blocks for the length of the sound, and during that time
+ * net_poll_rx() and sys_check_timeouts() do not run — the machine's only
+ * interface degrades exactly while it is being used.
+ *
+ * So the pump is deliberately NOT part of app_tick_handlers(): the ui fiber runs
+ * handlers (which only compute, and may QUEUE a request), and the request is
+ * performed here, from the idle loop, between two input polls. One pending slot
+ * machine-wide means a turn that spans several tick periods coalesces to a
+ * single sound afterwards rather than a burst.
+ *
+ * The clock is read only when something is actually waiting: with nothing queued
+ * this is one flag test, which is what makes it safe to call as often as the idle
+ * loop likes. */
 int app_service(void) {
     if (!app_cap_pending()) return 0;
-    uint64_t ms = src_ms ? src_ms() : millis();
-    return app_cap_service(ms);
+    return app_cap_service(app_now_ms());
+}
+
+/* One monotonic reading, through whatever source is installed. Exposed to
+ * apps/cap.c because it has to read the clock TWICE around a capability call —
+ * once before and once after — to know how long the call actually blocked the
+ * machine for. Nothing else in apps/ may read a clock directly; handlers get
+ * their time from the event snapshot so that one pass sees one instant. */
+uint64_t app_now_ms(void) {
+    return src_ms ? src_ms() : millis();
 }
 
 /* ---- what apps/cap.c calls back into ---- */

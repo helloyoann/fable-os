@@ -115,6 +115,14 @@
  *                          fault_plan_check.
  *   Recovery (live)        fault_plan_arm, fault_plan_clear, fault_plan_get,
  *                          fault_recover, fault_refaults.
+ *   Escaping               fault_guard_run, fault_guard_abort, fault_escape,
+ *                          fault_escapes. The third disposition: neither resumed
+ *                          nor halted, but returned to a caller that volunteered
+ *                          to lose its call chain. This is what makes asking the
+ *                          model about a fault possible at all.
+ *   Live code patching     fault_patch_check / _apply / _revert / _revert_all
+ *                          and the fault_mem_ops_t seam. Five gates, originals
+ *                          always kept, and no claim that the bytes are right.
  *   Live state (read-only) fault_occurred, fault_count, fault_last,
  *                          fault_last_report, fault_ring_len, fault_ring_at,
  *                          fault_by_seq. This is the surface tools/
@@ -207,11 +215,22 @@ typedef struct fault_frame {
  *   stack_lo..stack_hi   readable stack. The kernel stack lives inside .bss, so
  *                        [__bss_start, __bss_end) bounds it without needing a
  *                        symbol boot.asm does not export.
+ *   text_lo..text_hi     EXECUTABLE instructions, and nothing else. Strictly
+ *                        narrower than code_lo..code_hi, which is a superset
+ *                        admitting .rodata and .data because a return address
+ *                        only has to be *plausible*. A live code patch is not
+ *                        plausible-based: it writes bytes the CPU will execute,
+ *                        so it is bounded by [__text_start, __text_end) from
+ *                        linker.ld and refused everywhere else. Zero when the
+ *                        build did not publish the symbols, and a zero range
+ *                        refuses every patch rather than falling back to the
+ *                        wider one — see fault_patch_apply().
  */
 typedef struct fault_window {
     uint64_t image_lo, image_hi;
     uint64_t code_lo,  code_hi;
     uint64_t stack_lo, stack_hi;
+    uint64_t text_lo,  text_hi;
 } fault_window_t;
 
 /* ====================================================================== */
@@ -463,6 +482,11 @@ typedef enum fault_fix {
     FAULT_FIX_RIP_WINDOW,       /* the resume address is outside the image    */
     FAULT_FIX_REFAULT,          /* same RIP, too many times: stop trying      */
     FAULT_FIX_EXHAUSTED,        /* the plan ran out of uses                   */
+    FAULT_FIX_ESCAPED,          /* no in-place fix, but a guard caught it     */
+    FAULT_FIX_NO_GUARD,         /* ...and there was no guard to catch it      */
+    FAULT_FIX_GUARD_SPENT,      /* the per-boot escape budget is spent        */
+    FAULT_FIX_GUARD_CORRUPT,    /* the guard's saved context is not usable    */
+    FAULT_FIX_GUARD_FOREIGN,    /* the guard belongs to a different stack     */
     FAULT_FIX_COUNT
 } fault_fix_t;
 
@@ -511,6 +535,374 @@ fault_fix_t fault_apply_plan(fault_frame_t *frame,
                              const uint8_t *code, unsigned code_len,
                              char *why, size_t whycap,
                              uint8_t *insn_len);
+
+/* ====================================================================== */
+/* returning to a known-safe context — the fault guard                    */
+/* ====================================================================== */
+
+/* THE PROBLEM THIS SOLVES
+ *   Everything above recovers a fault IN PLACE: the frame is patched and IRETQ
+ *   resumes the very instruction stream that failed. That is the best outcome
+ *   available, and it is only available when somebody armed a plan in advance.
+ *   With no plan, a fatal fault halts the machine forever — which means the
+ *   machine can never ask the model what went wrong, because asking needs lwIP
+ *   and mbedTLS and mbedTLS needs the heap, and none of those may be entered
+ *   from an exception handler (see include/faultchat.h for that argument in
+ *   full; it has not been repealed and nothing here weakens it).
+ *
+ *   So this is the third disposition, between "resumed" and "halted": ABANDON
+ *   THE FAULTING CALL CHAIN AND RETURN TO A CALLER THAT VOLUNTEERED TO CATCH IT.
+ *   The handler does no work beyond patching the frame — no allocation, no
+ *   device access, no network — and the IRETQ lands in normal kernel context,
+ *   on a stack that is provably intact, with the fault fully recorded in the
+ *   ring. From there the machine is free to do the expensive thing: ask.
+ *
+ *   That is the whole mechanism behind autonomous self-repair. Capture in the
+ *   handler; return to a known-safe context; THEN diagnose.
+ *
+ * WHAT IT IS, MECHANICALLY
+ *   setjmp/longjmp, with the CPU performing the longjmp. fault_guard_run() saves
+ *   the callee-saved registers, the stack pointer and a resume address into a
+ *   fault_guard_t that lives on ITS OWN STACK FRAME, then calls the body. If the
+ *   body (or anything it calls, at any depth) takes a fatal fault that cannot be
+ *   fixed in place, the handler copies those saved values into the live fault
+ *   frame and returns; the IRETQ then lands back inside fault_guard_run(), which
+ *   returns FAULT_GUARD_ESCAPED to its caller. Nothing unwinds, nothing is freed,
+ *   no destructor runs — this kernel has none.
+ *
+ * WHY THE FRAME IS INTACT WHEN WE GET THERE
+ *   #PF/#GP/#DE/#UD all use IST_NONE, so the handler runs on the SAME stack,
+ *   pushing its frames BELOW the faulting RSP — which is itself below
+ *   fault_guard_run()'s frame. Restoring the saved RSP therefore discards only
+ *   memory nobody will read again. The guard's own bytes are above every frame
+ *   the fault could have touched.
+ *
+ * WHAT ESCAPING COSTS, SAID PLAINLY
+ *   Whatever the abandoned call chain was halfway through STAYS halfway through.
+ *   A half-written device register stays half-written; a heap block being split
+ *   stays split; a pbuf handed to nobody is leaked. This is not recovery, it is
+ *   triage: the machine trades an unknown amount of consistency for the ability
+ *   to still be running and still be able to talk. That trade is worth making
+ *   once, and is very obviously not worth making in a loop, which is why:
+ *
+ *     - #DF can never be escaped. The CPU already proved RSP is unusable, and
+ *       every field this mechanism restores is a stack address.
+ *     - The saved RIP must be inside code_lo..code_hi and the saved RSP inside
+ *       stack_lo..stack_hi, re-checked at the moment of use. A guard whose bytes
+ *       were corrupted by the very bug being escaped is refused, not trusted.
+ *     - FAULT_ESCAPE_MAX escapes per boot, total, across all guards. After that
+ *       the machine halts with a report, because a machine that has abandoned
+ *       eight call chains is a machine whose state nobody can reason about.
+ *     - Guards nest to FAULT_GUARD_DEPTH_MAX only. An escape always goes to the
+ *       INNERMOST armed guard, which is the smallest thing anybody volunteered
+ *       to lose.
+ *
+ * WHO ARMS ONE
+ *   Only code that has thought about the paragraph above. core/agenda.c wraps
+ *   every autonomous action in one, because an unattended action must not be
+ *   able to halt an unattended machine. Nothing else does: an operator-driven
+ *   turn that faults should halt loudly, exactly as it did before.
+ */
+
+/* An escape always reports a positive code, so `if (fault_guard_run(...))` reads
+ * correctly. Negative values are refusals to arm at all. */
+#define FAULT_GUARD_OK        0    /* the body ran to completion              */
+#define FAULT_GUARD_ESCAPED   1    /* a fatal fault unwound out of the body   */
+#define FAULT_GUARD_EINVAL   -22   /* no body given                           */
+#define FAULT_GUARD_EDEPTH   -40   /* guards are already nested as deep as    */
+                                   /* they go; the body was NOT run           */
+
+#define FAULT_GUARD_DEPTH_MAX  4
+#define FAULT_ESCAPE_MAX       8
+
+/* The saved context. `slot` is FIRST and that is load-bearing: the two
+ * hand-written asm functions in arch/x86_64/fault.c address it at +0, and a
+ * _Static_assert there pins it. Treat every field as private.
+ *
+ * On the host build the same array holds a jmp_buf instead, which is why it is
+ * sized generously there — see fault_guard_enter(). */
+#ifdef TALKOS_HOSTTEST
+#define FAULT_GUARD_SLOTS 128
+#else
+#define FAULT_GUARD_SLOTS 8        /* rip, rsp, rbx, rbp, r12, r13, r14, r15 */
+#endif
+
+#define FAULT_GUARD_MAGIC 0x67556172u
+
+typedef struct fault_guard {
+    uint64_t    slot[FAULT_GUARD_SLOTS] __attribute__((aligned(16)));
+    uint32_t    magic;
+    uint32_t    depth;      /* this guard's own index in the active stack    */
+    int         code;       /* 0, or the escape code written by the handler  */
+    uint32_t    seq;        /* fault_count() when the guard was armed        */
+    const char *what;       /* what the body was attempting, for the log     */
+    const void *stack;      /* WHICH STACK this guard was armed on — see below */
+} fault_guard_t;
+
+/* WHICH STACK, AND WHY A POINTER COMPARISON RATHER THAN AN ADDRESS RANGE.
+ *
+ * This mechanism was designed when the machine had ONE stack. It now has several
+ * (core/fiber.c), and the two bounds checks in fault_escape() cannot tell them
+ * apart: `window->stack_lo..stack_hi` is [__bss_start, __bss_end), and mm/heap.c's
+ * arena is in .bss, so EVERY fiber stack is inside the declared "stack" window.
+ * The only thing left distinguishing them was numeric ordering against the
+ * faulting RSP — an accident of where the linker happened to put the heap
+ * relative to boot.asm's stack.
+ *
+ * With a fiber holding a guard and the root faulting, that accident let the CPU
+ * IRETQ onto the fiber's stack. Observed on QEMU: the escape "succeeded", and the
+ * machine then faulted again with RIP exactly at that fiber's stack top,
+ * executing core/fiber.c's 0xF1BE9A11 poison band, and halted with a diagnosis
+ * naming neither fiber.
+ *
+ * So a guard now records an opaque identity for the stack it was armed on, and an
+ * escape onto a DIFFERENT one is refused (FAULT_FIX_GUARD_FOREIGN). Refusing is
+ * always safe: it halts, which is exactly what would have happened with no guard
+ * at all, and the frame is left byte-identical.
+ *
+ * The identity comes from a hook rather than from an #include, because
+ * arch/x86_64/fault.c must keep linking without core/fiber.c — several host suites
+ * depend on that, and a fault handler that needs the scheduler to decide whether
+ * it may act is a worse thing than a function pointer. NULL means "one stack",
+ * which is both the honest default and the pre-fiber truth. */
+typedef const void *(*fault_stack_id_fn)(void);
+void fault_set_stack_id(fault_stack_id_fn fn);
+
+/* WHAT THIS DOES NOT FIX, PRECISELY, because it is a redesign and not a patch.
+ *
+ * The guard stack (g_guards[]) is still ONE global stack shared by every fiber,
+ * and fault_guard_run() pops by index. Two consequences remain:
+ *
+ *   1. A guard does not cover work the guarded action YIELDED into. core/agenda.c
+ *      arms the only guard in the tree, on the root, and its body reaches
+ *      net_service(), which yields to the ui fiber. A fatal fault while the ui
+ *      fiber is running is now REFUSED BY IDENTITY and the machine halts —
+ *      correctly, and with an accurate reason, but agenda.h's "an unattended
+ *      action must not halt an unattended machine" is weaker than it reads.
+ *   2. Escaping to a guard further OUT than the innermost one would be the
+ *      natural extension, and must not be done with this data structure: setting
+ *      g_gdepth to that guard's depth would pop another fiber's guard while that
+ *      fiber is still inside its own fault_guard_run().
+ *
+ * Both want the same thing: a guard stack PER FIBER, i.e. the head of the chain
+ * living in the fiber rather than in a file-static array, with fiber_self()
+ * (or the same hook) selecting it. That is the fix; it is not this one. */
+
+/* Run `body(ctx)` with an escape hatch armed. Returns FAULT_GUARD_OK when the
+ * body returned normally, FAULT_GUARD_ESCAPED when a fatal fault abandoned it,
+ * or a negative FAULT_GUARD_E* when the guard could not be armed (in which case
+ * the body was NOT run — a caller that ignores that runs unguarded, so don't).
+ *
+ * `what` is a short kernel-authored noun phrase naming the attempt ("the boot
+ * agenda item \"audio\""). It is remembered for the log and must be a string
+ * with static lifetime; it is never freed and never copied. */
+int fault_guard_run(const char *what, void (*body)(void *ctx), void *ctx);
+
+/* Abandon the current call chain deliberately, without a CPU exception, exactly
+ * as a fault would. Returns only if there is no guard to escape to (or the
+ * budget is spent), in which case it returns the FAULT_FIX_* refusal. This is
+ * the same bookkeeping the handler path performs and is how the host tests
+ * exercise the whole loop on a machine with no x86-64 exceptions. */
+fault_fix_t fault_guard_abort(const char *why);
+
+/* THE HANDLER SIDE. Consult the innermost armed guard and, if everything checks
+ * out, patch `frame` so the IRETQ returns into fault_guard_run() instead of
+ * resuming the faulting instruction. Records the disposition into the current
+ * ring slot and re-renders its report, exactly as fault_recover() does.
+ *
+ * Returns FAULT_FIX_ESCAPED when the frame was patched and the caller should
+ * return into it, or one of FAULT_FIX_VECTOR / _NO_GUARD / _GUARD_SPENT /
+ * _GUARD_CORRUPT. Every refusal leaves the frame byte-identical.
+ *
+ * Allocation-free, device-free, and callable from inside an exception handler —
+ * the same hard constraint every other function in this header carries. */
+fault_fix_t fault_escape(fault_frame_t *frame, const fault_window_t *window);
+
+/* ---- introspection ---- */
+
+/* The guard an escape would go to, or NULL when none is armed. The pointer is
+ * only valid while that guard is armed — it addresses a frame on somebody's
+ * stack — so it is for immediate inspection and for fault_guard_forge(), which
+ * is the only reason it is not const. */
+fault_guard_t *fault_guard_innermost(void);
+
+int         fault_guard_depth(void);      /* guards currently armed           */
+uint32_t    fault_escapes(void);          /* escapes taken since boot         */
+uint32_t    fault_escape_budget(void);    /* how many are left                */
+const char *fault_escape_what(void);      /* what the last escape abandoned   */
+uint32_t    fault_escape_seq(void);       /* the fault seq that caused it     */
+
+/* The arch seam, and the only two functions in this module that are not
+ * portable C. fault_guard_enter() is a setjmp: it returns 0 when it saves, and
+ * whatever the handler put in the return-value register when execution comes
+ * back to it. fault_guard_unwind() is the matching longjmp, used by
+ * fault_guard_abort(); the fault path does not need it, because IRETQ is the
+ * transfer. Both are implemented in hand-written asm for x86-64 and with
+ * <setjmp.h> for the host build. */
+int  fault_guard_enter(fault_guard_t *g);
+void fault_guard_unwind(fault_guard_t *g, int code) __attribute__((noreturn));
+
+/* Tests only: fill `g`'s slots with a plausible x86-64 context so that
+ * fault_escape()'s validation and register arithmetic can be checked without an
+ * x86-64 CPU to fault on. Refuses (returns -1) unless the build is a host test,
+ * so this cannot be used to forge a guard on the machine. */
+int fault_guard_forge(fault_guard_t *g, uint64_t rip, uint64_t rsp);
+
+/* ====================================================================== */
+/* live code patching — the model editing the running kernel              */
+/* ====================================================================== */
+
+/* WHY THIS IS EVEN POSSIBLE HERE
+ *   boot/boot.asm maps the low 4 GiB with present+writable 2 MiB pages and never
+ *   sets NX, so every page in this kernel is RWX and .text is as writable as
+ *   .data. That is normally a weakness; combined with a catchable fault and a
+ *   length decoder it is the cheapest possible route to "the machine fixed a bug
+ *   in itself" — no compiler, no linker, no reboot. A function is a byte string
+ *   and the model can edit it.
+ *
+ * WHY THAT IS TERRIFYING, AND THE FIVE THINGS THAT MAKE IT SURVIVABLE
+ *   A wrong byte here does not fault. It silently changes what the CPU does,
+ *   forever, with no record — the single worst failure mode this codebase has.
+ *   So a patch must pass all five of these, and the model is told all five:
+ *
+ *     1. IN .TEXT. [addr, addr+len) must lie inside window->text_lo..text_hi,
+ *        the linker's own [__text_start, __text_end). Not code_lo..code_hi:
+ *        that admits .rodata and .data, and a patch is not a return address.
+ *        A build that did not publish the symbols has an empty range and
+ *        refuses every patch.
+ *     2. THE CALLER MUST SAY WHAT IT EXPECTS TO FIND. `expect` is REQUIRED and
+ *        must match the live bytes exactly. This is the only defence against a
+ *        stale address — the model reasoned about a report from an earlier boot,
+ *        or from a build with different offsets, and would otherwise scribble on
+ *        an unrelated function that happens to live there now. It is also the
+ *        only evidence available that `addr` is an instruction boundary at all,
+ *        which is not decidable from the bytes alone.
+ *     3. WHOLE INSTRUCTIONS OUT. Decoding forward from `addr` with
+ *        x86_insn_length() must consume EXACTLY len bytes. One byte over and the
+ *        patch straddles a boundary, leaving the tail of an operand to be
+ *        executed as an opcode.
+ *     4. WHOLE INSTRUCTIONS IN. The replacement bytes must themselves decode to
+ *        exactly len bytes, for the same reason in the other direction. A patch
+ *        that ends mid-instruction is refused even if it is the right length.
+ *     5. ROLLBACK-ABLE, ALWAYS. The original bytes are copied into a slot before
+ *        the first byte is written, and fault_patch_revert() puts them back
+ *        after checking that the live bytes are still the ones this patch wrote
+ *        (if they are not, something else has since edited them, and blind
+ *        restoration would destroy that instead). Slots are never reused while
+ *        live, so "undo the last thing you did" is always available.
+ *
+ *   Note what is deliberately NOT claimed: nothing here can tell whether the
+ *   replacement bytes are CORRECT. They are checked for being well-formed,
+ *   in-bounds, boundary-exact and reversible. Semantics are the model's problem,
+ *   and the reason every patch is announced with a kernel trace line.
+ *
+ * HOW IT IS TESTED WITHOUT AN X86-64 KERNEL TO PATCH
+ *   Reads and writes go through fault_mem_ops_t. The kernel binds direct
+ *   identity-mapped access; tests/host/test_repair.c binds a plain byte array
+ *   and a synthetic window, so every gate above is exercised natively, on a
+ *   machine whose .text this code could not possibly reach.
+ */
+
+#define FAULT_PATCH_MAX_BYTES 32   /* longest patch; 2 x the longest insn      */
+#define FAULT_PATCH_SLOTS     16   /* live patches at once                     */
+#define FAULT_PATCH_NOTE_MAX  72   /* why, in the model's words                */
+
+typedef enum fault_patch_err {
+    FAULT_PATCH_OK = 0,
+    FAULT_PATCH_ENOWINDOW,   /* this build published no .text range           */
+    FAULT_PATCH_ENOMEM,      /* no memory accessor is bound                   */
+    FAULT_PATCH_ERANGE,      /* the target is not inside .text                */
+    FAULT_PATCH_ELEN,        /* length is 0, over the cap, or disagrees       */
+    FAULT_PATCH_EEXPECT,     /* the live bytes are not what was stated        */
+    FAULT_PATCH_EBOUNDARY,   /* the span does not cover whole instructions    */
+    FAULT_PATCH_EOPAQUE,     /* the replacement bytes do not decode           */
+    FAULT_PATCH_EOVERLAP,    /* a live patch already covers these bytes       */
+    FAULT_PATCH_ENOSPC,      /* every slot is in use                          */
+    FAULT_PATCH_ENOENT,      /* no patch with that id                         */
+    FAULT_PATCH_EGONE,       /* it has already been reverted                  */
+    FAULT_PATCH_ECHANGED,    /* the bytes are not this patch's any more       */
+    FAULT_PATCH_EIO,         /* the write did not read back                   */
+    FAULT_PATCH_COUNT
+} fault_patch_err_t;
+
+const char *fault_patch_errname(int e);   /* "EEXPECT" — never NULL          */
+const char *fault_patch_errdesc(int e);   /* one actionable sentence         */
+
+typedef struct fault_patch {
+    uint32_t id;             /* 1-based, monotonic, never reused             */
+    uint8_t  live;           /* 1 while the patched bytes are in place       */
+    uint8_t  len;
+    uint8_t  insns_out;      /* instructions the original span held          */
+    uint8_t  insns_in;       /* instructions the replacement holds           */
+    uint64_t addr;
+    uint64_t applied_ms;
+    uint64_t reverted_ms;
+    uint8_t  orig[FAULT_PATCH_MAX_BYTES];
+    uint8_t  bytes[FAULT_PATCH_MAX_BYTES];
+    char     note[FAULT_PATCH_NOTE_MAX];
+} fault_patch_t;
+
+/* What a caller is asking for. `expect` is required and `expect_len` must equal
+ * `len`: see gate 2 above. */
+typedef struct fault_patch_req {
+    uint64_t addr;
+    uint8_t  len;
+    uint8_t  expect_len;
+    uint8_t  bytes[FAULT_PATCH_MAX_BYTES];
+    uint8_t  expect[FAULT_PATCH_MAX_BYTES];
+    const char *note;         /* may be NULL; copied, bounded                */
+} fault_patch_req_t;
+
+/* How this module touches the bytes it patches. Both return 0 on success.
+ * `read` must not fault: the caller has already bounded the address. */
+typedef struct fault_mem_ops {
+    int (*read)(uint64_t addr, uint8_t *dst, unsigned len, void *ctx);
+    int (*write)(uint64_t addr, const uint8_t *src, unsigned len, void *ctx);
+    void *ctx;
+} fault_mem_ops_t;
+
+/* Bind the accessor. NULL restores the build's default: direct identity-mapped
+ * access in the kernel, and NOTHING on the host, so a host test that forgets to
+ * bind gets FAULT_PATCH_ENOMEM rather than a segfault. */
+void fault_patch_bind(const fault_mem_ops_t *ops);
+
+/* Run all five gates without writing anything. Same return value
+ * fault_patch_apply() would give. `why` is optional and always NUL-terminated
+ * when whycap > 0; it names the specific byte or bound that failed, because a
+ * refusal the model cannot act on costs a whole round trip. */
+fault_patch_err_t fault_patch_check(const fault_patch_req_t *req,
+                                    const fault_window_t *window,
+                                    char *why, size_t whycap);
+
+/* Gate, save the original bytes, write, serialise, and read back to prove it
+ * took. On FAULT_PATCH_OK, *out_id is the new patch's id. On anything else
+ * nothing was written and no slot was consumed. */
+fault_patch_err_t fault_patch_apply(const fault_patch_req_t *req,
+                                    const fault_window_t *window,
+                                    uint64_t now_ms, uint32_t *out_id,
+                                    char *why, size_t whycap);
+
+/* Put the original bytes back. Refuses with FAULT_PATCH_ECHANGED if the live
+ * bytes are not the ones this patch wrote. */
+fault_patch_err_t fault_patch_revert(uint32_t id, uint64_t now_ms,
+                                     char *why, size_t whycap);
+
+/* Revert every live patch, newest first (so overlapping generations undo in the
+ * order they were made). Returns how many were put back. */
+uint32_t fault_patch_revert_all(uint64_t now_ms);
+
+uint32_t              fault_patch_count(void);   /* slots ever used          */
+uint32_t              fault_patch_live(void);    /* currently in place       */
+const fault_patch_t  *fault_patch_at(uint32_t index);
+const fault_patch_t  *fault_patch_by_id(uint32_t id);
+/* The live patch covering `addr`, or NULL. Used to tell the model "you already
+ * patched this instruction" instead of letting it patch its own patch. */
+const fault_patch_t  *fault_patch_covering(uint64_t addr);
+
+/* Tests only: forget every slot WITHOUT restoring anything. Never call this on
+ * the machine — it is how a test starts from a clean sheet, and on real .text it
+ * would strand a patch with no way back. */
+void fault_patch_forget_all(void);
 
 /* ====================================================================== */
 /* live state — read-only, and the whole point of tools/fault_tools.c      */

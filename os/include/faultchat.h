@@ -65,6 +65,61 @@
  *       never reach a pump call site. There is no code path in which this module
  *       runs on top of a machine that has already given up.
  *
+ * ============================================================================
+ * WHAT CLOSES THE LOOP — and why this file did not have to change much to do it
+ * ============================================================================
+ *
+ *   Everything above was true before the loop was closed, and none of it has
+ *   been weakened. What was missing was not a way to ASK; it was a way to still
+ *   be running when there was something worth asking about.
+ *
+ *   The pump can only ever see faults the machine SURVIVED. Before, there were
+ *   exactly two ways to survive one: it was a continuable trap, or somebody had
+ *   armed a recovery plan in advance. A plain fatal fault with no plan halted
+ *   inside the handler and the machine never reached a pump call site — so the
+ *   very faults most worth diagnosing were the ones that could not be diagnosed.
+ *   The loop had a hole in it exactly where it mattered.
+ *
+ *   fault.h's fault_guard_run() / fault_escape() fill that hole and are the only
+ *   new ingredient. A caller that has thought about the consequences wraps what
+ *   it is doing in a guard; a fatal fault inside that call chain is caught by the
+ *   handler, which — allocation-free, device-free, exactly as before — patches
+ *   the frame so the IRETQ lands back in the guard's caller instead of halting.
+ *   The call chain is abandoned. The machine is in normal kernel context, on an
+ *   intact stack, with the fault fully recorded in the ring. THEN this module
+ *   runs, on the far side of the handler, and asks.
+ *
+ *   So the sequence the operator never has to be present for is:
+ *
+ *     fault  ->  captured in the handler (no allocation, no network)
+ *            ->  frame patched to the innermost guard; handler returns
+ *            ->  normal kernel context; the guarded caller gets ESCAPED back
+ *            ->  faultchat_pump(): build a prompt from the record, ask
+ *            ->  the reply is validated by the same tools an operator's model
+ *                turn would go through, four gates deep
+ *            ->  a recovery plan is armed and/or .text is patched
+ *            ->  the caller retries, and the retry either works or is bounded
+ *
+ *   Note where this module still refuses to be clever: it does NOT retry
+ *   anything itself, and it does not decide what to re-run. It answers one
+ *   question ("what was that, and what should be done about it") and arms what
+ *   comes back. Deciding to try again is the caller's business, because only the
+ *   caller knows what it was doing — see core/agenda.c, which does both.
+ *
+ * AND THE PART THAT MAKES A REPAIR PERMANENT
+ *   A recovery plan changes what the CPU does at the NEXT fault. That is enough
+ *   to survive, and not enough to fix: the same bad instruction is still there
+ *   and will fault again, and the plan is consumed. So a diagnosis may also
+ *   propose a "patch" — literally the input of the fault_patch tool — which
+ *   rewrites the instructions. Pages here are RWX, so the bug can be edited out
+ *   of the running kernel with no compiler and no reboot, and the ORIGINAL BYTES
+ *   ARE ALWAYS KEPT so it can be undone.
+ *
+ *   That is a much sharper instrument than a recovery plan, which is why it has
+ *   its own, much smaller budget (FAULTCHAT_MAX_PATCHES) and why the per-address
+ *   attempt limit (FAULTCHAT_MAX_PER_RIP) exists: a wrong patch does not expire,
+ *   does not fault, and costs money to keep re-diagnosing.
+ *
  * WHY NOT "LAST RITES" — a diagnosis on the way down
  *   The tempting exception is the fatal case: the machine is about to halt
  *   forever, so what is there to lose by trying? Two things, and they are the
@@ -183,6 +238,9 @@
  *   Pure parts    faultchat_build_prompt, faultchat_parse_reply,
  *                 faultchat_apply_fix, faultchat_system_prompt,
  *                 faultchat_strerror. All host-tested against net/model_mock.c.
+ *   Autonomy      faultchat_apply_patch, faultchat_patches_applied,
+ *                 faultchat_rip_attempts. The pump is what makes the machine
+ *                 repair itself with nobody watching; these are what bound it.
  *   Introspection faultchat_diagnoses, faultchat_fixes_armed,
  *                 faultchat_last_result, faultchat_last_seq,
  *                 faultchat_last_diagnosis, faultchat_last_prompt,
@@ -236,6 +294,7 @@
 #define FAULTCHAT_EHTTP      -100    /* the API answered, but not with 200     */
 #define FAULTCHAT_EFIX       -103    /* a fix was proposed and refused         */
 #define FAULTCHAT_ERECURSE   -104    /* a fault occurred during the request    */
+#define FAULTCHAT_EPATCH     -105    /* a code patch was proposed and refused  */
 
 /* ---- bounds. Every one is static .bss; nothing here allocates. ---- */
 
@@ -262,12 +321,38 @@
  * one is well under 160 bytes; anything near this is a red flag, not a plan. */
 #define FAULTCHAT_FIX_MAX        512
 
+/* The raw "patch" object handed to the fault_patch tool. Bigger than a fix
+ * because it carries two hex byte strings (up to 64 characters each) and a note,
+ * and still small enough that a runaway object is refused rather than parsed. */
+#define FAULTCHAT_PATCH_MAX      768
+
 /* Why a diagnosis ended the way it did, in one sentence. */
 #define FAULTCHAT_WHY_MAX        192
 
 /* Requests one boot may make. A machine that faults in a slow storm must not
  * spend the rest of its life talking about it. */
 #define FAULTCHAT_MAX_DIAGNOSES    4
+
+/* Code patches one boot may accept from a diagnosis. Much smaller than the
+ * diagnosis budget, and deliberately so: a diagnosis costs a round trip and
+ * some of the operator's money, but a wrong code patch costs a kernel whose
+ * behaviour nobody can predict, and unlike a recovery plan it does not expire.
+ * Two is enough to fix a thing and then fix the fix. */
+#define FAULTCHAT_MAX_PATCHES      2
+
+/* Diagnoses spent on any ONE faulting address before that address is written
+ * off for the rest of the boot.
+ *
+ * This is the bound that makes an autonomous loop a loop and not a spiral. The
+ * per-RIP re-fault counter in fault.c already stops the CPU thrashing one
+ * instruction, but it says nothing about MONEY or about progress: without this,
+ * a fault that recurs at 0x10a4f3 after every attempted repair would spend the
+ * whole diagnosis budget re-describing the same three bytes, and each round is a
+ * paid API call. After this many tries at one address the module says so, names
+ * the address, and stops asking about it - while remaining willing to diagnose a
+ * fault somewhere else, which is the difference between giving up on a bug and
+ * giving up on the machine. */
+#define FAULTCHAT_MAX_PER_RIP      2
 
 /* ---- what came back ---- */
 
@@ -284,6 +369,15 @@ typedef struct faultchat_reply {
     int    has_fix;
     char   fix[FAULTCHAT_FIX_MAX];
     size_t fix_len;
+
+    /* The proposed code patch, verbatim, as a NUL-terminated JSON object -
+     * exactly the bytes handed to the fault_patch tool as its input. Same
+     * discipline as `fix` above and for the same reason: this module does not
+     * interpret either of them, because there must be exactly one grammar for
+     * a patch and tools/fault_patch.c already owns it. */
+    int    has_patch;
+    char   patch[FAULTCHAT_PATCH_MAX];
+    size_t patch_len;
 } faultchat_reply_t;
 
 /* ====================================================================== */
@@ -340,6 +434,21 @@ int faultchat_parse_reply(const char *body, size_t len,
  * line, so the console cannot be read as if one of them happened quietly. */
 int faultchat_apply_fix(const faultchat_reply_t *reply, char *why, size_t whycap);
 
+/* Apply the proposed CODE PATCH by dispatching the real fault_patch tool with
+ * the reply's `patch` object as its input. Same contract, same reasoning, same
+ * single door as faultchat_apply_fix() - and the same refusal to interpret the
+ * object here.
+ *
+ * Returns FAULTCHAT_OK when the patch was applied, FAULTCHAT_EPATCH when the
+ * tool refused it (with the tool's own words in `why`), or FAULTCHAT_ENONE when
+ * none was proposed. Refuses without asking the tool when the per-boot patch
+ * budget is spent, because "how much of this kernel has been rewritten
+ * unattended" is a quantity that must be bounded here, where it can be counted,
+ * rather than in the tool, which cannot tell an operator's patch from the
+ * kernel's own. */
+int faultchat_apply_patch(const faultchat_reply_t *reply,
+                          char *why, size_t whycap);
+
 /* Static description of a FAULTCHAT_* code. Never NULL. */
 const char *faultchat_strerror(int rc);
 
@@ -387,6 +496,13 @@ int faultchat_pump(void);
  * storm should not spend its boot announcing that it cannot ask. */
 uint32_t    faultchat_diagnoses(void);
 uint32_t    faultchat_fixes_armed(void);    /* proposed fixes that were armed  */
+uint32_t    faultchat_patches_applied(void);/* proposed code patches applied   */
+
+/* How many diagnoses this boot has already spent on `rip`, and the address the
+ * module is currently counting against. A caller that wants to know whether the
+ * loop is making progress reads these. */
+uint32_t    faultchat_rip_attempts(uint64_t rip);
+uint64_t    faultchat_worst_rip(void);
 int         faultchat_last_result(void);    /* the last FAULTCHAT_* code       */
 uint32_t    faultchat_last_seq(void);       /* which fault was last diagnosed  */
 const char *faultchat_last_diagnosis(void); /* sanitised prose; "" if none     */

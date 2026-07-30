@@ -99,8 +99,24 @@
  *     - the arena is its own .bss object with 64 KiB of poisoned guard band
  *       either side, and dvm_dma_check() reports an overrun of up to that much
  *       as a fact with a byte offset, to the model and to the trace;
- *     - every value the program wrote into a device register is in the access
- *       log, so the address it handed the hardware is on the record.
+ *     - the values a program wrote into device registers are recorded twice, in
+ *       two records with OPPOSITE blind spots, so the address it handed the
+ *       hardware is usually — but NOT always — recoverable. Stated precisely,
+ *       because this bullet is part of the argument for accepting the escalation
+ *       and it used to claim "every value ... is in the access log", which is
+ *       false:
+ *         * g_log, which driver_run's tail and driver_trace read, is a RING of
+ *           DRV_LOG_MAX (256) events against a budget of DRV_MAX_IO (1024). It
+ *           keeps the LAST 256, so it loses the START of a long run;
+ *         * the serial console trace in vm/dvm.c is bounded by max_trace (128 for
+ *           trace=io, 256 for trace=all) and keeps the FIRST N, so it loses the
+ *           END.
+ *       A program that polls 200 times, then writes a wild descriptor address,
+ *       then polls 300 more times (501 events — an ordinary bring-up shape, and
+ *       inside budget) has that write in NEITHER record. driver_trace is honest at
+ *       the point of use ("%lu events happened; the last %lu are kept"), and this
+ *       comment now is too. Closing the hole needs the log to keep both ends
+ *       rather than one, which is a bigger change than a constant.
  *
  *   A determined program can still compute a completely different 32-bit number
  *   and write it into a descriptor-base register, and that DMA will happen. This
@@ -169,6 +185,7 @@
 #include "pci.h"
 #include "json.h"
 #include "trace.h"
+#include "vfs.h"
 #include "kernel.h"
 
 #include <stdarg.h>
@@ -181,7 +198,29 @@
 #define DRV_TARGETS_TRACKED 8       /* targets whose attempts we remember    */
 #define DRV_LOG_MAX         256     /* device events kept from the last run  */
 #define DRV_BASES_MAX       128     /* BAR bases collected from the whole bus */
-#define DRV_ROW_MARGIN      200     /* result bytes held back for the footer */
+/* RESULT BUDGET ARITHMETIC, and it has to be arithmetic rather than a guess.
+ *
+ * The number that matters is NOT the 4096 a host test passes; it is
+ * CHAT_TOOL_RESULT_CAP, which is 1024 (net/chat.c keeps one shared result buffer
+ * that size). Every driver_targets answer a model has ever read was capped at
+ * 1024 bytes, and one usable row is 260-300 of them.
+ *
+ * DRV_ROW_MARGIN used to be 200 and was checked BEFORE a row was emitted. The
+ * footer is about 240 bytes, so at len ~= 780 the check passed, the ~300-byte row
+ * was written, the result hard-truncated mid-token, and the "...more not shown"
+ * line and the "targets: N known, M can be driven, K shown" summary were never
+ * written AT ALL. The model got a listing that stopped mid-word with no count and
+ * no hint that anything was missing.
+ *
+ * So the footer is RESERVED, and a row is only started if the whole of it plus
+ * the whole footer still fit. DRV_ROW_MAX is a worst case measured against the
+ * widest row this file can produce (a target line, a sandbox line carrying four
+ * BAR windows plus a DMA grant, a preloaded-register line, a pci-cmd line and an
+ * attempts line). Being generous here costs at most one row and buys the property
+ * that a row is never cut in half. */
+#define DRV_ROW_MAX         384     /* worst case for one whole target row    */
+#define DRV_FOOTER_RESERVE  300     /* the summary lines, which always print  */
+#define DRV_ROW_MARGIN      200     /* legacy guard for the other listings    */
 
 /* Window sizing. An I/O BAR is at most 256 bytes by the PCI spec; 1 MiB is a
  * generous ceiling for a memory BAR that the neighbour clamp normally beats. */
@@ -204,6 +243,37 @@
 #define DRV_MAX_DMA_OPS     (DVM_DMA_SIZE / 2)
 #define DRV_TRACE_IO_LINES  128u     /* console lines at trace=io            */
 #define DRV_TRACE_ALL_LINES 256u     /* ...and at trace=all                  */
+
+/* Scratch memory and the kernel calls. A text-shaped program does a handful of
+ * passes over the arena, so 64 of them is slack rather than a limit; 64
+ * syscalls is more filesystem traffic than any one program should need and far
+ * less than a loop would make. */
+#define DRV_MAX_MEM_BYTES   (64ull * DVM_MEM_SIZE)
+#define DRV_MAX_SYS         64u
+
+/* THE SUBTREE A PROGRAM MAY NAME A FILE IN.
+ *
+ * fs.write is the widest hole in the syscall set: a program that can write
+ * files can leave something a later turn will read and believe. Confining it to
+ * one directory is what keeps "the model wrote a program that wrote a file"
+ * from being able to touch anything the model put somewhere else with
+ * write_file, and it gives the operator one place to look.
+ *
+ * "/" would have been the lazy choice and is exactly what dvm.c refuses to
+ * assume: an empty fs_root with an fs syscall granted is a policy error there,
+ * so this constant has to be typed by somebody. */
+#define DRV_FS_ROOT         "/vm"
+
+/* Bytes of the scratch arena echoed back after a run. This is a program's
+ * OUTPUT channel for anything wider than sixteen registers, and 192 bytes is
+ * enough to show a built request or a parsed field without eating the access
+ * log's room in a 1 KiB result. */
+#define DRV_SCRATCH_SHOW    192
+
+/* The name a program with no device runs under, in the attempt table and in
+ * every message. It cannot collide with a device: pci.c names its nodes
+ * "pci<bb>:<dd>.<f>" and resolve_target only ever matches a registered one. */
+#define DRV_SOFTWARE_NAME   "(no device)"
 
 /* The platform block: IOAPIC, HPET, local APIC. No BAR belongs here, and a
  * program that reached it would be reprogramming interrupt routing. */
@@ -606,7 +676,7 @@ typedef struct {
     dvm_policy_t pol;
     uint64_t     args[DVM_NARGS]; /* see DVM_ARG_*: BARs, bdf, dma base+size */
     int          nargs;
-    char         text[224];       /* "ports 0xd000-0xd0ff; mmio none; ..."   */
+    char         text[288];       /* "ports 0xd000-0xd0ff; mmio none; ..."   */
     int          nwin;
 } sandbox_t;
 
@@ -752,10 +822,68 @@ static void put_cmd_bits(char *buf, size_t cap, uint16_t bits) {
     if (!n) catf(buf, cap, 0, "none");
 }
 
-/* Build the policy from the target's BARs. Returns 0, or -1 with `why` set. */
-static int build_sandbox(const target_t *t, sandbox_t *sb,
-                         uint64_t max_steps, uint64_t delay_us, dvm_trace_t trace,
-                         char *why, size_t cap) {
+/* THE SYSCALLS A PROGRAM GETS, one line of justification each. Every one of
+ * them is a hole; the point of listing them here rather than looping over the
+ * enum is that adding a syscall to dvm.h must not silently grant it.
+ *
+ *   con.write   the program's own voice. It goes out through trace.c, so it
+ *               cannot forge a kernel line, and it is charged to max_prints.
+ *   fs.read     a program that can keep what it computed, and read it back on
+ *   fs.write    a later turn, is the difference between a machine that learns
+ *   fs.size     and one that starts over. Confined to DRV_FS_ROOT.
+ *   audio.tone  the machine can already make a sound; a program that can ask
+ *               for one can report progress without the operator reading a log.
+ *               CAVEAT, and it is not a small one: if the machine's audio sink
+ *               is itself a driver program (the normal outcome of this tool),
+ *               servicing this syscall would mean running a second program
+ *               while this one is mid-flight, and dvm_run() refuses that with
+ *               DVM_TRAP_REENTRY. So audio.tone works from a program only while
+ *               the sink is native C. That refusal is the correct answer rather
+ *               than a limitation to route around: the two programs would share
+ *               one scratch arena and one pair of DMA guard bands, and the inner
+ *               one silently erased both for the outer one.
+ *   time.ms     a timeout that is a real timeout rather than a loop count.
+ *
+ * NOT granted, because it does not exist: anything that reaches the network.
+ * See include/dvm.h's FUTURE EXTENSION POINTS. */
+static void grant_syscalls(dvm_policy_t *pol, char *why, size_t cap) {
+    dvm_policy_allow_sys(pol, DVM_SYS_CON_WRITE);
+    dvm_policy_allow_sys(pol, DVM_SYS_FS_READ);
+    dvm_policy_allow_sys(pol, DVM_SYS_FS_WRITE);
+    dvm_policy_allow_sys(pol, DVM_SYS_FS_SIZE);
+    dvm_policy_allow_sys(pol, DVM_SYS_AUDIO_TONE);
+    dvm_policy_allow_sys(pol, DVM_SYS_TIME_MS);
+    if (dvm_policy_set_fs_root(pol, DRV_FS_ROOT) != 0) {
+        /* Unreachable with a literal constant, and checked anyway: an fs
+         * syscall with no root is a policy error one layer down, and finding
+         * out here beats finding out in dvm_run(). */
+        snprintf(why, cap, "the VM refused \"%s\" as a filesystem root, which is a "
+                           "kernel bug", DRV_FS_ROOT);
+    }
+    pol->max_sys       = DRV_MAX_SYS;
+    pol->max_mem_bytes = DRV_MAX_MEM_BYTES;
+}
+
+/* The one directory a program may write in has to exist before it can. mkdir is
+ * idempotent enough for this: an existing directory returns VFS_EEXIST and the
+ * program's own fs.write is where a real failure gets reported, with the path
+ * the program actually named. */
+static void ensure_fs_root(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    vfs_mkdir(DRV_FS_ROOT);
+}
+
+/* The budgets and grants that do not depend on a device: scratch memory, the
+ * syscalls, and the counters every run shares. Split out so that a program with
+ * no target gets exactly the same non-device machine as one with a target. */
+static void base_sandbox(sandbox_t *sb, uint64_t max_steps, uint64_t delay_us,
+                         dvm_trace_t trace, char *why, size_t cap) {
+    /* Cleared HERE, not by the callers: `why` arrives holding whatever the last
+     * function to fail wrote into it, and the two lines below read it as "did
+     * grant_syscalls object". */
+    if (cap) why[0] = '\0';
     memset(sb, 0, sizeof *sb);
     dvm_policy_init(&sb->pol);
     sb->pol.max_steps           = max_steps;
@@ -766,6 +894,39 @@ static int build_sandbox(const target_t *t, sandbox_t *sb,
     sb->pol.trace               = trace;
     sb->pol.max_trace           = (trace == DVM_TRACE_ALL) ? DRV_TRACE_ALL_LINES
                                                            : DRV_TRACE_IO_LINES;
+    grant_syscalls(&sb->pol, why, cap);
+}
+
+/* A program with no device at all. No ports, no MMIO, no PCI function and no
+ * DMA grant — which is not a weakened driver sandbox but the absence of one,
+ * and is why this is the shape to run anything that is not a driver in. It
+ * still has the scratch arena, the strings and the syscalls, because those are
+ * properties of the machine rather than grants. */
+static int build_software_sandbox(sandbox_t *sb, uint64_t max_steps,
+                                  uint64_t delay_us, dvm_trace_t trace,
+                                  char *why, size_t cap) {
+    base_sandbox(sb, max_steps, delay_us, trace, why, cap);
+    if (why[0]) return -1;
+    sb->nargs = 0;
+    snprintf(sb->text, sizeof sb->text,
+             "no device; %u bytes of scratch memory; syscalls under %s",
+             (unsigned)DVM_MEM_SIZE, DRV_FS_ROOT);
+
+    char pmsg[DVM_MSG_MAX];
+    if (dvm_policy_check(&sb->pol, pmsg, sizeof pmsg) != DVM_OK) {
+        snprintf(why, cap, "the VM refused a sandbox with no device in it, which is "
+                           "a kernel bug: %s", pmsg);
+        return -1;
+    }
+    return 0;
+}
+
+/* Build the policy from the target's BARs. Returns 0, or -1 with `why` set. */
+static int build_sandbox(const target_t *t, sandbox_t *sb,
+                         uint64_t max_steps, uint64_t delay_us, dvm_trace_t trace,
+                         char *why, size_t cap) {
+    base_sandbox(sb, max_steps, delay_us, trace, why, cap);
+    if (why[0]) return -1;
 
     scan_bar_bases();
 
@@ -861,6 +1022,12 @@ static int build_sandbox(const target_t *t, sandbox_t *sb,
     sb->args[DVM_ARG_DMA_SIZE] = dma_size;
     sb->nargs = DVM_NARGS;
 
+    /* The scratch arena and the syscalls are deliberately NOT named here. They
+     * are identical for every target — they are properties of the machine, not
+     * of this device — and driver_targets prints one of these lines per device
+     * into a 1 KiB result. Repeating 34 bytes of unchanging text per row cost
+     * two whole devices off the end of the list the first time it was tried.
+     * They are stated once, in each tool's footer. */
     snprintf(sb->text, sizeof sb->text,
              "ports %s; mmio %s; pci %02x:%02x.%x; dma 0x%lx+0x%lx",
              np ? ports : "none", nm ? mmio : "none", t->bus, t->dev, t->fn,
@@ -974,18 +1141,50 @@ static const dvm_io_t *recorder_bind(const dvm_io_t *io) {
     if (io->mmio_read)  g_recorder.mmio_read  = rec_mmio_read;
     if (io->pci_read32) g_recorder.pci_read32 = rec_pci_read32;
     if (io->delay_us)   g_recorder.delay_us   = rec_delay_us;
+    /* Carried through unwrapped. A syscall is not a device access and does not
+     * belong in the access log; dropping it here instead would silently take
+     * the kernel away from every program driver_run has ever executed. */
+    g_recorder.sys = io->sys;
     return &g_recorder;
 }
 
-/* The backend a run executes against. dvm_io_hardware() is NULL on a host
- * build, where there are no in/out instructions; tests substitute a synthetic
- * device through dvm_tools_set_io(). */
-static const dvm_io_t *g_io_override;
+/* The backends a run executes against. dvm_io_hardware() and dvm_sys_kernel()
+ * are NULL on a host build, where there are no in/out instructions and no
+ * kernel; tests substitute synthetic ones through the two setters below. */
+static const dvm_io_t  *g_io_override;
+static const dvm_sys_t *g_sys_override;
 
-void dvm_tools_set_io(const dvm_io_t *io) { g_io_override = io; }
+void dvm_tools_set_io(const dvm_io_t *io)   { g_io_override = io; }
+void dvm_tools_set_sys(const dvm_sys_t *s)  { g_sys_override = s; }
+
+static const dvm_sys_t *kernel_sys(void) {
+    return g_sys_override ? g_sys_override : dvm_sys_kernel();
+}
+
+/* A device backend with the current kernel behind it. The override path has to
+ * splice rather than replace: a test that supplies a synthetic DEVICE still
+ * wants the syscall backend it separately supplied, and dvm_io_hardware()'s own
+ * struct is const. */
+static dvm_io_t g_bound_io;
 
 static const dvm_io_t *hardware_io(void) {
-    return g_io_override ? g_io_override : dvm_io_hardware();
+    const dvm_io_t *base = g_io_override ? g_io_override : dvm_io_hardware();
+    if (!base) return NULL;
+    if (!g_sys_override) return base;
+    g_bound_io = *base;
+    g_bound_io.sys = g_sys_override;
+    return &g_bound_io;
+}
+
+/* No device at all: every hook NULL, so every device opcode traps NO_BACKEND
+ * rather than reaching something. The syscalls are all a software program has,
+ * and that is the point. */
+static dvm_io_t g_soft_io;
+
+static const dvm_io_t *software_io(void) {
+    memset(&g_soft_io, 0, sizeof g_soft_io);
+    g_soft_io.sys = kernel_sys();
+    return &g_soft_io;
 }
 
 /* ====================================================================== */
@@ -1045,7 +1244,7 @@ static void attempts_record(const char *name, int ok) {
 static struct {
     int          valid;
     char         target[DRV_NAME_MAX + 1];
-    char         sandbox[224];          /* must hold sandbox_t.text              */
+    char         sandbox[sizeof ((sandbox_t *)0)->text];  /* never shorter */
     char         insn[80];              /* the stopping instruction, disassembled */
     char         srcline[112];          /* the model's own text for that line     */
     char         dma_msg[DVM_MSG_MAX];  /* "" unless a device overran the buffer  */
@@ -1143,14 +1342,42 @@ static void put_registers(tool_result_t *r, const dvm_result_t *res) {
 static void put_counters(tool_result_t *r, const dvm_result_t *res) {
     tool_result_printf(r,
         "ran %lu steps, %lu device accesses (port rd %lu wr %lu, mmio rd %lu wr %lu, "
-        "pci %lu), %lu dma buffer accesses (rd %lu wr %lu), %lu us delay, %lu prints\n",
+        "pci %lu), %lu dma buffer accesses (rd %lu wr %lu), %lu us delay, %lu prints, "
+        "%lu scratch bytes touched, %lu syscalls\n",
         (unsigned long)res->steps, (unsigned long)res->io_ops,
         (unsigned long)res->n_port_rd, (unsigned long)res->n_port_wr,
         (unsigned long)res->n_mmio_rd, (unsigned long)res->n_mmio_wr,
         (unsigned long)res->n_pci_rd,
         (unsigned long)res->n_dma_rd + res->n_dma_wr,
         (unsigned long)res->n_dma_rd, (unsigned long)res->n_dma_wr,
-        (unsigned long)res->delay_us, (unsigned long)res->prints);
+        (unsigned long)res->delay_us, (unsigned long)res->prints,
+        (unsigned long)res->mem_bytes, (unsigned long)res->n_sys);
+    if (res->sys_msg[0])
+        tool_result_printf(r, "last syscall failure: %s\n", res->sys_msg);
+}
+
+/* The start of the scratch arena, as text. A program's answer is often wider
+ * than sixteen registers — a built request, a field it picked out — and this is
+ * where it comes back. The arena still holds what the run left; the NEXT
+ * dvm_run() is what zeroes it.
+ *
+ * Every byte here is model-authored, so every byte that is not printable ASCII
+ * becomes '.', including the newlines: this text goes into a tool result that
+ * is quoted back to the model and may be shown to the operator, and a '[' in
+ * column zero is the one thing nothing model-controlled may ever produce. The
+ * fixed prefix in front of it means column zero is never the program's. */
+static void put_scratch(tool_result_t *r, const dvm_result_t *res) {
+    if (!res->mem_hwm) return;
+    unsigned n = res->mem_hwm < DRV_SCRATCH_SHOW ? res->mem_hwm : DRV_SCRATCH_SHOW;
+    unsigned char raw[DRV_SCRATCH_SHOW];
+    char          txt[DRV_SCRATCH_SHOW + 1];
+    size_t got = dvm_mem_peek(0, raw, n);
+    size_t i;
+    for (i = 0; i < got; i++)
+        txt[i] = (raw[i] >= 0x20 && raw[i] < 0x7F) ? (char)raw[i] : '.';
+    txt[i] = '\0';
+    tool_result_printf(r, "scratch[0..%lu) of %lu written: %s\n",
+                       (unsigned long)got, (unsigned long)res->mem_hwm, txt);
 }
 
 /* What the KERNEL did to config space around this run. The model needs this for
@@ -1217,9 +1444,13 @@ static void put_log_tail(tool_result_t *r) {
 typedef struct {
     tool_result_t *r;
     int  limit;
+    int  offset;              /* skip this many matching rows before printing */
     int  include_unusable;
     int  want_usable;         /* this pass prints usable rows / unusable rows */
     int  matched, shown, usable, stopped;
+    int  skipped;             /* rows the offset stepped over                */
+    int  eligible;            /* rows that would have printed given room     */
+    int  out_of_room;         /* stopped because of BYTES, not because of limit */
 } tlist_t;
 
 static void target_row(device_t *d, void *ctx) {
@@ -1250,7 +1481,22 @@ static void target_row(device_t *d, void *ctx) {
     }
     if (ok != s->want_usable) return;
     if (!ok && !s->include_unusable) return;
-    if (s->stopped || s->shown >= s->limit || room_low(s->r)) { s->stopped = 1; return; }
+
+    /* This row is one the caller asked for. Count it before deciding whether
+     * there is room, so the footer can say exactly how many were left out. */
+    s->eligible++;
+    if (s->skipped < s->offset) { s->skipped++; return; }
+    if (s->shown >= s->limit) { s->stopped = 1; return; }
+
+    /* Room for the WHOLE row AND the whole footer, checked before a byte of the
+     * row is written. Anything less and the result truncates mid-token and loses
+     * the summary — see DRV_ROW_MAX. */
+    if (s->r->truncated ||
+        s->r->len + DRV_ROW_MAX + DRV_FOOTER_RESERVE >= s->r->cap) {
+        s->stopped = 1;
+        s->out_of_room = 1;
+        return;
+    }
 
     tool_result_printf(s->r, "target=%s %02x:%02x.%x %04x:%04x class=%02x:%02x\n",
                        t.name, t.bus, t.dev, t.fn,
@@ -1309,6 +1555,18 @@ static int t_driver_targets(const tool_call_t *c, tool_result_t *r) {
         return fail(r, TOOL_EINVAL, "driver_targets", "",
                     "\"include_unusable\" must be a boolean");
 
+    /* PAGING, because "raise limit" was advice that could not work. One row is up
+     * to 384 bytes and a model's whole result is CHAT_TOOL_RESULT_CAP = 1024, so
+     * two or three rows is the most any single answer can carry, whatever `limit`
+     * says. Without an offset the functions past the first few were simply
+     * unreachable — on a machine with several unclaimed devices the sound card
+     * could be one of them. */
+    int64_t off;
+    rc = f_int(&in, "offset", 0, 4096, &off);
+    if (rc < 0) return fail(r, TOOL_EINVAL, "driver_targets", "",
+                            "\"offset\" must be an integer 0-4096");
+    if (rc == 1) s.offset = (int)off;
+
     /* Usable targets first: the answer is clipped to the model's result budget,
      * and the row it can act on must not be the one that falls off the end. */
     bases_invalidate();
@@ -1319,11 +1577,36 @@ static int t_driver_targets(const tool_call_t *c, tool_result_t *r) {
         device_foreach(target_row, &s);
     }
 
-    if (s.stopped)
-        tool_result_printf(r, "...more not shown (raise \"limit\")\n");
+    /* THE FOOTER ALWAYS PRINTS. DRV_FOOTER_RESERVE is held back for exactly this,
+     * because a listing that stops with no count and no reason is worse than a
+     * short one: the model cannot tell the difference between "that is all there
+     * is" and "there were ten more". Say how many, and say what to do — and the
+     * advice has to be true. When the stop was caused by the BYTE budget, raising
+     * "limit" changes nothing at all; the only thing that works is another call
+     * with an "offset". */
+    int not_shown = s.eligible - s.skipped - s.shown;
+    if (not_shown < 0) not_shown = 0;
+    if (not_shown > 0) {
+        if (s.out_of_room)
+            tool_result_printf(r,
+                "...%d more matched but this result is full (%d bytes is the whole "
+                "budget). Call again with \"offset\": %d - raising \"limit\" will "
+                "not help\n",
+                not_shown, (int)r->cap, s.offset + s.shown);
+        else
+            tool_result_printf(r, "...%d more not shown (raise \"limit\")\n",
+                               not_shown);
+    }
     tool_result_printf(r,
-        "targets: %d PCI function(s) known, %d can be driven by a program, %d shown\n",
+        "targets: %d PCI function(s) known, %d can be driven by a program, %d shown",
         s.matched, s.usable, s.shown);
+    if (s.offset) tool_result_printf(r, " after skipping %d", s.skipped);
+    tool_result_printf(r, "\n");
+    /* Once, not per row: every program gets these, target or no target. */
+    tool_result_printf(r,
+        "every program also gets %u bytes of scratch memory and the syscalls under "
+        "%s; driver_run with no \"target\" runs one with no device at all\n",
+        (unsigned)DVM_MEM_SIZE, DRV_FS_ROOT);
     if (!s.usable)
         tool_result_printf(r,
             "none are targetable right now; add include_unusable=true to see why "
@@ -1337,17 +1620,18 @@ static const tool_t driver_targets_tool = {
     .name = "driver_targets",
     .description =
         "List the devices a driver program may be run against. For each one: the "
-        "sandbox it would get (port ranges and MMIO windows derived from that "
-        "device's own BARs), the PCI function opened for pcicfg, the DMA scratch "
-        "buffer, the registers preloaded before the first instruction, and the "
-        "PCI command bits the kernel will set on it. include_unusable=true also "
-        "lists the devices that cannot be driven and why: claimed by a driver, no "
-        "programmed BAR, a display controller (the operator's console), or a BAR the "
-        "VM never allows. driver_run accepts only a target named here.",
+        "sandbox it would get (ports and MMIO derived from that device's own "
+        "BARs), the PCI function opened for pcicfg, the DMA buffer, the registers "
+        "preloaded before the first instruction, and the PCI command bits the "
+        "kernel will set. include_unusable=true also lists what cannot be driven "
+        "and why: claimed by a driver, no programmed BAR, a display controller "
+        "(the operator's console), or a BAR the VM never allows. A result holds two "
+        "or three rows; if it says more matched, call again with \"offset\".",
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
         "\"include_unusable\":{\"type\":\"boolean\",\"description\":\"also list devices that cannot be targeted, with the reason\"},"
-        "\"limit\":{\"type\":\"integer\",\"description\":\"max rows, 1-64 (default 16)\"}"
+        "\"limit\":{\"type\":\"integer\",\"description\":\"max rows, 1-64 (default 16)\"},"
+        "\"offset\":{\"type\":\"integer\",\"description\":\"skip this many rows: pages a listing too big for one result\"}"
         "},\"required\":[]}",
     .flags  = 0,
     .invoke = t_driver_targets,
@@ -1452,12 +1736,11 @@ static int t_driver_assemble(const tool_call_t *c, tool_result_t *r) {
 static const tool_t driver_assemble_tool = {
     .name = "driver_assemble",
     .description =
-        "Check that a driver program assembles. Touches no hardware and spends "
-        "none of driver_run's attempts, so use it for every syntax question. "
-        "Returns the instruction, label and string counts, or the first error with "
-        "its line number and the text of that line; listing=true adds a numbered "
-        "disassembly, which is how to confirm the assembler read an addressing "
-        "form the way you meant it.",
+        "Check that a program assembles. Touches no hardware and spends none of "
+        "driver_run's attempts, so use it for every syntax question. Returns the "
+        "instruction, label and string counts, or the first error with its line "
+        "number and that line's text; listing=true adds a numbered disassembly, "
+        "which confirms the assembler read an addressing form the way you meant.",
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
         "\"source\":{\"type\":\"string\",\"description\":\"the program text (see driver_run for the instruction set)\"},"
@@ -1490,25 +1773,37 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
     if (parse_obj(c, &in) != TOOL_OK)
         return fail(r, TOOL_EINVAL, "driver_run", "", "input must be a JSON object");
 
-    /* ---- the target names a device, and only a device ---- */
+    /* ---- the target names a device, and only a device ----
+     *
+     * OPTIONAL, and its absence is a mode rather than a default. With a name,
+     * this is the driver tool it has always been. Without one there is no
+     * device sandbox at all — no ports, no MMIO, no PCI function, no DMA — and
+     * what is left is the scratch arena, the string instructions and the
+     * syscalls. That is the shape for everything the model wants to build that
+     * is not a driver, and it costs eleven bytes of schema rather than a
+     * fiftieth tool's worth. */
     char name[DRV_NAME_MAX + 1];
     int  rc = f_str(&in, "target", name, sizeof name, NULL);
-    if (rc == 0)  return fail(r, TOOL_EINVAL, "driver_run", "",
-                              "\"target\" is required: the name of the device to drive, "
-                              "from driver_targets");
     if (rc == -1) return fail(r, TOOL_EINVAL, "driver_run", "", "\"target\" must be a string");
     if (rc == -2) return fail(r, TOOL_ENOENT, "driver_run", "<oversized>",
                               "no such device: a name longer than %d characters cannot "
                               "match anything registered", DRV_NAME_MAX);
+    int software = (rc == 0);
 
     bases_invalidate();
 
     char why[DVM_MSG_MAX + 96];
+    why[0] = '\0';
     target_t t;
-    if (resolve_target(name, &t, why, sizeof why) != 0)
-        return fail(r, TOOL_ENOENT, "driver_run", name, "%s", why);
-    if (target_blocked(&t, why, sizeof why) != 0)
-        return fail(r, TOOL_EINVAL, "driver_run", t.name, "%s", why);
+    memset(&t, 0, sizeof t);
+    if (software) {
+        snprintf(t.name, sizeof t.name, "%s", DRV_SOFTWARE_NAME);
+    } else {
+        if (resolve_target(name, &t, why, sizeof why) != 0)
+            return fail(r, TOOL_ENOENT, "driver_run", name, "%s", why);
+        if (target_blocked(&t, why, sizeof why) != 0)
+            return fail(r, TOOL_EINVAL, "driver_run", t.name, "%s", why);
+    }
 
     /* ---- the retry budget, checked before anything is assembled ---- */
     unsigned used = attempts_used(t.name);
@@ -1544,12 +1839,16 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
     rc = want_source(&in, r, "driver_run", t.name);
     if (rc != 0) return rc;
 
-    /* ---- the sandbox, derived from the device ---- */
+    /* ---- the sandbox: derived from the device, or from nothing ---- */
+    ensure_fs_root();
     sandbox_t sb;
-    if (build_sandbox(&t, &sb, max_steps, delay_us, trace, why, sizeof why) != 0)
+    int built = software
+        ? build_software_sandbox(&sb, max_steps, delay_us, trace, why, sizeof why)
+        : build_sandbox(&t, &sb, max_steps, delay_us, trace, why, sizeof why);
+    if (built != 0)
         return fail(r, TOOL_EINVAL, "driver_run", t.name, "%s", why);
 
-    const dvm_io_t *io = hardware_io();
+    const dvm_io_t *io = software ? software_io() : hardware_io();
     if (!io)
         return fail(r, TOOL_EINVAL, "driver_run", t.name,
                     "this build has no hardware I/O backend, so no program can run");
@@ -1600,11 +1899,12 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
      * the sandbox has been proved buildable, and it is undone below if the program
      * did not reach halt. The ISA still has no config-space write. */
     uint16_t cmd_before = 0;
-    uint16_t want_bits  = PCI_CMD_MASTER |
-                          (sb.pol.nport ? PCI_CMD_IO  : 0) |
-                          (sb.pol.nmmio ? PCI_CMD_MEM : 0);
-    uint16_t cmd_added  = cmd_enable(&t, want_bits, &cmd_before);
-    {
+    uint16_t cmd_added  = 0;
+    if (!software) {
+        uint16_t want_bits = PCI_CMD_MASTER |
+                             (sb.pol.nport ? PCI_CMD_IO  : 0) |
+                             (sb.pol.nmmio ? PCI_CMD_MEM : 0);
+        cmd_added = cmd_enable(&t, want_bits, &cmd_before);
         char bits[48], had[48];
         put_cmd_bits(bits, sizeof bits, cmd_added);
         put_cmd_bits(had,  sizeof had,  (uint16_t)(want_bits & cmd_before));
@@ -1660,24 +1960,40 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
      * halt: the device wrote outside the only buffer it was given. Crediting that
      * as progress would clear the attempt budget for a program that is corrupting
      * memory, which is the last program that should get unlimited retries. */
-    int converged = (st == DVM_OK) && res.io_ops > 0 && !dma_overrun;
+    /* A software program has no device to touch, so "it spoke to the device" is
+     * the wrong test for it — but "it reached halt" alone would still let the
+     * one-instruction program `halt` clear the budget between failures. What
+     * counts as progress with no device is that it computed or asked for
+     * SOMETHING: memory, a syscall. */
+    int did_work = software ? (res.mem_bytes > 0 || res.n_sys > 0)
+                            : (res.io_ops > 0);
+    int converged = (st == DVM_OK) && did_work && !dma_overrun;
     attempts_record(t.name, converged);
 
     /* ---- what the model reads ---- */
-    tool_result_printf(r, "target=%s %02x:%02x.%x %04x:%04x attempt %u of %d\n",
-                       t.name, t.bus, t.dev, t.fn,
-                       (unsigned)t.vendor, (unsigned)t.device,
-                       g_last.attempt, DRV_ATTEMPT_BUDGET);
+    if (software)
+        tool_result_printf(r, "no device (software program) attempt %u of %d\n",
+                           g_last.attempt, DRV_ATTEMPT_BUDGET);
+    else
+        tool_result_printf(r, "target=%s %02x:%02x.%x %04x:%04x attempt %u of %d\n",
+                           t.name, t.bus, t.dev, t.fn,
+                           (unsigned)t.vendor, (unsigned)t.device,
+                           g_last.attempt, DRV_ATTEMPT_BUDGET);
     tool_result_printf(r, "sandbox: %s\n", g_last.sandbox);
-    put_bme(r, sb.args[DVM_ARG_DMA_BASE], cmd_before, cmd_added, cmd_cleared);
+    if (!software) {
+        tool_result_printf(r, "also: %u bytes of scratch memory (zeroed), syscalls "
+                              "under %s\n", (unsigned)DVM_MEM_SIZE, DRV_FS_ROOT);
+        put_bme(r, sb.args[DVM_ARG_DMA_BASE], cmd_before, cmd_added, cmd_cleared);
+    }
 
     if (st == DVM_OK) {
         tool_result_printf(r, "status=OK - the program reached halt at line %lu\n",
                            (unsigned long)res.line);
         if (!converged)
-            tool_result_printf(r, "note: it reached halt without touching the device "
-                                  "once, so this does not count as progress and the "
-                                  "attempt was spent\n");
+            tool_result_printf(r, "note: it reached halt without %s, so this does not "
+                                  "count as progress and the attempt was spent\n",
+                               software ? "touching memory or calling the kernel once"
+                                        : "touching the device once");
     } else {
         r->is_error = 1;
         tool_result_printf(r, "status=%s at line %lu (pc %lu)\n",
@@ -1691,6 +2007,7 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
 
     put_counters(r, &res);
     put_registers(r, &res);
+    put_scratch(r, &res);
     if (dma_overrun) {
         r->is_error = 1;
         tool_result_printf(r, "DMA WENT OUT OF BOUNDS: %s. The guard band either side of "
@@ -1698,7 +2015,7 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
                               "time, but a length or descriptor count you gave the device "
                               "is wrong.\n", dma_msg);
     }
-    put_log_tail(r);
+    if (!software) put_log_tail(r);
 
     if (!converged) {
         unsigned used_now = attempts_used(t.name);
@@ -1727,61 +2044,73 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
 static const tool_t driver_run_tool = {
     .name = "driver_run",
     .description =
-        "Write a device driver and run it, on the kernel's driver VM, against ONE "
-        "NAMED DEVICE from driver_targets. The sandbox is derived from that "
-        "device's BARs: a program reaches that device and the DMA buffer below and "
-        "nothing else - not kernel memory, the interrupt controllers, the console "
-        "or any other device - and it cannot loop forever. On a trap you get the "
-        "reason, the source line, that instruction disassembled, the final "
-        "registers, and the tail of the access log with the values the device "
-        "really returned. Fix it and call again; 5 failed attempts per target, so "
-        "read the log instead of guessing. This writes to real hardware "
-        "registers.\n"
-        "MACHINE: 16 registers r0-r15, 64-bit, UNSIGNED. A 32-deep data stack and "
-        "a separate 16-deep call stack. ON ENTRY: r0-r5 hold this device's BAR base "
-        "addresses (0 if that BAR is unused), r6 holds its bdf for pcicfg, r7 holds "
-        "the PHYSICAL address of a DMA scratch buffer and r8 holds that buffer's "
-        "size in bytes.\n"
-        "THE DMA BUFFER (r7 = PHYSICAL address, r8 = size): the only memory here. "
-        "ld/st reach any naturally-aligned location in [r7, r7+r8) just as they reach "
-        "MMIO. 256 KiB, page-aligned. Because r7 is physical it is what you "
-        "write into a device's buffer or descriptor-base register: derive every "
-        "address you give hardware from r7, bound every length by r8. Contents are "
-        "whatever the last program left. Buffer accesses cost a step each - raise "
-        "max_steps to fill it (~48000 st32 per second of 48 kHz stereo). The kernel "
-        "enables PCI bus mastering on your target first so a device can reach the "
-        "buffer; there is no IOMMU, so any OTHER address you hand a device is really "
-        "written to, and the guard band only catches a near miss.\n"
+        "Write a program and run it on the kernel's bounded VM. With \"target\" it "
+        "is a DEVICE DRIVER for one device from driver_targets, sandboxed to that "
+        "device's own BARs and the DMA buffer and nothing else, writing to real "
+        "hardware. WITHOUT \"target\" it has no device access at all: scratch "
+        "memory, strings and syscalls only: how to build what is not a driver. "
+        "Either way it cannot loop forever. On a trap you get the reason, "
+        "the source line, that instruction disassembled, the registers, the start "
+        "of scratch memory, and the access log with what the device really "
+        "returned. Fix it and call again; 5 failed attempts each.\n"
+        "MACHINE: 16 registers r0-r15, 64-bit, UNSIGNED; a 32-deep data stack; a "
+        "16-deep call stack; 65536 bytes of scratch memory addressed by OFFSET, "
+        "zeroed each run. WITH a target, ON ENTRY: r0-r5 = its BAR bases (0 "
+        "if unused), r6 = its bdf, r7 = the PHYSICAL address of a 256 KiB DMA "
+        "buffer, r8 = its size. Derive every address you hand hardware from r7 and "
+        "bound every length by r8; the kernel turns on bus mastering, and with no "
+        "IOMMU any other address really is written to.\n"
         "INSTRUCTIONS (a, b = register or number):\n"
-        " halt | abort \"why\" | nop\n"
+        " halt | abort \"why\" | nop | print \"text\"[,a]\n"
         " mov rd,a | add|sub|mul|div|mod|and|or|xor|shl|shr rd,a,b | not rd,a\n"
-        "   (two-operand shorthand: `add r1,4` means `add r1,r1,4`)\n"
-        " cmp a,b (unsigned) | test a,b (sets zero = ((a&b)==0))\n"
-        " jmp L | beq|bne|blt|ble|bgt|bge L | call L | ret | push a | pop rd\n"
+        "   (`add r1,4` means `add r1,r1,4`)\n"
+        " cmp a,b (unsigned) | test a,b (zero = ((a&b)==0))\n"
+        " jmp|beq|bne|blt|ble|bgt|bge L | call L | ret | push a | pop rd\n"
         " out8|out16|out32 port,a | in8|in16|in32 rd,port\n"
-        " ld8|ld16|ld32 rd,[base+disp] | st8|st16|st32 [base+disp],a  (MMIO or dma)\n"
-        " pcicfg rd,bdf,off   (config-space READ only; bdf may be written 00:05.0)\n"
-        " delay us            (microseconds; a floor, not a precise timer)\n"
-        " print \"text\" | print \"text\",a   (goes to the operator's console)\n"
-        "SYNTAX: one instruction per line; `label:` marks a branch target; "
-        "comments start with ; or # or //; commas are optional; case-insensitive; "
-        "numbers may be decimal, 0x hex, 0b binary or contain _; "
-        "`.equ NAME value` defines a constant.\n"
-        "HOW TO WRITE ONE: "
-        "reset the device, then poll for ready with a COUNTED retry loop and a "
-        "delay as backoff (never an unbounded loop); write a register, read it "
-        "back, and `abort \"...\"` with a specific reason if it did not stick; "
-        "for DMA, build the device's descriptors inside the buffer at r7 and give it "
-        "addresses derived from r7, never literals; leave the values you want in "
-        "registers, because the final register file comes back to you.",
+        " ld8|ld16|ld32 rd,[base+disp] | st8|st16|st32 [base+disp],a  (MMIO or DMA, "
+        "aligned)\n"
+        " pcicfg rd,bdf,off (READ only; bdf may be 00:05.0) | delay us (a floor)\n"
+        "SCRATCH MEMORY is a separate address space: byte offsets 0-65535, no "
+        "alignment rule, little-endian, no device can see it.\n"
+        " mld8|mld16|mld32|mld64 rd,[off] | mst8|mst16|mst32|mst64 [off],a\n"
+        "STRINGS are (offset,length) pairs, never NUL-terminated: slicing is "
+        "arithmetic. Every op that writes returns the END offset, so building is a "
+        "chain.\n"
+        " mstr rd,dst,\"text\" | mcpy rd,dst,src,len (overlap-safe) | mset "
+        "rd,dst,byte,len | mitoa rd,dst,val,base\n"
+        " mcmp a,b,len   compares len bytes and sets the flags, so beq/bne follow\n"
+        " mfind rd,hay,len,\"text\" | mchr rd,hay,len,byte | matoi rd,off,len,base\n"
+        "   these set the zero flag on success; rd = where it was found (hay+len if "
+        "not) or the value\n"
+        "SYSCALLS: push the arguments, then `sys rd,name`. Zero flag = it worked "
+        "and rd = the result; else rd = an error code and the report has the "
+        "reason. con.write(off,len) prints a line; fs.read(poff,plen,dst,cap), "
+        "fs.write(poff,plen,src,len), fs.size(poff,plen) take paths under /vm only; "
+        "audio.tone(hz,ms); time.ms().\n"
+        "EXAMPLE - build a request, then read a status code out of a reply:\n"
+        " mstr r1,0,\"GET /x HTTP/1.1\\r\\nHost: \"\n"
+        " mstr r1,r1,\"h.example\\r\\n\\r\\n\" ; r1 = the request's length\n"
+        " mstr r2,4096,\"HTTP/1.1 404 Not Found\" ; a reply at 4096\n"
+        " sub r2,r2,4096 ; an END offset minus its start IS a length\n"
+        " mchr r3,4096,r2,32 ; the space after that\n"
+        " add r3,r3,1\n"
+        " matoi r4,r3,3,10 ; r4 = 404, zero flag set\n"
+        "SYNTAX: one instruction per line; `label:` marks a branch target; comments "
+        "start ; # or //; commas optional; case-insensitive; numbers may be "
+        "0x hex, 0b binary or contain _; `.equ NAME value` defines a constant.\n"
+        "HOW TO WRITE ONE: poll with a COUNTED retry loop and delay as backoff, "
+        "never an unbounded one; write a register, read it back, and `abort "
+        "\"...\"` with a specific reason if it did not stick; build a device's "
+        "descriptors in the buffer at r7; leave answers in the registers and at the "
+        "start of scratch memory, because both come back to you.",
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
-        "\"target\":{\"type\":\"string\",\"description\":\"device name from driver_targets, e.g. \\\"pci00:05.0\\\"\"},"
+        "\"target\":{\"type\":\"string\",\"description\":\"device from driver_targets, e.g. \\\"pci00:05.0\\\"; omit it for a program with no device\"},"
         "\"source\":{\"type\":\"string\",\"description\":\"the program text, one instruction per line\"},"
-        "\"trace\":{\"type\":\"string\",\"description\":\"console trace detail: \\\"off\\\", \\\"io\\\" (default: every device access) or \\\"all\\\" (every instruction)\"},"
-        "\"delay_budget_ms\":{\"type\":\"integer\",\"description\":\"total milliseconds the program may spend in delay, 0-2000 (default 250)\"},"
+        "\"trace\":{\"type\":\"string\",\"description\":\"console detail: \\\"off\\\", \\\"io\\\" (default, every device access) or \\\"all\\\" (every instruction)\"},"
+        "\"delay_budget_ms\":{\"type\":\"integer\",\"description\":\"ms the program may spend in delay, 0-2000 (default 250)\"},"
         "\"max_steps\":{\"type\":\"integer\",\"description\":\"instruction budget, 1-1000000 (default 100000)\"}"
-        "},\"required\":[\"target\",\"source\"]}",
+        "},\"required\":[\"source\"]}",
     .flags  = TOOL_MUTATES,
     .invoke = t_driver_run,
 };
@@ -1925,6 +2254,15 @@ static int t_driver_install(const tool_call_t *c, tool_result_t *r) {
     if (build_sandbox(&t, &sb, DRV_STEPS_DEF, DRV_DELAY_DEF_US, DVM_TRACE_OFF,
                       why, sizeof why) != 0)
         return fail(r, TOOL_EINVAL, "driver_install", t.name, "%s", why);
+
+    /* AN INSTALLED SINK GETS NO SYSCALLS, and that is a different decision from
+     * the one driver_run makes. driver_run grants them for the length of one
+     * call the operator asked for; this program becomes RESIDENT and is re-run
+     * for every note from here on, so a granted fs.write would be a standing
+     * capability to rewrite a file on every beep. A play program points a
+     * device at samples and waits — it has nothing to say to the kernel. */
+    sb.pol.sys_allow  = 0;
+    sb.pol.fs_root[0] = '\0';
 
     const dvm_io_t *io = hardware_io();
     if (!io)
@@ -2165,14 +2503,14 @@ static const tool_t driver_trace_tool = {
         "Read back the device access log of the most recent driver_run: every port "
         "and MMIO access in order with its width and the value written or read, "
         "the delays, the final registers, and why the program stopped. driver_run "
-        "returns the tail of this; use driver_trace for the earlier part of a long "
-        "run. Only the last 256 events are kept, and the answer says so when older "
-        "ones were dropped.",
+        "returns the tail; use this for the earlier part of a long run. Only the "
+        "last 256 events are kept, and the answer says so when older ones were "
+        "dropped.",
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
         "\"offset\":{\"type\":\"integer\",\"description\":\"first event to print, 0-based (default 0)\"},"
         "\"limit\":{\"type\":\"integer\",\"description\":\"how many events, 1-64 (default 24)\"},"
-        "\"tail\":{\"type\":\"boolean\",\"description\":\"print the LAST \\\"limit\\\" events instead of starting at \\\"offset\\\"\"}"
+        "\"tail\":{\"type\":\"boolean\",\"description\":\"print the LAST \\\"limit\\\" events\"}"
         "},\"required\":[]}",
     .flags  = 0,
     .invoke = t_driver_trace,

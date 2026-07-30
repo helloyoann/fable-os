@@ -107,104 +107,13 @@ unsigned int lwip_rand(void) {
     return ((unsigned int)rand() << 17) ^ ((unsigned int)rand() << 9) ^ (unsigned int)rand();
 }
 
-/* ====================================================================== */
-/* snprintf / vsnprintf — small, bounded formatter for mbedTLS             */
-/* Supports: flags '-' '0', width, '.'precision, length l/ll/z, and the    */
-/* conversions d i u x X p c s %. Returns the C99 "would-have-written" len. */
-/* ====================================================================== */
-
-struct sbuf { char *p; size_t cap; size_t len; };
-
-static void sb_putc(struct sbuf *s, char c) {
-    if (s->len + 1 < s->cap) s->p[s->len] = c;
-    s->len++;
-}
-
-static void sb_pad(struct sbuf *s, int n, char pad) {
-    while (n-- > 0) sb_putc(s, pad);
-}
-
-static void emit_uint(struct sbuf *s, uint64_t v, int base, int upper,
-                      int width, int prec, int left, char padc) {
-    char tmp[32];
-    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-    int n = 0;
-    /* `prec` comes from the format string and is accumulated unbounded by the
-     * parser, so it must be clamped before it is used as a write count: "%.40d"
-     * would otherwise run the zero-fill below straight off the end of tmp and
-     * corrupt the caller's stack frame. 32 is past every representable value
-     * (20 digits for a base-10 uint64, 16 for base-16), so no legitimate
-     * conversion is affected by the clamp. */
-    if (prec > (int)sizeof tmp) prec = (int)sizeof tmp;
-    if (v == 0 && prec != 0) tmp[n++] = '0';
-    while (v) { tmp[n++] = digits[v % base]; v /= base; }
-    while (n < prec) tmp[n++] = '0';                 /* precision = min digits */
-    int pad = width - n;
-    if (!left) sb_pad(s, pad, padc);
-    while (n--) sb_putc(s, tmp[n]);
-    if (left) sb_pad(s, pad, ' ');
-}
-
-int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
-    struct sbuf s = { str, size, 0 };
-    for (; *fmt; fmt++) {
-        if (*fmt != '%') { sb_putc(&s, *fmt); continue; }
-        fmt++;
-        /* A format ending in a bare '%' leaves fmt on the terminator. Without
-         * this the switch below falls to `default`, the loop's own fmt++ steps
-         * PAST the NUL, and formatting continues into whatever .rodata follows —
-         * consuming varargs that were never passed. */
-        if (!*fmt) { sb_putc(&s, '%'); break; }
-        int left = 0, zero = 0;
-        for (;; fmt++) {                              /* flags */
-            if (*fmt == '-') left = 1;
-            else if (*fmt == '0') zero = 1;
-            else break;
-        }
-        int width = 0;
-        while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
-        int prec = -1;
-        if (*fmt == '.') { fmt++; prec = 0; while (*fmt >= '0' && *fmt <= '9') prec = prec * 10 + (*fmt++ - '0'); }
-        int lng = 0;
-        while (*fmt == 'l') { lng++; fmt++; }
-        if (*fmt == 'z') { lng = 2; fmt++; }
-        char padc = (zero && !left) ? '0' : ' ';
-
-        switch (*fmt) {
-        case 'd': case 'i': {
-            int64_t v = (lng >= 1) ? va_arg(ap, long) : va_arg(ap, int);
-            if (v < 0) { sb_putc(&s, '-'); emit_uint(&s, (uint64_t)(-v), 10, 0, width ? width - 1 : 0, prec, left, padc); }
-            else emit_uint(&s, (uint64_t)v, 10, 0, width, prec, left, padc);
-            break;
-        }
-        case 'u': emit_uint(&s, (lng >= 1) ? va_arg(ap, unsigned long) : va_arg(ap, unsigned), 10, 0, width, prec, left, padc); break;
-        case 'x': emit_uint(&s, (lng >= 1) ? va_arg(ap, unsigned long) : va_arg(ap, unsigned), 16, 0, width, prec, left, padc); break;
-        case 'X': emit_uint(&s, (lng >= 1) ? va_arg(ap, unsigned long) : va_arg(ap, unsigned), 16, 1, width, prec, left, padc); break;
-        case 'p': sb_putc(&s, '0'); sb_putc(&s, 'x'); emit_uint(&s, (uint64_t)(uintptr_t)va_arg(ap, void *), 16, 0, 0, -1, 0, ' '); break;
-        case 'c': sb_putc(&s, (char)va_arg(ap, int)); break;
-        case 's': {
-            const char *str2 = va_arg(ap, const char *);
-            if (!str2) str2 = "(null)";
-            int n = 0; while (str2[n] && (prec < 0 || n < prec)) n++;
-            if (!left) sb_pad(&s, width - n, ' ');
-            for (int i = 0; i < n; i++) sb_putc(&s, str2[i]);
-            if (left) sb_pad(&s, width - n, ' ');
-            break;
-        }
-        case '%': sb_putc(&s, '%'); break;
-        default: sb_putc(&s, '%'); if (*fmt) sb_putc(&s, *fmt); break;
-        }
-    }
-    if (s.cap) s.p[s.len < s.cap ? s.len : s.cap - 1] = '\0';
-    return (int)s.len;
-}
-
-int snprintf(char *str, size_t size, const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    int n = vsnprintf(str, size, fmt, ap);
-    va_end(ap);
-    return n;
-}
+/* snprintf/vsnprintf USED TO BE HERE. They now live in lib/kfmt.c, which
+ * includes nothing but <stdint.h>/<stddef.h>/<stdarg.h> so that a host suite
+ * can link the real kernel formatter and test it. This file cannot be compiled
+ * for a host test — it needs kernel.h, io.h, kmalloc, millis and RDRAND — which
+ * is why the formatter had no test at all while it was in here, and why a
+ * defect in it survived in the text models read to fix their own programs. Do
+ * not move them back. */
 
 /* ====================================================================== */
 /* Entropy for TLS — mbedTLS calls this to seed CTR_DRBG.                   */

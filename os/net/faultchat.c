@@ -118,7 +118,24 @@ static const char SYSTEM_PROMPT[] =
     "fix: it changes what the CPU executes next, it is applied without anyone "
     "confirming it, and this machine has no shell to recover from. A diagnosis "
     "with no fix is a useful, complete answer. So is "
-    "{\"action\":\"refuse\"}, which means 'let it halt, deliberately'.";
+    "{\"action\":\"refuse\"}, which means 'let it halt, deliberately'.\n"
+    "You may ALSO include an optional \"patch\" object, which rewrites the "
+    "faulting instructions in this running kernel's .text so the bug is gone "
+    "rather than survived. Every page here is RWX, so this works with no "
+    "compiler and no reboot, and the original bytes are always kept. Its fields "
+    "are exactly the fault_patch tool's:\n"
+    "  action   \"apply\"\n"
+    "  address  the first byte to replace, hex, e.g. \"0x10a4f3\"\n"
+    "  expect   REQUIRED: the bytes you believe are there now, hex e.g. "
+    "\"48f7f1\". The patch is refused if they are not.\n"
+    "  bytes    the replacement, hex, EXACTLY as long as \"expect\"\n"
+    "  note     one short line saying why\n"
+    "Both spans must cover a whole number of x86-64 instructions; 0x90 is a "
+    "one-byte nop and pads any gap. A patch is the right answer when the report "
+    "shows the machine ABANDONED a call chain, because that code will be run "
+    "again and a recovery plan only survives the next fault instead of removing "
+    "it. Omit \"patch\" unless the bytes at RIP are shown to you and you can "
+    "say what they should be instead.";
 
 const char *faultchat_system_prompt(void) { return SYSTEM_PROMPT; }
 
@@ -196,6 +213,7 @@ size_t faultchat_build_prompt(const fault_record_t *rec,
      * proposing it when the length decoder will refuse wastes the one shot. */
     int ilen = (rec->code_valid && rec->code_len)
                    ? x86_insn_length(rec->code, rec->code_len) : 0;
+    /* Used again by the patch section below, which is why it is not scoped. */
     if (ilen > 0)
         ap(dst, cap, &off,
            "  \"skip\" available  : yes - the instruction at RIP decodes to %d "
@@ -248,14 +266,90 @@ size_t faultchat_build_prompt(const fault_record_t *rec,
         ap(dst, cap, &off, "  <-- RIP, the faulting instruction starts here\n");
     }
 
+    /* ---- can this be fixed for good, rather than merely survived? ----
+     * The distinction the model has to be handed explicitly, because it is the
+     * difference between a machine that keeps limping and a machine that is
+     * repaired: a recovery plan changes what happens at the NEXT fault, while a
+     * code patch removes the instruction that caused this one. Only the second
+     * one is available if RIP is inside .text, and only the second one is any
+     * use when the fault was ESCAPED — because escaping means the code was
+     * abandoned rather than fixed, and something will run it again. */
+    ap(dst, cap, &off, "\nCAN THIS BE PATCHED OUT?\n");
+    if (window && window->text_hi > window->text_lo) {
+        int in_text = (f->rip >= window->text_lo && f->rip < window->text_hi);
+        ap(dst, cap, &off,
+           "  patchable .text   : [0x%016lx, 0x%016lx)\n"
+           "  RIP is %s\n",
+           (unsigned long)window->text_lo, (unsigned long)window->text_hi,
+           in_text ? "inside it, so the faulting instruction CAN be rewritten"
+                   : "NOT inside it, so no code patch is possible for this "
+                     "fault");
+        if (in_text && rec->code_valid && rec->code_len) {
+            ap(dst, cap, &off,
+               "  bytes at RIP      : ");
+            for (unsigned i = 0; i < rec->code_len && i < 8; i++)
+                ap(dst, cap, &off, "%02x", (unsigned)rec->code[i]);
+            ap(dst, cap, &off,
+               " (the first %u are shown; the faulting instruction is the "
+               "first %d of them)\n",
+               (rec->code_len < 8u) ? (unsigned)rec->code_len : 8u,
+               ilen > 0 ? ilen : 0);
+            if (ilen > 0) {
+                ap(dst, cap, &off,
+                   "  a patch of it     : \"address\":\"0x%lx\", "
+                   "\"expect\":\"", (unsigned long)f->rip);
+                for (int i = 0; i < ilen && i < (int)rec->code_len; i++)
+                    ap(dst, cap, &off, "%02x", (unsigned)rec->code[i]);
+                ap(dst, cap, &off,
+                   "\" and \"bytes\" of exactly %d byte(s)\n", ilen);
+            } else {
+                ap(dst, cap, &off,
+                   "  a patch of it     : NOT possible - the length decoder "
+                   "will not commit to a length for these bytes, so no span "
+                   "starting at RIP can be shown to cover whole "
+                   "instructions\n");
+            }
+        }
+    } else {
+        ap(dst, cap, &off,
+           "  patchable .text   : not published on this build, so every code "
+           "patch will be refused. Do not propose one.\n");
+    }
+    {
+        uint32_t np = fault_patch_live();
+        const fault_patch_t *cover = fault_patch_covering(f->rip);
+        ap(dst, cap, &off,
+           "  patches live now  : %lu\n", (unsigned long)np);
+        if (cover)
+            ap(dst, cap, &off,
+               "  WARNING           : patch %lu already covers RIP. Something "
+               "has already been rewritten here and it did not fix this. Do NOT "
+               "patch it again - say so in the diagnosis instead.\n",
+               (unsigned long)cover->id);
+        if (faultchat_patches_applied() >= FAULTCHAT_MAX_PATCHES)
+            ap(dst, cap, &off,
+               "  budget            : this boot has already applied its %u "
+               "code patches, so a \"patch\" WILL be refused\n",
+               (unsigned)FAULTCHAT_MAX_PATCHES);
+        else
+            ap(dst, cap, &off,
+               "  budget            : %u code patch(es) left this boot\n",
+               (unsigned)(FAULTCHAT_MAX_PATCHES -
+                          faultchat_patches_applied()));
+    }
+
     /* ---- what an answer looks like, restated with this machine's numbers ---- */
     ap(dst, cap, &off,
        "\nANSWER WITH ONE JSON OBJECT\n"
        "  {\"diagnosis\":\"...\"}                       if you do not know what "
        "to do about it\n"
-       "  {\"diagnosis\":\"...\",\"fix\":{\"action\":...}}   if you do\n"
-       "A fix is applied without confirmation and changes what this CPU executes "
-       "next. Omit it unless the report above actually tells you what to do.\n");
+       "  {\"diagnosis\":\"...\",\"fix\":{\"action\":...}}   to change what "
+       "happens at the NEXT fault\n"
+       "  {\"diagnosis\":\"...\",\"patch\":{\"action\":\"apply\",...}}  to "
+       "remove the faulting instruction for good\n"
+       "Both are applied without confirmation and both change what this CPU "
+       "executes. Omit them unless the report above actually tells you what to "
+       "do.\n");
 
     return off;
 }
@@ -323,6 +417,9 @@ int faultchat_parse_reply(const char *body, size_t len,
     out->has_fix      = 0;
     out->fix[0]       = '\0';
     out->fix_len      = 0;
+    out->has_patch    = 0;
+    out->patch[0]     = '\0';
+    out->patch_len    = 0;
 
     if (!body || len == 0) {
         why_say(why, whycap, "the model returned an empty body");
@@ -430,10 +527,34 @@ int faultchat_parse_reply(const char *body, size_t len,
         out->has_fix     = 1;
     }
 
-    if (out->diagnosis[0] == '\0' && !out->has_fix) {
+    /* ---- patch: optional, must be an object, copied out verbatim ----
+     * Identical treatment to "fix" one field up, and for the identical reason:
+     * tools/fault_tools.c's fault_patch is the one place that turns these fields
+     * into bytes in .text, and a second reader would be a second grammar. The
+     * only difference is the size bound, because a patch carries hex. */
+    json_value_t pv;
+    int prc = json_get(&obj, "patch", &pv);
+    if (prc == JSON_OK && pv.type != JSON_NULL) {
+        if (pv.type != JSON_OBJECT) {
+            why_say(why, whycap,
+                    "\"patch\" is present but is not a JSON object");
+            return FAULTCHAT_EPROTO;
+        }
+        if (pv.len == 0 || pv.len >= sizeof out->patch) {
+            why_say(why, whycap,
+                    "\"patch\" is larger than any legitimate code patch");
+            return FAULTCHAT_EPROTO;
+        }
+        for (size_t i = 0; i < pv.len; i++) out->patch[i] = pv.start[i];
+        out->patch[pv.len] = '\0';
+        out->patch_len     = pv.len;
+        out->has_patch     = 1;
+    }
+
+    if (out->diagnosis[0] == '\0' && !out->has_fix && !out->has_patch) {
         why_say(why, whycap,
-                "the reply parsed but said nothing: no diagnosis text and no "
-                "fix");
+                "the reply parsed but said nothing: no diagnosis text, no fix "
+                "and no patch");
         return FAULTCHAT_EPROTO;
     }
     return FAULTCHAT_OK;
@@ -500,6 +621,69 @@ int faultchat_apply_fix(const faultchat_reply_t *reply, char *why, size_t whycap
     return FAULTCHAT_OK;
 }
 
+/* ---- and the same door for a code patch ---- */
+
+/* Declared here rather than in the live-half block below because
+ * faultchat_apply_patch() is one of the pure-ish functions and must not depend
+ * on where the counters happen to be defined. */
+static uint32_t g_patches;                  /* code patches actually applied */
+
+int faultchat_apply_patch(const faultchat_reply_t *reply,
+                          char *why, size_t whycap) {
+    if (whycap) why_say(why, whycap, "");
+    if (!reply) return FAULTCHAT_EINVAL;
+    if (!reply->has_patch) {
+        why_say(why, whycap, "the model proposed no code patch");
+        return FAULTCHAT_ENONE;
+    }
+
+    /* THE BUDGET IS CHECKED HERE, NOT IN THE TOOL, and the distinction matters:
+     * the tool cannot tell an operator's deliberate patch from the kernel's own
+     * unattended one, and only the second needs a cap. "How much of this kernel
+     * has been rewritten with nobody watching" is this module's question. */
+    if (g_patches >= FAULTCHAT_MAX_PATCHES) {
+        why_say(why, whycap,
+                "this boot has already applied its allowance of unattended code "
+                "patches; nothing was written");
+        return FAULTCHAT_EPATCH;
+    }
+
+    tool_result_t r;
+    tool_result_init(&r, fix_result, sizeof fix_result);
+
+    tool_call_t c;
+    c.id        = "toolu_kernel_faultpatch";
+    c.name      = "fault_patch";
+    c.input     = reply->patch;
+    c.input_len = reply->patch_len;
+
+    int rc = tool_dispatch(&c, &r);
+    if (rc == TOOL_ENOENT) {
+        why_say(why, whycap,
+                "the fault_patch tool is not registered in this build");
+        return FAULTCHAT_EPATCH;
+    }
+    if (rc != TOOL_OK || r.is_error) {
+        /* Same sanitising argument as faultchat_apply_fix(): the tool's refusal
+         * echoes model-chosen text (a hex string, a note, a field name) and this
+         * ends up inside a kernel-prefixed console line. */
+        char raw[FAULTCHAT_WHY_MAX], one[FAULTCHAT_WHY_MAX];
+        size_t n = 0;
+        while (n + 1 < sizeof raw && n < r.len &&
+               fix_result[n] != '\n') { raw[n] = fix_result[n]; n++; }
+        raw[n] = '\0';
+        sanitize(one, sizeof one, raw, n);
+        why_say(why, whycap, one[0] ? one : "the fault_patch tool refused it");
+        return FAULTCHAT_EPATCH;
+    }
+
+    g_patches++;
+    why_say(why, whycap, "applied");
+    return FAULTCHAT_OK;
+}
+
+uint32_t faultchat_patches_applied(void) { return g_patches; }
+
 /* ====================================================================== */
 /* error names                                                            */
 /* ====================================================================== */
@@ -521,6 +705,7 @@ const char *faultchat_strerror(int rc) {
         case FAULTCHAT_EFIX:       return "the proposed fix was refused";
         case FAULTCHAT_ERECURSE:   return "a fault occurred while the diagnosis "
                                           "request was in flight";
+        case FAULTCHAT_EPATCH:     return "the proposed code patch was refused";
         default:                   return "unknown result";
     }
 }
@@ -540,6 +725,44 @@ static const char *g_off_why = "";
 static uint32_t g_seen;                 /* fault_count() as of the last pump  */
 static uint32_t g_diagnoses;            /* requests actually sent             */
 static uint32_t g_fixes;                /* proposed fixes that were armed     */
+
+/* PER-ADDRESS ACCOUNTING — the bound that stops an autonomous loop spiralling.
+ *
+ * A fixed, tiny table rather than a counter, because "we have tried this address
+ * twice" and "we have tried two addresses once each" are different situations
+ * and only the first one is a machine failing to make progress. Four slots is
+ * more than FAULTCHAT_MAX_DIAGNOSES can fill, so the table cannot be a source of
+ * false negatives; when it does overflow the oldest slot is reused, which errs
+ * towards asking again rather than towards silently giving up. */
+#define FAULTCHAT_RIP_SLOTS 4
+static struct { uint64_t rip; uint32_t tries; } g_rip[FAULTCHAT_RIP_SLOTS];
+static uint32_t g_rip_next;
+
+static uint32_t rip_tries(uint64_t rip) {
+    for (unsigned i = 0; i < FAULTCHAT_RIP_SLOTS; i++)
+        if (g_rip[i].tries && g_rip[i].rip == rip) return g_rip[i].tries;
+    return 0;
+}
+
+static uint32_t rip_bump(uint64_t rip) {
+    for (unsigned i = 0; i < FAULTCHAT_RIP_SLOTS; i++)
+        if (g_rip[i].tries && g_rip[i].rip == rip) return ++g_rip[i].tries;
+    unsigned slot = g_rip_next % FAULTCHAT_RIP_SLOTS;
+    g_rip_next++;
+    g_rip[slot].rip   = rip;
+    g_rip[slot].tries = 1;
+    return 1;
+}
+
+uint32_t faultchat_rip_attempts(uint64_t rip) { return rip_tries(rip); }
+
+uint64_t faultchat_worst_rip(void) {
+    uint64_t worst = 0;
+    uint32_t best  = 0;
+    for (unsigned i = 0; i < FAULTCHAT_RIP_SLOTS; i++)
+        if (g_rip[i].tries > best) { best = g_rip[i].tries; worst = g_rip[i].rip; }
+    return worst;
+}
 static int      g_last_result = FAULTCHAT_ENONE;
 static uint32_t g_last_seq;
 static char     g_last_why[FAULTCHAT_WHY_MAX];
@@ -572,6 +795,15 @@ void faultchat_reset(void) {
     g_reply.has_fix      = 0;
     g_reply.fix[0]       = '\0';
     g_reply.fix_len      = 0;
+    g_reply.has_patch    = 0;
+    g_reply.patch[0]     = '\0';
+    g_reply.patch_len    = 0;
+    g_patches     = 0;
+    g_rip_next    = 0;
+    for (unsigned i = 0; i < FAULTCHAT_RIP_SLOTS; i++) {
+        g_rip[i].rip   = 0;
+        g_rip[i].tries = 0;
+    }
     g_enabled     = 1;
 }
 
@@ -629,11 +861,32 @@ int faultchat_pump(void) {
         return finish(FAULTCHAT_EOFF, "diagnosis budget spent");
     }
 
+    /* HAVE WE ALREADY TRIED THIS EXACT ADDRESS ENOUGH TIMES?
+     *
+     * The per-boot diagnosis budget above bounds how much of a boot is spent
+     * talking about crashes; this bounds how much of it is spent talking about
+     * the SAME crash. Without it, one instruction that keeps faulting after
+     * every attempted repair eats every remaining diagnosis - and each one is a
+     * paid API call - while the machine learns nothing new. Note that this is
+     * not a latch: a fault at a DIFFERENT address is still diagnosed, because
+     * giving up on one bug is not the same as giving up on the machine. */
+    if (rip_tries(rec->regs.rip) >= FAULTCHAT_MAX_PER_RIP) {
+        kprintf("[fault-diagnose] fault #%u is at %p again, which this boot has "
+                "already asked about %u time(s) without fixing it. Not asking a "
+                "third; a diagnosis that has not worked twice will not work by "
+                "repetition, and each one costs a round trip. Faults elsewhere "
+                "will still be diagnosed.\n",
+                (unsigned)rec->seq, (void *)(uintptr_t)rec->regs.rip,
+                (unsigned)FAULTCHAT_MAX_PER_RIP);
+        return finish(FAULTCHAT_EOFF, "this address has had its attempts");
+    }
+
     /* Budget is spent HERE, on the attempt, not on the send. A machine with no
      * transport and a fault storm would otherwise announce every one of them
      * forever, and "how much of this boot is spent talking about crashes" is
      * the quantity the cap is actually about. */
     g_diagnoses++;
+    rip_bump(rec->regs.rip);
 
     kprintf("[fault-diagnose] fault #%u (%s, vector %u, at %p) was "
             "survived; asking the model what it was\n",
@@ -746,26 +999,63 @@ int faultchat_pump(void) {
         kputc('\n');
     }
 
-    if (!g_reply.has_fix) {
-        kputs("[fault-diagnose] the model proposed no fix, which is a complete "
-              "answer. Nothing was armed.\n");
-        return finish(FAULTCHAT_OK, "diagnosed, no fix proposed");
+    if (!g_reply.has_fix && !g_reply.has_patch) {
+        kputs("[fault-diagnose] the model proposed neither a fix nor a code "
+              "patch, which is a complete answer. Nothing was changed.\n");
+        return finish(FAULTCHAT_OK, "diagnosed, nothing proposed");
     }
 
-    kputs("[fault-diagnose] the model proposed a fix; handing it to the "
-          "fault_recover tool, which validates it exactly as if the model had "
-          "called it directly\n");
+    /* THE CODE PATCH GOES FIRST, and the order is a decision.
+     *
+     * A patch removes the faulting instruction; a recovery plan survives the
+     * next fault at it. If both are offered, the patch is the repair and the
+     * plan is the safety net for the attempt, so the repair must be in place
+     * before anything runs again. Each is reported separately: a machine that
+     * rewrote its own .text and a machine that armed a plan are different
+     * machines, and the console must not blur them into one "fixed". */
+    int patch_rc = FAULTCHAT_ENONE, arc = FAULTCHAT_ENONE;
 
-    int arc = faultchat_apply_fix(&g_reply, why, sizeof why);
-    if (arc != FAULTCHAT_OK) {
-        kprintf("[fault-diagnose] the proposed fix was NOT armed: %s\n", why);
-        return finish(FAULTCHAT_EFIX, why);
+    if (g_reply.has_patch) {
+        kputs("[fault-diagnose] the model proposed a CODE PATCH; handing it to "
+              "the fault_patch tool, which validates it exactly as if the model "
+              "had called it directly\n");
+        patch_rc = faultchat_apply_patch(&g_reply, why, sizeof why);
+        if (patch_rc != FAULTCHAT_OK)
+            kprintf("[fault-diagnose] the proposed code patch was NOT applied: "
+                    "%s\n", why);
+        else
+            kputs("[fault-diagnose] this kernel's .text has been rewritten. The "
+                  "original bytes are kept and the patch can be reverted; "
+                  "nothing has verified that the new bytes are CORRECT.\n");
     }
 
-    g_fixes++;
-    kputs("[fault-diagnose] the fix is armed. The next matching exception will "
-          "be handled by it instead of halting the machine.\n");
-    return finish(FAULTCHAT_OK, "diagnosed and a fix was armed");
+    if (g_reply.has_fix) {
+        kputs("[fault-diagnose] the model proposed a recovery fix; handing it "
+              "to the fault_recover tool, which validates it exactly as if the "
+              "model had called it directly\n");
+        arc = faultchat_apply_fix(&g_reply, why, sizeof why);
+        if (arc != FAULTCHAT_OK) {
+            kprintf("[fault-diagnose] the proposed fix was NOT armed: %s\n",
+                    why);
+        } else {
+            g_fixes++;
+            kputs("[fault-diagnose] the fix is armed. The next matching "
+                  "exception will be handled by it instead of halting the "
+                  "machine.\n");
+        }
+    }
+
+    /* One outcome code, and it reports the WORST thing that happened: a caller
+     * that only looks at the return value must not be told OK when half of what
+     * was proposed was refused. */
+    if (patch_rc != FAULTCHAT_OK && patch_rc != FAULTCHAT_ENONE)
+        return finish(FAULTCHAT_EPATCH, "the proposed code patch was refused");
+    if (arc != FAULTCHAT_OK && arc != FAULTCHAT_ENONE)
+        return finish(FAULTCHAT_EFIX, "the proposed fix was refused");
+    return finish(FAULTCHAT_OK,
+                  patch_rc == FAULTCHAT_OK
+                      ? "diagnosed and this kernel's code was patched"
+                      : "diagnosed and a fix was armed");
 }
 
 /* ---- introspection ---- */

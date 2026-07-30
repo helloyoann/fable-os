@@ -118,7 +118,9 @@ static struct {
     int      fail;
     char     why[192];
     int      hold_clock;      /* advance fake_ms by ms          */
+    unsigned clock_scale;     /* ...times this (0/1 = exactly ms) */
     unsigned spin_real_ms;    /* busy-wait this long, for real  */
+    uint64_t blocked_ms;      /* total fake time held, all plays  */
 } sink;
 
 static uint64_t mono_ms(void) {
@@ -139,7 +141,16 @@ static int sink_play(void *ctx, uint64_t phys, uint32_t bytes, uint32_t frames,
         uint64_t until = mono_ms() + sink.spin_real_ms;
         while (mono_ms() < until) { }
     }
-    if (sink.hold_clock) fake_ms += ms;
+    /* How long a synchronous driver holds the machine is NOT the duration it was
+     * asked for. A play program polling a device gets a budget of the sound plus
+     * AUDIO_PLAY_MARGIN_US, so `clock_scale` lets a test model a driver that costs
+     * more than it plays — which is the whole reason apps/cap.c measures instead
+     * of trusting APP_CAP_AUDIO_MS_MAX. */
+    if (sink.hold_clock) {
+        uint32_t held = ms * (sink.clock_scale ? sink.clock_scale : 1u);
+        fake_ms += held;
+        sink.blocked_ms += held;
+    }
     if (sink.fail) {
         snprintf(why, cap, "%s", sink.why);
         return -1;
@@ -694,19 +705,43 @@ static void test_one_call_at_a_time(void) {
     CHECK_EQ(sink.frames, 48000u * 120u / 1000u);   /* the default ms */
 }
 
+/* Advance the fake clock far enough that the duty-cycle limiter will allow
+ * another sound, whatever the last one cost.
+ *
+ * The limiter is not a fixed interval: apps/cap.c times each call and then keeps
+ * the machine quiet for at least that long again plus APP_CAP_GAP_MS, counted
+ * from when the call FINISHED. So a test that wants "long enough" cannot just add
+ * APP_CAP_GAP_MS — it has to cover the block as well. The block is at most the
+ * requested duration, which is at most APP_CAP_AUDIO_MS_MAX, so this is always
+ * enough and never depends on which sink the test installed. Tests that are
+ * specifically ABOUT the boundary set sink.hold_clock = 0 and step the clock by
+ * hand instead. */
+static void wait_out_the_quiet(void) {
+    fake_ms += (uint64_t)APP_CAP_GAP_MS + APP_CAP_AUDIO_MS_MAX + 1;
+}
+
 static void test_the_rate_limit_holds(void) {
     fixture();
     install_sink();
-    sink.hold_clock = 0;                  /* isolate the gap from the duration */
+    /* The sink neither advances the fake clock nor burns real time, so the
+     * MEASURED block is 0 and the quiet window is exactly APP_CAP_GAP_MS. That
+     * isolates the gap from the duration, which is what this test is about;
+     * test_a_slow_driver_buys_a_longer_silence covers the other half. */
+    sink.hold_clock = 0;
 
     uint32_t id = run_with("{\"hz\":\"440\"}");
     CHECK_EQ(app_service(), 1);
     CHECK_STR(status_of(id), "ok");
 
-    /* Immediately again: too soon, and the sentence says how long ago. */
+    /* Immediately again: too soon, and the sentence says how long is left and
+     * WHY there is a wait at all. The rule is a measured duty cycle, not a fixed
+     * interval: the machine stays quiet for as long as the last sound actually
+     * blocked it, plus APP_CAP_GAP_MS, counted from when it finished. */
     press_go(id);
     CHECK_STR(status_of(id), "too soon");
-    CHECK_CONTAINS(app_last_error(id), "one app sound every 500 ms");
+    CHECK_CONTAINS(app_last_error(id), "held this machine for");
+    CHECK_CONTAINS(app_last_error(id), "plus 500 ms");
+    CHECK_CONTAINS(app_last_error(id), "ms to go");
     CHECK_EQ(sink.plays, 1);
 
     /* One millisecond short of the gap: still refused. */
@@ -730,6 +765,174 @@ static void test_the_rate_limit_holds(void) {
     CHECK_EQ(app_cap_pending(), 1);
     CHECK_EQ(app_service(), 1);
     CHECK_EQ(sink.plays, 3);
+}
+
+/* THE DUTY CYCLE IS BOUNDED BY MEASUREMENT, NOT BY APP_CAP_AUDIO_MS_MAX.
+ *
+ * This is the regression test for a documented number that was simply false.
+ * include/app.h and apps/cap.c both used to state that APP_CAP_AUDIO_MS_MAX and
+ * APP_CAP_GAP_MS "bound that to 200 ms in any 500 ms, i.e. at most 40% of the
+ * machine". APP_CAP_AUDIO_MS_MAX bounds the duration an app may REQUEST. It does
+ * not bound how long performing the request BLOCKS the machine, and with the sink
+ * this project exists to produce — a driver program the model wrote — those are
+ * different numbers: core/audio.c raises the program's delay budget to the sound
+ * plus AUDIO_PLAY_MARGIN_US (250 ms), and the program spends it in mdelay(),
+ * which yields to nothing. A 200 ms app tone was measured holding the machine for
+ * 450 ms. Because the old gap was timed from the moment a sound STARTED, that
+ * 450 ms came out of the 500 ms interval: 90% of the machine.
+ *
+ * The fix is to measure. This test installs a sink that blocks for FOUR TIMES the
+ * requested duration — a stand-in for exactly that margin — and asserts the
+ * resulting duty cycle, in the sink's own accounting of time it held the machine
+ * against the wall clock the whole run took. */
+/* TWO DOCUMENTS BOTH GET A TURN AT THE SPEAKER.
+ *
+ * There is one pending capability slot machine-wide, deliberately (apps/cap.c:
+ * "who is making the sound has to have one answer"). That is fine. What was not
+ * fine is that run_ticks() iterated the instance pool from slot 0 every single
+ * pass, while every handler's first due time is 0 and equal-period handlers share
+ * one env_ms reading — so two documents with the same tick period were phase
+ * locked for ever and the lower slot won the slot every time. Measured before the
+ * fix: two identical documents over 66 s of virtual time, app A 132 sounds, app B
+ * ZERO. Not a race; an exact and permanent outcome. And the refusal app B was
+ * given ("still busy" / "too soon") reads as transient, so a model would back off
+ * — which could not possibly help.
+ *
+ * This test is the fairness property, asserted as a ratio rather than as equality:
+ * round robin does not promise identical counts, it promises nobody is silenced. */
+static void test_two_documents_share_the_speaker(void) {
+    fixture();
+    install_sink();
+    sink.hold_clock = 0;
+
+    static const char ticker[] =
+        "{\"width\":200,\"height\":110,\"grid\":{\"rows\":1,\"cols\":1},"
+        "\"widgets\":[{\"kind\":\"label\",\"name\":\"l\",\"text\":\"t\","
+        "\"row\":0,\"col\":0}],\"on\":[{\"tick\":50,\"do\":["
+        "{\"call\":\"audio.tone\",\"with\":{\"hz\":\"440\",\"ms\":\"20\"},"
+        "\"into\":\"l\"}]}]}";
+
+    uint32_t a = 0, b = 0;
+    CHECK_EQ(launch(ticker, &a), APP_OK);
+    CHECK_EQ(launch(ticker, &b), APP_OK);
+    CHECK(a != b);
+
+    /* Which app each sound belonged to is in the trace line the kernel printed,
+     * which is the only honest record of who really made a noise. */
+    kcap_reset();
+    for (int i = 0; i < 66000; i++) {         /* 66 s at 1 ms per pass */
+        (void)app_tick_handlers();
+        (void)app_service();
+        fake_ms += 1;
+    }
+
+    int for_a = 0, for_b = 0;
+    char needle[48];
+    snprintf(needle, sizeof needle, "app=%u ", (unsigned)a);
+    for (const char *p = kcap_text(); (p = strstr(p, needle)) != NULL; p++) for_a++;
+    snprintf(needle, sizeof needle, "app=%u ", (unsigned)b);
+    for (const char *p = kcap_text(); (p = strstr(p, needle)) != NULL; p++) for_b++;
+
+    printf("    (66 s, two identical tickers: app A got %d sounds, app B got %d)\n",
+           for_a, for_b);
+
+    /* NEITHER MAY BE ZERO. This is the whole test. */
+    CHECK(for_a > 0);
+    CHECK(for_b > 0);
+    /* And neither may dominate: with round robin the split is close to even, so
+     * require each to hold at least a third of the total. A 3:1 split would mean
+     * the rotation is not actually rotating. */
+    CHECK(for_a * 3 >= for_a + for_b);
+    CHECK(for_b * 3 >= for_a + for_b);
+    CHECK_EQ(sink.plays, for_a + for_b);
+    CHECK_EQ(kpanic_hit, 0);
+
+    /* Four documents: still nobody silenced. */
+    fixture();
+    install_sink();
+    sink.hold_clock = 0;
+    uint32_t ids[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < 4; i++) CHECK_EQ(launch(ticker, &ids[i]), APP_OK);
+    kcap_reset();
+    for (int i = 0; i < 66000; i++) {
+        (void)app_tick_handlers();
+        (void)app_service();
+        fake_ms += 1;
+    }
+    for (int i = 0; i < 4; i++) {
+        int n = 0;
+        snprintf(needle, sizeof needle, "app=%u ", (unsigned)ids[i]);
+        for (const char *p = kcap_text(); (p = strstr(p, needle)) != NULL; p++) n++;
+        printf("    (four tickers: app %u got %d)\n", (unsigned)ids[i], n);
+        CHECK(n > 0);
+    }
+}
+
+static void test_a_slow_driver_buys_a_longer_silence(void) {
+    fixture();
+    install_sink();
+
+    /* hold_clock advances the fake clock by the requested ms. Multiply it: this
+     * sink holds the machine for 4x what it was asked for, which is worse than
+     * the real VM path's 2.25x. The limiter has never been told this. */
+    sink.hold_clock  = 1;
+    sink.clock_scale = 4;
+
+    static const char ticker[] =
+        "{\"width\":200,\"height\":110,\"grid\":{\"rows\":1,\"cols\":1},"
+        "\"widgets\":[{\"kind\":\"label\",\"name\":\"l\",\"text\":\"t\","
+        "\"row\":0,\"col\":0}],\"on\":[{\"tick\":50,\"do\":["
+        "{\"call\":\"audio.tone\",\"with\":{\"hz\":\"440\",\"ms\":\"200\"},"
+        "\"into\":\"l\"}]}]}";
+    uint32_t id = 0;
+    CHECK_EQ(launch(ticker, &id), APP_OK);
+
+    /* Ask as fast as a document is allowed to, for 60 s of virtual time. Each
+     * accepted sound is asked for as 200 ms and costs the machine 800 ms. */
+    uint64_t start = fake_ms;
+    for (int i = 0; i < 60000; i++) {
+        (void)app_tick_handlers();
+        (void)app_service();
+        fake_ms += 1;
+    }
+    uint64_t elapsed = fake_ms - start;
+    uint64_t blocked = sink.blocked_ms;
+
+    printf("    (a driver blocking 4x the requested duration: %u sounds, "
+           "%lu ms blocked of %lu ms = %lu%%)\n",
+           sink.plays, (unsigned long)blocked, (unsigned long)elapsed,
+           (unsigned long)(blocked * 100 / (elapsed ? elapsed : 1)));
+
+    /* THE PROPERTY. Under the old rule this was 90%+. It must now be under half
+     * however slow the driver is, because the quiet interval is derived from the
+     * measured block rather than from a constant. */
+    CHECK(blocked * 2 < elapsed);
+
+    /* And it must not have stopped the app making any sound at all: a limiter
+     * that silences everything is not a fix. */
+    CHECK(sink.plays > 10);
+
+    /* Every request that was refused got a note saying so, so the document can
+     * tell the difference between "not yet" and "broken". */
+    CHECK(d_refused() > 0u);
+    CHECK_CONTAINS(app_last_error(id), "stays quiet");
+    CHECK_EQ(kpanic_hit, 0);
+
+    /* A FAST driver must not be punished by the same rule: with a block of ~0 the
+     * quiet interval collapses to APP_CAP_GAP_MS, i.e. the old behaviour. */
+    fixture();
+    install_sink();
+    sink.hold_clock = 0;                  /* no measurable block at all */
+    CHECK_EQ(launch(ticker, &id), APP_OK);
+    start = fake_ms;
+    for (int i = 0; i < 10000; i++) {
+        (void)app_tick_handlers();
+        (void)app_service();
+        fake_ms += 1;
+    }
+    elapsed = fake_ms - start;
+    /* 10 s / 500 ms = 20, plus the one at t=0. */
+    CHECK(sink.plays >= 20 && sink.plays <= 21);
 }
 
 static void test_ten_thousand_tones_a_second_become_two(void) {
@@ -767,9 +970,12 @@ static void test_ten_thousand_tones_a_second_become_two(void) {
     CHECK_EQ(app_call_lines(), (int)d_hw());
     CHECK_EQ(kpanic_hit, 0);
 
-    /* The app is still alive and still holds one bounded note. */
+    /* The app is still alive and still holds one bounded note. The bound is
+     * app_inst_t.lasterr (224 bytes, matching app_error_t.msg) — a refusal has to
+     * fit whole, because the clause saying what to do about it is at the end. */
     CHECK_EQ(app_count(), 1);
-    CHECK(strlen(app_last_error(id)) < 128);
+    CHECK(strlen(app_last_error(id)) > 0);
+    CHECK(strlen(app_last_error(id)) < 224);
 }
 
 static void test_a_hostile_document_cannot_exhaust_anything(void) {
@@ -840,7 +1046,7 @@ static void test_a_hostile_document_cannot_exhaust_anything(void) {
         CHECK_EQ(launch(doc_with("{\"hz\":\"440\"}"), &t), APP_OK);
         press_go(t);
         (void)app_service();
-        fake_ms += APP_CAP_GAP_MS;
+        wait_out_the_quiet();
         CHECK_EQ(app_close(t), APP_OK);
     }
     CHECK_EQ(app_count(), 1);             /* only `nested` is still open */
@@ -887,7 +1093,7 @@ static void test_every_performed_call_emits_one_trace_line(void) {
 
     /* A failure is traced too, symbolically, and the sink's own sentence is NOT
      * in the line — only in the app's note. */
-    fake_ms += APP_CAP_GAP_MS;
+    wait_out_the_quiet();
     kcap_reset();
     sink.fail = 1;
     snprintf(sink.why, sizeof sink.why, "status register still 0x00 after 40 ms");
@@ -928,7 +1134,7 @@ static void test_the_trace_line_starts_in_column_zero_after_a_prompt(void) {
     CHECK_STR(status_of(id), "ok");
 
     /* And no gratuitous newline when the cursor is already at column zero. */
-    fake_ms += APP_CAP_GAP_MS;
+    wait_out_the_quiet();
     kcap_reset();
     kputs("line\n");
     press_go(id);
@@ -1122,7 +1328,7 @@ static void test_the_beeper_example_plays_every_note(void) {
         { "440", 440 }, { "554", 554 }, { "659", 659 },
     };
     for (unsigned i = 0; i < sizeof notes / sizeof notes[0]; i++) {
-        fake_ms += APP_CAP_GAP_MS;
+        wait_out_the_quiet();
         gui_window_t *w = gui_window(id);
         CHECK(w != NULL);
         if (!w) return;
@@ -1152,7 +1358,7 @@ static void test_the_beeper_example_plays_every_note(void) {
     CHECK_EQ(sink.plays, 3);
 
     /* The buzz button: a different waveform and a louder level, from literals. */
-    fake_ms += APP_CAP_GAP_MS;
+    wait_out_the_quiet();
     gui_window_t *w = gui_window(id);
     for (uint16_t k = 0; w && k < w->nwidgets; k++)
         if (!strcmp(w->widgets[k].text, "buzz"))
@@ -1173,7 +1379,7 @@ static void test_the_beeper_example_plays_every_note(void) {
 
     /* On a machine with no driver the SAME document is honest instead of silent. */
     audio_reset();
-    fake_ms += APP_CAP_GAP_MS;
+    wait_out_the_quiet();
     app_cap_reset();
     for (uint16_t k = 0; w && k < w->nwidgets; k++)
         if (!strcmp(w->widgets[k].text, "440"))
@@ -1193,6 +1399,8 @@ int main(void) {
     RUN(test_the_edges_of_the_range_are_accepted);
     RUN(test_one_call_at_a_time);
     RUN(test_the_rate_limit_holds);
+    RUN(test_two_documents_share_the_speaker);
+    RUN(test_a_slow_driver_buys_a_longer_silence);
     RUN(test_ten_thousand_tones_a_second_become_two);
     RUN(test_a_hostile_document_cannot_exhaust_anything);
     RUN(test_an_app_that_closes_makes_no_sound);

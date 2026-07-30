@@ -7,43 +7,55 @@
 
 WHY THIS EXISTS, and why it is a source lint rather than a test.
 
-The kernel does not use the host C library. `lib/libc_shim.c` provides a small
-bounded vsnprintf, and its parser accepts only DIGITS after '.' and only digits
-for a width. It has no star width and no star precision.
+The kernel does not use the host C library. lib/kfmt.c provides a small bounded
+vsnprintf that implements a SUBSET of C99. Host suites link the real libc, where
+every format string in the tree works perfectly, so a conversion the kernel
+cannot render is invisible to `make test-host` by construction. That asymmetry is
+the whole reason for a lint: it reads the source, so it does not care which
+formatter is linked. tests/host/test_kfmt.c covers the other half — it links
+lib/kfmt.c next to the host libc and diffs them conversion by conversion — but
+it can only test the grammar kfmt claims to support. Only a lint can find a
+caller reaching for something outside that grammar.
 
-The failure mode is NOT a truncated string, which is what everyone assumes when
-they read "no %*d support". Because the '*' is never consumed, the formatter
-emits the LITERAL FOUR CHARACTERS "%*s" into the output AND LEAVES THE ARGUMENT
-LIST MISALIGNED, so every conversion after it reads the wrong argument. Measured
-against the real shim:
+WHAT USED TO BE HERE, and why the check changed shape.
+
+This script was originally written to find star width and precision (`%*d`,
+`%.*s`), which the formatter did not support. The failure mode was not a
+truncated string: because the '*' was never consumed, the formatter emitted the
+literal characters "%*s" AND LEFT THE ARGUMENT LIST MISALIGNED, so every
+conversion after it read the wrong argument.
 
     format : "%s: register \"%.*s\" does not exist (this machine has r0-r%d)"
-    args   : "ld", 3, "r6b", 15
-    host   : ld: register "r6b" does not exist (this machine has r0-r15)
-    KERNEL : ld: register "%*s" does not exist (this machine has r0-r3)
+    args   : "mov", 3, "r16", 15
+    host   : mov: register "r16" does not exist (this machine has r0-r15)
+    KERNEL : mov: register "%*s" does not exist (this machine has r0-r3)
 
-Two separate harms in one line. The token the model needs is replaced by
-punctuation, and the register count becomes a CONFIDENT LIE assembled from the
-token's length. A model reading that is told this machine has four registers.
+Two harms in one line: the token the model needs is replaced by punctuation, and
+the register count becomes a confident lie assembled from the token's length. A
+model reading that is told this machine has four registers. Worse shapes existed
+— where a `%s` followed the `%.*s`, the `%s` dereferenced the token LENGTH as a
+pointer, and since boot/boot.asm identity-maps low memory present+writable from
+physical 0 it did not fault; it read the real-mode IVT into a model-facing error
+string and from there into the JSON request body as invalid UTF-8.
 
-WHY `make test-host` CANNOT FIND THESE. Host suites link the real libc, where
-every one of these format strings works perfectly. The bug exists only in the
-binary that boots. That asymmetry is the whole reason for a lint: it reads the
-source, so it does not care which formatter is linked.
+There were 27 such lines, all of them assembler errors in vm/dvm.c. They were
+not fixed one at a time. lib/kfmt.c now IMPLEMENTS star width and precision, so
+all 27 became correct at once and, more to the point, the next one written is
+correct too. Star is therefore no longer a finding.
 
-WHAT IS AND IS NOT A FINDING. Third-party trees (lwip, mbedtls) are skipped:
-they ship their own formatters and are not printed through libc_shim. Host test
-sources under tests/ are skipped for the same reason — they really do run
-against the host libc. Everything a default `make` compiles is in scope.
+WHAT IS A FINDING NOW: a conversion, flag or length modifier that lib/kfmt.c
+still does not implement. Each entry in UNSUPPORTED below names the reason. The
+consequences are the same family as before — a `default` arm that echoes the
+conversion literally and consumes no vararg, so everything after it shifts.
+
+WHAT IS NOT A FINDING. Third-party trees (lwip, mbedtls) are skipped: they ship
+their own formatters and are not printed through kfmt. Host test sources under
+tests/ are skipped because they really do run against the host libc. lib/base.c
+is IN scope but its kprintf is an even smaller formatter than kfmt — see the
+note on KPRINTF_ONLY below.
 
 EXIT STATUS: 0 if clean, 1 if any offender is found, 2 on usage error. Findings
 are printed as `file:line: text`, so an editor can jump to them.
-
-NOT WIRED INTO `make test-qemu`, deliberately. At the time of writing the only
-offenders are in a file this script's author does not own, and a new red test
-that nobody is allowed to fix teaches people to ignore red tests. It is a
-one-command reproduction for whoever does own it, and it belongs in the suite
-the moment the count reaches zero.
 """
 
 import argparse
@@ -58,10 +70,34 @@ OSDIR = os.path.dirname(os.path.dirname(HERE))           # os/
 # Third-party trees bring their own printf. tests/ links the host libc.
 SKIP_PREFIX = ("lwip/", "mbedtls/", "tests/", "port/")
 
-# A conversion whose width or precision is taken from an argument. Matches
-# `%*d`, `%.*s`, `%-*s`, `%0.*x`, `%.*S` ... but not `%.3s`, and not a literal
-# `%%*` (an escaped percent followed by a star, which is just text).
-STAR = re.compile(r"%[-+ #0]*(?:\*|[0-9]*\.\*)")
+# What lib/kfmt.c actually implements, as of this writing:
+#   flags        '-' '0'
+#   width        digits or '*'
+#   precision    '.' digits or '.*'
+#   length       'l', 'll', 'z'
+#   conversions  d i u x X p c s %
+# Anything else falls to the `default` arm, which echoes the conversion
+# character literally AND CONSUMES NO VARARG, shifting every argument after it.
+#
+# Each pattern below is (regex, why it cannot be rendered). The regexes match
+# inside a string literal, after "%%" has been removed, so an escaped percent
+# followed by one of these characters is not a finding.
+UNSUPPORTED = [
+    (re.compile(r"%[-+ #0]*[0-9*]*(?:\.[0-9*]+)?(?:hh|h|j|t|L)[diuxXoefgacsn]"),
+     "length modifier hh/h/j/t/L is not parsed; kfmt understands only l, ll and z"),
+    (re.compile(r"%[-+ #0]*[0-9*]*(?:\.[0-9*]+)?(?:l|ll|z)?[feEgGaA]"),
+     "floating point is not implemented (no float conversions, and no saved SSE state)"),
+    (re.compile(r"%[-+ #0]*[0-9*]*(?:\.[0-9*]+)?(?:l|ll|z)?[o]"),
+     "octal %o is not implemented; use %x or print the value in decimal"),
+    (re.compile(r"%[-+ #0]*[0-9*]*(?:\.[0-9*]+)?(?:l|ll|z)?n"),
+     "%n writes through a pointer argument and is deliberately absent"),
+    (re.compile(r"%[-+ #0]*[0-9*]*(?:\.[0-9*]+)?[SC]"),
+     "wide-character %S/%C is not implemented"),
+    (re.compile(r"%[-#0]*[+ ][-+ #0]*[0-9*]*(?:\.[0-9*]+)?(?:l|ll|z)?[diuxX]"),
+     "the '+' and ' ' sign flags are not parsed; they are echoed literally"),
+    (re.compile(r"%[-+ 0]*#[-+ #0]*[0-9*]*(?:\.[0-9*]+)?(?:l|ll|z)?[xXo]"),
+     "the '#' alternate-form flag is not parsed; it is echoed literally"),
+]
 
 
 def sources_from_depfiles():
@@ -135,9 +171,13 @@ def scan(rel):
         # expression like `x = y %*p`, is not a format string. Cheap and good
         # enough — every real offender is a literal on the line.
         for lit in re.findall(r'"((?:[^"\\]|\\.)*)"', line):
-            m = STAR.findall(lit.replace("%%", ""))
-            if m:
-                hits.append((i, line.strip(), m))
+            body = lit.replace("%%", "")
+            reasons = []
+            for rx, why in UNSUPPORTED:
+                for m in rx.findall(body):
+                    reasons.append("%s -- %s" % (m if isinstance(m, str) else m[0], why))
+            if reasons:
+                hits.append((i, line.strip(), reasons))
                 break
     return hits
 
@@ -169,12 +209,13 @@ def main(argv):
         return 1 if findings else 0
 
     print("lint_printf: scanned %d file(s): %s" % (len(srcs), how))
-    print("looking for star width/precision, which lib/libc_shim.c renders as")
-    print("the literal text \"%*s\" while misaligning every later argument.")
+    print("looking for conversions lib/kfmt.c does not implement. Its `default`")
+    print("arm echoes them literally AND consumes no vararg, so every argument")
+    print("after one of these shifts by a slot.")
     print()
     if not findings:
-        print("CLEAN: no kernel format string uses an argument-supplied width")
-        print("or precision. This lint belongs in make test-qemu now.")
+        print("CLEAN: every kernel format string is inside the grammar")
+        print("lib/kfmt.c implements (and tests/host/test_kfmt.c pins).")
         return 0
 
     byfile = {}
@@ -184,9 +225,11 @@ def main(argv):
         print("%s  (%d)" % (rel, len(byfile[rel])))
         for f in byfile[rel]:
             print("  %s:%d: %s" % (rel, f["line"], f["text"][:96]))
+            for r in f["conversions"]:
+                print("      %s" % r)
     print()
     print("%d offending line(s) in %d file(s)." % (len(findings), len(byfile)))
-    print("Each one reaches a model as punctuation plus a wrong number.")
+    print("Each one reaches a model as punctuation plus a shifted argument list.")
     return 1
 
 

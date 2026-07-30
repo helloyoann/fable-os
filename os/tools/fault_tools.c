@@ -118,6 +118,7 @@
 #include "trace.h"
 #include "json.h"
 #include "fault.h"
+#include "kernel.h"     /* millis() — the only thing this file needs from it */
 
 #include <stdint.h>
 #include <stddef.h>
@@ -281,6 +282,25 @@ static void describe_window(tool_result_t *r) {
         "resume window   : [0x%016lx, 0x%016lx) - a recovery may only resume "
         "at an address inside the loaded kernel image\n",
         (unsigned long)w->code_lo, (unsigned long)w->code_hi);
+}
+
+/* The narrower range a live code patch is judged by. Separate from the resume
+ * window on purpose, and the difference is worth spelling out for a model that
+ * has just been shown both: a resume address only has to be plausible, so
+ * code_lo..code_hi is a superset that admits .rodata and .data; a patch writes
+ * bytes the CPU will execute, so it gets the linker's exact .text bounds. */
+static void describe_text_window(tool_result_t *r) {
+    const fault_window_t *w = fault_window();
+    if (!w || w->text_hi <= w->text_lo) {
+        tool_result_printf(r,
+            "patchable .text : not published on this build, so every code patch "
+            "is refused\n");
+        return;
+    }
+    tool_result_printf(r,
+        "patchable .text : [0x%016lx, 0x%016lx) - a code patch may only touch "
+        "instructions inside this range\n",
+        (unsigned long)w->text_lo, (unsigned long)w->text_hi);
 }
 
 /* ====================================================================== */
@@ -987,3 +1007,361 @@ static const tool_t fault_recover_tool = {
     .invoke       = t_fault_recover,
 };
 REGISTER_TOOL(fault_recover_tool);
+
+/* ====================================================================== */
+/* fault_patch — the model editing the running kernel's instructions      */
+/* ====================================================================== */
+
+/* THE MOST DANGEROUS TOOL IN THIS KERNEL, and it is worth being explicit about
+ * why it exists anyway.
+ *
+ *   Every page here is RWX (boot/boot.asm never sets NX), so .text is as
+ *   writable as .data. That makes "the machine fixed a bug in itself" reachable
+ *   without a compiler, a linker or a reboot: a function is a byte string and
+ *   the model can edit it. It is the cheapest route to genuine self-repair.
+ *
+ *   It is also the only tool whose mistakes do not fault. A wrong byte silently
+ *   changes what the CPU does, forever, with no record — strictly worse than a
+ *   crash, because a crash at least prints a report. So this tool contributes
+ *   almost no policy of its own: it parses hex, refuses anything it cannot parse
+ *   exactly, and hands the request to fault_patch_apply(), which runs the five
+ *   gates documented in include/fault.h (inside .text, the expected bytes must
+ *   actually be there, whole instructions out, whole instructions in, and the
+ *   original always kept). One implementation of the rules, one place to read
+ *   them, and the same rules whether a patch arrives from an operator turn or
+ *   from the kernel's own fault diagnosis.
+ *
+ *   "expect" is REQUIRED and there is no flag to skip it. It is the only defence
+ *   against an address that was correct in another build, and the only evidence
+ *   available that the address is an instruction boundary at all.
+ */
+
+#define FAULT_HEX_MAX (FAULT_PATCH_MAX_BYTES * 2 + 1)
+
+/* Hex text -> bytes. Accepts "48f7f1", "48 f7 f1" and "48:f7:f1"; refuses an odd
+ * number of digits, any other character, and more than `cap` bytes. Returns the
+ * byte count, or -1. Deliberately strict: a silently dropped nibble is a
+ * different instruction. */
+static int hex_bytes(const char *s, uint8_t *out, unsigned cap) {
+    unsigned n = 0;
+    int      hi = -1;
+    if (!s) return -1;
+    for (size_t i = 0; s[i]; i++) {
+        char c = s[i];
+        int  v;
+        if (c == ' ' || c == '\t' || c == ':' || c == ',' || c == '_') {
+            /* A separator is only legal between whole bytes. */
+            if (hi >= 0) return -1;
+            continue;
+        }
+        if (c >= '0' && c <= '9')      v = c - '0';
+        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+        else return -1;
+        if (hi < 0) { hi = v; continue; }
+        if (n >= cap) return -1;
+        out[n++] = (uint8_t)((hi << 4) | v);
+        hi = -1;
+    }
+    if (hi >= 0) return -1;          /* trailing half a byte */
+    return (int)n;
+}
+
+static const char PATCH_USAGE[] =
+    "Expected {\"action\":\"apply\",\"address\":\"0x...\",\"expect\":\"<the "
+    "bytes you believe are there>\",\"bytes\":\"<the replacement>\","
+    "\"note\":\"why\"}, or {\"action\":\"revert\",\"id\":N}, or "
+    "{\"action\":\"revert_all\"}, or {\"action\":\"list\"}.\n"
+    "  expect and bytes are hex, the SAME length, 1..32 bytes. Both must cover "
+    "a whole number of instructions; 0x90 is a one-byte nop and pads any gap.\n";
+
+static int patch_fail(tool_result_t *r, const char *why, const char *extra) {
+    r->is_error = 1;
+    tool_result_printf(r, "fault_patch refused: %s%s%s%s.\n%s",
+                       why,
+                       extra ? " (\"" : "", extra ? extra : "",
+                       extra ? "\")"  : "",
+                       PATCH_USAGE);
+    mark_truncated(r);
+    trace_err(TOOL_EINVAL, "fault_patch", "%s%s%s", why,
+              extra ? " " : "", extra ? extra : "");
+    return TOOL_OK;
+}
+
+/* One line per patch slot, live or not. The `expect` field a future revert or
+ * re-patch needs is exactly the "now" column, so it is printed as hex. */
+static void patch_list(tool_result_t *r) {
+    uint32_t n = fault_patch_count();
+    if (n == 0) {
+        tool_result_printf(r, "No code patch has been applied this boot.\n");
+        return;
+    }
+    tool_result_printf(r, "%lu patch slot(s) used this boot, %lu still live "
+                          "(of %u):\n",
+                       (unsigned long)n, (unsigned long)fault_patch_live(),
+                       (unsigned)FAULT_PATCH_SLOTS);
+    for (uint32_t i = 0; i < n; i++) {
+        const fault_patch_t *p = fault_patch_at(i);
+        if (!p) continue;
+        tool_result_printf(r, "  %lu %s 0x%016lx %u byte(s)  was",
+                           (unsigned long)p->id, p->live ? "LIVE    " : "reverted",
+                           (unsigned long)p->addr, (unsigned)p->len);
+        for (unsigned b = 0; b < p->len; b++)
+            tool_result_printf(r, " %02x", (unsigned)p->orig[b]);
+        tool_result_printf(r, "  now");
+        for (unsigned b = 0; b < p->len; b++)
+            tool_result_printf(r, " %02x", (unsigned)p->bytes[b]);
+        tool_result_printf(r, "  %s\n", p->note[0] ? p->note : "(no note)");
+    }
+}
+
+static int t_fault_patch(const tool_call_t *call, tool_result_t *r) {
+    if (!call || !call->input || call->input_len == 0)
+        return patch_fail(r, "no arguments given", NULL);
+
+    json_value_t root;
+    if (json_parse(call->input, call->input_len, &root) != JSON_OK)
+        return patch_fail(r, "arguments are not valid JSON", NULL);
+    if (root.type != JSON_OBJECT)
+        return patch_fail(r, "arguments are not a JSON object", NULL);
+
+    /* Unknown keys are refused rather than ignored, for the reason
+     * t_fault_recover gives at length: a patch the model believes it described
+     * and the kernel read half of is the worst outcome available. */
+    static const char *const allowed[] = {
+        "action", "address", "expect", "bytes", "note", "id"
+    };
+    size_t nmemb = json_count(&root);
+    for (size_t i = 0; i < nmemb; i++) {
+        json_value_t k;
+        char         name[FAULT_WORD_MAX];
+        if (json_member(&root, i, &k, NULL) != JSON_OK)
+            return patch_fail(r, "the arguments object could not be read", NULL);
+        if (json_str(&k, name, sizeof name, NULL) != JSON_OK)
+            return patch_fail(r, "an argument name is not one of the accepted "
+                                 "fields", NULL);
+        int known = 0;
+        for (unsigned j = 0; j < sizeof allowed / sizeof allowed[0]; j++)
+            if (streq(name, allowed[j])) known = 1;
+        if (!known) return patch_fail(r, "unknown field", name);
+    }
+
+    char action[FAULT_WORD_MAX];
+    int  arc = read_word_field(&root, "action", action, sizeof action);
+    if (arc < 0) return patch_fail(r, "\"action\" must be a short word", NULL);
+    if (arc == 0) return patch_fail(r, "missing required field \"action\"", NULL);
+
+    /* ---- the read-only verbs ---- */
+    if (streq(action, "list")) {
+        patch_list(r);
+        mark_truncated(r);
+        trace_ret((long)fault_patch_live(), "fault_patch", "list");
+        return TOOL_OK;
+    }
+
+    if (streq(action, "revert_all")) {
+        uint32_t live = fault_patch_live();
+        uint32_t n    = fault_patch_revert_all(millis());
+        tool_result_printf(r,
+            "%lu of %lu live patch(es) reverted; the kernel's instructions are "
+            "back as the linker left them.\n",
+            (unsigned long)n, (unsigned long)live);
+        if (n != live)
+            tool_result_printf(r,
+                "%lu could NOT be put back because the bytes in memory are no "
+                "longer the ones that patch wrote. Call fault_patch with "
+                "\"list\" and look at them.\n", (unsigned long)(live - n));
+        patch_list(r);
+        mark_truncated(r);
+        trace_ret((long)n, "fault_patch", "revert_all live=%lu",
+                  (unsigned long)live);
+        return TOOL_OK;
+    }
+
+    if (streq(action, "revert")) {
+        uint64_t id = 0;
+        int      present = 0;
+        if (read_u64_field(&root, "id", &id, &present) != 0)
+            return patch_fail(r, "\"id\" must be a patch id", NULL);
+        if (!present)
+            return patch_fail(r, "\"revert\" needs the \"id\" of the patch to "
+                                 "undo; call \"list\" to see them", NULL);
+        if (id == 0 || id > 0xFFFFFFFFULL)
+            return patch_fail(r, "\"id\" is not a patch id this machine could "
+                                 "have issued", NULL);
+
+        char why[224];
+        fault_patch_err_t rc = fault_patch_revert((uint32_t)id,
+                                                  millis(),
+                                                  why, sizeof why);
+        if (rc != FAULT_PATCH_OK) {
+            r->is_error = 1;
+            tool_result_printf(r, "fault_patch could not revert %lu (%s): %s.\n",
+                               (unsigned long)id, fault_patch_errname(rc), why);
+            patch_list(r);
+            mark_truncated(r);
+            trace_err(TOOL_EINVAL, "fault_patch", "revert id=%lu %s",
+                      (unsigned long)id, fault_patch_errname(rc));
+            return TOOL_OK;
+        }
+        tool_result_printf(r, "%s.\n", why);
+        patch_list(r);
+        mark_truncated(r);
+        trace_ret((long)id, "fault_patch", "revert id=%lu", (unsigned long)id);
+        return TOOL_OK;
+    }
+
+    if (!streq(action, "apply"))
+        return patch_fail(r, "\"action\" must be apply, revert, revert_all or "
+                             "list", action);
+
+    /* ---- apply ---- */
+    uint64_t addr    = 0;
+    int      present = 0;
+    if (read_u64_field(&root, "address", &addr, &present) != 0)
+        return patch_fail(r, "\"address\" must be a hex or decimal address",
+                          NULL);
+    if (!present)
+        return patch_fail(r, "\"apply\" needs an \"address\"", NULL);
+
+    char    hex[FAULT_HEX_MAX];
+    uint8_t want[FAULT_PATCH_MAX_BYTES];
+    uint8_t have[FAULT_PATCH_MAX_BYTES];
+
+    int hrc = read_word_field(&root, "expect", hex, sizeof hex);
+    if (hrc < 0)
+        return patch_fail(r, "\"expect\" must be a hex string of at most 32 "
+                             "bytes", NULL);
+    if (hrc == 0)
+        return patch_fail(r,
+            "\"expect\" is required: state the bytes you believe are at that "
+            "address. It is the only thing that can tell a correct address from "
+            "one that was correct in a different build", NULL);
+    int nexp = hex_bytes(hex, have, sizeof have);
+    if (nexp <= 0)
+        return patch_fail(r, "\"expect\" is not an even number of hex bytes",
+                          NULL);
+
+    hrc = read_word_field(&root, "bytes", hex, sizeof hex);
+    if (hrc < 0)
+        return patch_fail(r, "\"bytes\" must be a hex string of at most 32 "
+                             "bytes", NULL);
+    if (hrc == 0)
+        return patch_fail(r, "\"apply\" needs the replacement \"bytes\"", NULL);
+    int nnew = hex_bytes(hex, want, sizeof want);
+    if (nnew <= 0)
+        return patch_fail(r, "\"bytes\" is not an even number of hex bytes",
+                          NULL);
+
+    /* THE NOTE IS CLIPPED, NEVER A REASON TO REFUSE, and this was a real defect
+     * found in a live run: the model diagnosed a divide-by-zero correctly, wrote
+     * a perfectly good two-byte patch, and the whole thing was thrown away
+     * because its explanatory comment was longer than this buffer. A patch is
+     * bytes and an address; the note is decoration that gets stored beside them.
+     * Refusing a correct repair over the length of its comment costs a round
+     * trip, spends a paid API call, and burns one of the two per-boot patch
+     * attempts to learn a buffer size. So an over-long note is truncated and the
+     * patch is judged on its bytes. Contrast "expect" and "bytes" immediately
+     * above, where a clipped value would be a DIFFERENT instruction and refusing
+     * is the only safe answer. */
+    char note[FAULT_PATCH_NOTE_MAX];
+    note[0] = '\0';
+    {
+        json_value_t nv;
+        if (json_get(&root, "note", &nv) == JSON_OK) {
+            if (nv.type != JSON_STRING)
+                return patch_fail(r, "\"note\" must be a string", NULL);
+            /* json_str returns ENOSPC and still fills the buffer, so a long note
+             * arrives clipped rather than absent. */
+            (void)json_str(&nv, note, sizeof note, NULL);
+        }
+    }
+
+    fault_patch_req_t req;
+    for (unsigned i = 0; i < sizeof req.bytes; i++) {
+        req.bytes[i]  = (i < (unsigned)nnew) ? want[i] : 0;
+        req.expect[i] = (i < (unsigned)nexp) ? have[i] : 0;
+    }
+    req.addr       = addr;
+    req.len        = (uint8_t)nnew;
+    req.expect_len = (uint8_t)nexp;
+    req.note       = note[0] ? note : NULL;
+
+    char     why[320];
+    uint32_t id = 0;
+    fault_patch_err_t rc = fault_patch_apply(&req, fault_window(),
+                                             millis(), &id,
+                                             why, sizeof why);
+    if (rc != FAULT_PATCH_OK) {
+        r->is_error = 1;
+        tool_result_printf(r,
+            "fault_patch refused (%s): %s.\n%s.\n",
+            fault_patch_errname(rc), why, fault_patch_errdesc(rc));
+        describe_text_window(r);
+        mark_truncated(r);
+        trace_err(TOOL_EINVAL, "fault_patch", "apply addr=0x%lx len=%u %s",
+                  (unsigned long)addr, (unsigned)nnew,
+                  fault_patch_errname(rc));
+        return TOOL_OK;
+    }
+
+    tool_result_printf(r,
+        "Patch %lu applied: %s.\n"
+        "This kernel's instructions have changed and the change is LIVE - the "
+        "next call to that code runs the new bytes. Nothing verified that they "
+        "are correct, only that they are inside .text, that the bytes you "
+        "expected were really there, and that both spans are whole "
+        "instructions. If the machine misbehaves, "
+        "{\"action\":\"revert\",\"id\":%lu} puts the original back.\n",
+        (unsigned long)id, why, (unsigned long)id);
+    patch_list(r);
+    mark_truncated(r);
+
+    trace_ret((long)id, "fault_patch", "apply addr=0x%lx len=%u",
+              (unsigned long)addr, (unsigned)nnew);
+    return TOOL_OK;
+}
+
+static const tool_t fault_patch_tool = {
+    .name        = "fault_patch",
+    .description =
+        "Rewrite instructions in this running kernel's .text, and undo it. "
+        "Every page here is RWX, so a function is a byte string that can be "
+        "edited in place: this is how a bug in the kernel itself gets fixed "
+        "without a compiler and without a reboot.\n"
+        "It is also the only tool whose mistakes do not fault - a wrong byte "
+        "silently changes what the CPU does forever. So \"expect\" is required "
+        "and must match the bytes actually at that address, \"expect\" and "
+        "\"bytes\" must be the same length, and both must cover a whole number "
+        "of x86-64 instructions (0x90 is a one-byte nop and pads any gap). The "
+        "target must be inside .text; .rodata and .data are refused. The "
+        "original bytes are always kept, so \"revert\" and \"revert_all\" "
+        "always work.\n"
+        "Get the address and the current bytes from fault_report or mem_read - "
+        "never from memory of another build. Use \"list\" to see what is "
+        "patched.",
+    .input_schema =
+        "{\"type\":\"object\","
+        "\"properties\":{"
+        "\"action\":{\"type\":\"string\","
+        "\"enum\":[\"apply\",\"revert\",\"revert_all\",\"list\"],"
+        "\"description\":\"apply a patch, undo one by id, undo all, or list.\"},"
+        "\"address\":{\"type\":\"string\","
+        "\"description\":\"With apply: the first byte to replace, hex with a 0x "
+        "prefix.\"},"
+        "\"expect\":{\"type\":\"string\","
+        "\"description\":\"With apply, REQUIRED: the bytes you believe are "
+        "there now, as hex e.g. \\\"48f7f1\\\". Refused if they are not.\"},"
+        "\"bytes\":{\"type\":\"string\","
+        "\"description\":\"With apply: the replacement, as hex. Must be exactly "
+        "as long as expect.\"},"
+        "\"note\":{\"type\":\"string\","
+        "\"description\":\"With apply: one short line saying why, kept with the "
+        "patch.\"},"
+        "\"id\":{\"type\":\"integer\","
+        "\"description\":\"With revert: which patch to undo.\"}},"
+        "\"required\":[\"action\"]}",
+    .flags        = TOOL_MUTATES,
+    .invoke       = t_fault_patch,
+};
+REGISTER_TOOL(fault_patch_tool);

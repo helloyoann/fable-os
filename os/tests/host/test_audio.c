@@ -1819,6 +1819,123 @@ static void test_tool_reports_a_sink_failure(void) {
     CHECK_CONTAINS(kcap_text(), "-> EINVAL]");
 }
 
+/* ---------------------------------------------------------------------
+ * THE GOAL STATE, AND THE HOLE THAT WAS IN IT
+ *
+ * Once the model has installed its own audio driver, the machine's audio sink IS
+ * a driver program. `sys audio.tone` from inside ANOTHER driver program then
+ * meant running two programs at once, and the two share one scratch arena and
+ * one pair of DMA guard bands — both re-initialised at dvm_run() entry. So the
+ * inner run silently erased the outer program's working store and, worse,
+ * re-poisoned guard bands that the outer program's device had already overrun,
+ * which turned a memory-corrupting program's run into "converged" and cleared
+ * its attempt budget.
+ *
+ * dvm_run() now refuses re-entry. tests/host/test_dvm.c pins the VM-level
+ * mechanism; what this test pins is that the REAL audio path is the thing that
+ * reaches it, through the real core/audio.c with a real registered VM sink, and
+ * that the refusal arrives as a usable sentence rather than a silent failure.
+ * ------------------------------------------------------------------ */
+
+static int reentry_tone_calls;
+
+/* A stand-in for vm/dvm.c's k_audio_tone, which is #ifdef'd out of a host build.
+ * It does what that function does: call audio_tone() and hand back the audio
+ * service's own sentence on failure. */
+static int64_t sys_audio_tone(void *ctx, uint32_t hz, uint32_t ms,
+                              char *err, size_t cap) {
+    (void)ctx;
+    reentry_tone_calls++;
+    if (!audio_available()) { snprintf(err, cap, "no audio sink"); return -1; }
+    if (audio_tone(hz, ms) != AUDIO_OK) {
+        snprintf(err, cap, "%s", audio_last_error());
+        return -1;
+    }
+    return 0;
+}
+
+static void test_a_driver_program_cannot_play_through_a_vm_sink(void) {
+    audio_reset();
+    reentry_tone_calls = 0;
+
+    /* A VM sink, installed exactly as driver_install does. */
+    if (assemble(PLAY_SRC) != 0) return;
+    audio_vm_spec_t sp;
+    vm_spec_init(&sp);
+    CHECK_EQ(audio_register_vm("modelsnd", NULL, &FMT_48_STEREO, &sp), AUDIO_OK);
+    CHECK_EQ(audio_available(), 1);
+
+    /* Now an OUTER driver program, of the shape driver_run runs: it stakes a
+     * value in scratch, asks for a tone, and reads the value back. */
+    static dvm_program_t outer;
+    dvm_asm_err_t oerr;
+    const char *osrc = "mst32 [0], 0xdeadbeef\n"
+                       "mld32 r1, [0]\n"
+                       "push 440\npush 20\n"
+                       "sys r3, audio.tone\n"
+                       "mld32 r2, [0]\n"
+                       "halt\n";
+    CHECK_EQ(dvm_assemble(osrc, strlen(osrc), &outer, &oerr), 0);
+
+    static const dvm_sys_t osys = { .ctx = NULL, .audio_tone = sys_audio_tone };
+    static dvm_io_t oio;
+    oio = dev_io;
+    oio.sys = &osys;
+
+    dvm_policy_t opol;
+    uint64_t dbase = 0, dsize = 0;
+    dvm_dma_region(&dbase, &dsize);
+    dvm_policy_init(&opol);
+    dvm_policy_allow_ports(&opol, DEVBASE, DEVBASE + 0x3F);
+    CHECK_EQ(dvm_policy_allow_dma(&opol, dbase, dsize), 0);
+    dvm_policy_allow_sys(&opol, DVM_SYS_AUDIO_TONE);
+    opol.max_sys = 4;
+    opol.max_mem_bytes = 4096;
+    opol.trace = DVM_TRACE_OFF;
+
+    dev_reset(1);
+    dvm_result_t ores;
+    CHECK_EQ((int)dvm_run(&outer, &opol, &oio, NULL, 0, &ores), (int)DVM_OK);
+
+    /* The syscall really was attempted, so this test is not vacuous. */
+    CHECK_EQ(reentry_tone_calls, 1);
+
+    /* It failed, and the program can see that it failed. */
+    CHECK(ores.reg[3] != 0);
+
+    /* THE PROPERTY: the outer program's scratch memory survived. Before the
+     * guard, r2 came back 0 while r1 was 0xdeadbeef, with no trap and no
+     * message — the kernel silently emptied the program's own working store. */
+    CHECK_EQ(ores.reg[1], 0xdeadbeefu);
+    CHECK_EQ(ores.reg[2], 0xdeadbeefu);
+
+    /* Nothing was played, and the sink was never entered. */
+    CHECK_EQ(dev.started, 0);
+    audio_status_t st;
+    audio_status(&st);
+    CHECK_EQ(st.plays, 0);
+
+    /* The reason reaches the model, through the audio service's own wording,
+     * and it names the situation rather than just saying "failed". */
+    CHECK_CONTAINS(ores.sys_msg, "audio.tone");
+    CHECK_CONTAINS(ores.sys_msg, "one driver program at a time");
+
+    /* A NATIVE sink is unaffected: it never re-enters the VM, so a driver
+     * program can still ask for a tone. This is the half of the behaviour that
+     * proves the guard is targeted rather than a blanket ban on the syscall. */
+    audio_reset();
+    reentry_tone_calls = 0;
+    register_native(&FMT_48_STEREO);
+    CHECK_EQ(audio_available(), 1);
+    dev_reset(1);
+    CHECK_EQ((int)dvm_run(&outer, &opol, &oio, NULL, 0, &ores), (int)DVM_OK);
+    CHECK_EQ(reentry_tone_calls, 1);
+    CHECK_EQ(ores.reg[3], 0u);              /* the syscall succeeded */
+    CHECK_EQ(ores.reg[2], 0xdeadbeefu);     /* and scratch still survived */
+    audio_status(&st);
+    CHECK_EQ(st.plays, 1);
+}
+
 static void test_tool_vm_sink_end_to_end(void) {
     audio_reset();
     if (assemble(PLAY_SRC) != 0) return;
@@ -1928,6 +2045,7 @@ int main(void) {
     RUN(test_tool_melody);
     RUN(test_tool_melody_spans_buffers);
     RUN(test_tool_reports_a_sink_failure);
+    RUN(test_a_driver_program_cannot_play_through_a_vm_sink);
     RUN(test_tool_vm_sink_end_to_end);
 
     CHECK_EQ(kpanic_hit, 0);

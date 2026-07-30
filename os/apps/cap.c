@@ -53,25 +53,48 @@
  *     - the handler runs to completion in arithmetic time, exactly as it did
  *       before this file existed. Clicking a button cannot take longer because
  *       the button makes a noise;
- *     - the sound starts from app_service(), which the idle loop calls between
+ *     - the sound starts from app_service(), which the IDLE loop calls between
  *       input polls. Nothing is started during a model turn, when the machine is
- *       inside a TLS round trip, and nothing is started from inside gui paint;
- *     - one request is in flight at a time and one sound starts per
- *       APP_CAP_GAP_MS, so the worst case an app can impose on the prompt is one
- *       sound's length, bounded by APP_CAP_AUDIO_MS_MAX.
+ *       inside a TLS round trip, and nothing is started from inside gui paint.
+ *       That is enforced by which function the ui fiber calls, not by hope: see
+ *       the note below;
+ *     - one request is in flight at a time, and the next one is refused until the
+ *       machine has been free for at least as long as the last one blocked it.
+ *
+ *   HOW THE "NOT DURING A MODEL TURN" HALF WAS BROKEN, AND WHAT NOW HOLDS IT.
+ *   That sentence was true when app_tick() was reached only from
+ *   wait_for_sentence(). It became false when app_tick() also became the body of
+ *   kernel/main.c's ui fiber, because net/net.c's net_service() yields to that
+ *   fiber on every pass of every network wait — a DNS lookup and the model turn
+ *   included — and app_tick() ended with an unconditional app_service(). Measured:
+ *   ~2000 ui-fiber passes inside one 657 ms API call, with an
+ *   [app_call cap=audio.tone ...] line printed between "net: resolving
+ *   api.anthropic.com" and "TLS ready". apps/runtime.c now publishes
+ *   app_tick_handlers() (compute only) separately from app_tick() (compute plus
+ *   pump); the fiber calls the former, the idle loop the latter. A safety property
+ *   that rests on a call site has to be spelled out at that call site, which is
+ *   why the same note is in include/app.h and kernel/main.c.
  *
  *   HONEST LIMIT, stated because it is the one thing here that is not fully
  *   solved: audio.h's play contract is SYNCHRONOUS ("play must not return until
  *   the device has finished reading the buffer"), because the kernel refills that
  *   buffer for the next sound and has no way to ask a device where it is reading.
- *   So the drain itself blocks for the length of the sound. That is why an app's
- *   sound is capped at APP_CAP_AUDIO_MS_MAX rather than audio.h's AUDIO_MAX_MS:
- *   200 ms is a UI beep, it is the same order as a keystroke round trip, and it
- *   bounds the delay an app can impose to well under half the machine even if it
- *   asks as fast as it is allowed to. A truly non-blocking sound needs a
- *   start/poll split in the audio service — see FUTURE EXTENSION POINTS in
- *   include/app.h. Long sounds remain the model's own audio_tone tool, which is
- *   traced as a tool call and is not on this path at all.
+ *   So the drain itself blocks. With a native sink it blocks for the length of the
+ *   sound; with a sink that is a DRIVER PROGRAM it blocks for longer, because
+ *   core/audio.c gives that program a polling budget of the sound plus
+ *   AUDIO_PLAY_MARGIN_US and the program spends it in mdelay(), which yields to
+ *   nothing. A 200 ms tone was measured holding the machine for 450 ms.
+ *
+ *   So APP_CAP_AUDIO_MS_MAX does NOT bound the stall — it bounds the duration an
+ *   app may request, which is a different number. What bounds the stall is the
+ *   duty-cycle rule on `free_at_ms` below: every call is TIMED, and the next one
+ *   is refused until the machine has been free for at least that long again plus
+ *   APP_CAP_GAP_MS. That keeps app sounds under half the machine whatever a driver
+ *   does, instead of asserting a percentage derived from a constant that turned
+ *   out not to govern it. A truly non-blocking sound still needs a start/poll
+ *   split in the audio service — see FUTURE EXTENSION POINTS in include/app.h.
+ *   Long sounds remain the model's own audio_tone tool, which is traced as a tool
+ *   call and is not on this path at all.
  *
  * UNTRUSTED INPUT
  *   Argument values arrive as app_val_t from the expression evaluator, so they
@@ -370,7 +393,19 @@ static int arg_num(const app_val_t *v, const app_cap_arg_t *a, const char *cname
  * and the rate limit is a property of the machine rather than of a document. A
  * second request while this one waits is refused with a sentence saying so,
  * which is information the app can display; a queue would instead hide the
- * overload and then play a burst of stale beeps. */
+ * overload and then play a burst of stale beeps.
+ *
+ * ONE SLOT IS NOT THE SAME AS FIRST COME FOR EVER, and for a while it was. This
+ * file grants the slot to whoever asks first and has no idea who else wanted it,
+ * so FAIRNESS IS run_ticks()'s JOB, in apps/runtime.c: it rotates which document
+ * gets to ask first, and it rotates on the GRANT rather than on a timer, so no
+ * period in the machine can alias with it. Before that existed, two documents
+ * with the same tick period were phase-locked and the lower pool slot won every
+ * single time — measured at 132 sounds to 0 over 66 s. The refusals this file
+ * hands out ("still busy", "too soon") are worded as transient because that is
+ * what they now are; if this slot ever stops rotating they become permanent
+ * refusals that read as temporary, which is the worst kind of error message this
+ * project can produce. */
 static struct {
     int      used;
     int      cap;
@@ -382,12 +417,43 @@ static struct {
     uint8_t  wave;
 } pend;
 
-static uint64_t last_start_ms;
+/* THE RATE LIMIT IS A MEASURED DUTY CYCLE, NOT A FIXED INTERVAL.
+ *
+ * It used to be "one sound started every APP_CAP_GAP_MS", timed from the moment
+ * the previous one STARTED. Two things were wrong with that, and both of them
+ * made a documented safety bound false rather than merely loose:
+ *
+ *   1. APP_CAP_AUDIO_MS_MAX bounds the duration an app may REQUEST. It does not
+ *      bound how long performing that request BLOCKS this machine, and the two
+ *      are not the same number. When the audio sink is a driver program — the
+ *      normal outcome of driver_install, and the state this whole project exists
+ *      to reach — core/audio.c's run_vm() raises the program's delay budget to
+ *      the sound's length PLUS AUDIO_PLAY_MARGIN_US (250 ms), and the program
+ *      spends it polling a device with mdelay(), which yields to nothing. A 200 ms
+ *      app tone was measured holding the machine for 450 ms.
+ *   2. Timing the gap from the START meant the blocking time ate the gap
+ *      one-for-one. 450 ms of blocking inside a 500 ms interval is 90% of the
+ *      machine, against a header that claimed 40%.
+ *
+ * So the interval is now timed from the moment the sound FINISHED, and it is at
+ * least as long as the sound actually blocked for. The worst-case duty cycle is
+ * therefore block/(block + APP_CAP_GAP_MS + block), which is strictly under half
+ * whatever a driver does, and under 4% for the 20-150 ms beeps an app actually
+ * asks for. A driver that blocks for longer buys itself a proportionally longer
+ * silence rather than a larger share of the machine — which is the property the
+ * headers claim, now enforced by measurement instead of by arithmetic on a
+ * constant that turned out not to govern the thing it was named after.
+ *
+ * Measuring is the only way to know: the kernel cannot ask a model-authored
+ * driver how long it will take, and nothing in this file gets to see the sink. */
+static uint64_t free_at_ms;      /* no sound may START before this reading */
+static uint64_t last_block_ms;   /* how long the previous one held the machine */
 static int      started_any;
 
 void app_cap_reset(void) {
     pend.used     = 0;
-    last_start_ms = 0;
+    free_at_ms    = 0;
+    last_block_ms = 0;
     started_any   = 0;
 }
 
@@ -514,15 +580,17 @@ int app_cap_request(const app_cap_req_t *rq, char *why, size_t why_cap,
     }
     /* A clock that went BACKWARDS (a suspend, or a test installing another time
      * source) must not silence every app until it catches up, so a reading before
-     * the last start is treated as "long enough ago" — the same rule app_tick()
-     * applies to a tick handler's due time. */
-    uint64_t since = (rq->now_ms >= last_start_ms) ? rq->now_ms - last_start_ms
-                                                  : (uint64_t)APP_CAP_GAP_MS;
-    if (started_any && since < APP_CAP_GAP_MS) {
+     * the window opened is treated as "the window is open" — the same rule
+     * app_tick() applies to a tick handler's due time. */
+    if (started_any && rq->now_ms < free_at_ms &&
+        free_at_ms - rq->now_ms <= (uint64_t)APP_CAP_QUIET_MAX_MS) {
+        uint64_t wait = free_at_ms - rq->now_ms;
         whyf(why, why_cap,
-             "too soon: the kernel starts at most one app sound every %u ms, and "
-             "the last one started %lu ms ago",
-             (unsigned)APP_CAP_GAP_MS, (unsigned long)since);
+             "too soon: the last app sound held this machine for %lu ms, so it "
+             "stays quiet for that long again plus %u ms - %lu ms to go. Ask less "
+             "often or for a shorter sound",
+             (unsigned long)last_block_ms, (unsigned)APP_CAP_GAP_MS,
+             (unsigned long)wait);
         brief_of(&m, "too soon");
         return APP_EBUSY;
     }
@@ -559,8 +627,28 @@ int app_cap_service(uint64_t now_ms) {
     uint32_t amp = pend.amp ? pend.amp : AUDIO_AMP_DEFAULT;
     int rc = audio_tone_ex(pend.hz, pend.ms, amp, (audio_wave_t)pend.wave);
 
-    last_start_ms = now_ms;
-    started_any   = 1;
+    /* HOW LONG DID THAT ACTUALLY COST THE MACHINE? Read the clock again rather
+     * than assuming pend.ms: the sink may be a driver program polling a device,
+     * in which case it blocks for the sound plus its polling margin, and the
+     * kernel has no way to know that number in advance. A failed call is timed
+     * too — a driver that hangs its budget and then reports failure has spent
+     * the machine's time just the same.
+     *
+     * The clock can go backwards (a suspend, a test installing another source);
+     * treat that as "no measurable block" rather than as an enormous one, which
+     * would silence every app for the length of a bogus interval. */
+    uint64_t done_ms = app_now_ms();
+    uint64_t block   = (done_ms >= now_ms) ? done_ms - now_ms : 0;
+    if (block > APP_CAP_QUIET_MAX_MS) block = APP_CAP_QUIET_MAX_MS;
+
+    last_block_ms = block;
+    /* Quiet for as long as it blocked, plus the ordinary gap, measured from the
+     * moment it FINISHED. Clamped, so a pathological measurement cannot mute
+     * apps for the rest of the boot. */
+    uint64_t quiet = block + (uint64_t)APP_CAP_GAP_MS;
+    if (quiet > APP_CAP_QUIET_MAX_MS) quiet = APP_CAP_QUIET_MAX_MS;
+    free_at_ms  = done_ms + quiet;
+    started_any = 1;
     app_note_sound();
 
     /* GROUND TRUTH, WHATEVER THE OUTCOME. An app is model-authored, so the

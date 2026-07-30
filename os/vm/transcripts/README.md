@@ -51,8 +51,106 @@ formatting bug, a model's guess, and a measurable acoustic artefact, joined end
 to end.
 
 That line is fixed. `tests/qemu/lint_printf.py` is the guard, and it still
-reports 25 more instances in `vm/dvm.c`'s assembler diagnostics — see that
-script's header for why those are worse.
+reports a couple of dozen more instances in `vm/dvm.c`'s assembler diagnostics —
+run it for the current count, which grows as that file does. Those are worse than
+the one that was fixed here: they are the messages a model reads to correct its
+own program, and several of them end in a `%d` that consumes the token's LENGTH,
+so the kernel confidently tells the model this machine has `r0-r3`. See the
+script's header for the measured before/after.
+
+## `ac97-contract-fixed.*` — the same experiment with the contract readable
+
+Run again after the `%.*s` fix. The model's reasoning changes exactly where you
+would predict: it now writes **"r9 = bytes of PCM, so samples = r9/2"** instead of
+hardcoding the region size. The note it produced is 1000.0 Hz, **100.0% tonal**,
+peak exactly 8000, and the 26.9-second DC hold is gone (1 frame of trailing DC).
+
+It is still not the 900 ms that was asked for; it is 217.3 ms. That is now a
+different and much better bug. The model derived 86400 samples correctly from r9,
+then wrote it into a field it had itself described as "low 16 bits" — 86400 masked
+to 16 bits is 20864 samples = 10432 stereo frames = 217.33 ms, and the WAV holds
+10432 frames. Long sounds on that part need the descriptor list split across
+several entries. The fix moved the failure from "cannot read the spec" to "made an
+arithmetic mistake inside the spec", which is the failure a driver author is
+supposed to be able to have.
+
+## `hda-install-attempt.*` — the most useful failure in this directory
+
+Two live attempts at `intel-hda` + `hda-duplex`, both silent, and worth more than
+the successes because of *how* they failed.
+
+**The model wrote an AC'97 driver for an HD Audio card.** It read the right
+values and drew the wrong conclusion: 8086:2668 class 04:03 it called "an Intel
+AC'97 controller, not HDA" (it is ICH6 HD Audio), then — to its credit — said
+"rather than trust that identification, let me probe", read offset 0 and got
+**0x4401**, and took that as an AC'97 reset register reporting a codec. 0x4401 is
+HDA's GCAP: 4 output streams, 4 input, 1 bidirectional, 64-bit capable. The probe
+*confirmed* the wrong hypothesis because the number is plausible under both
+readings. `hda2.log` is the same card being identified correctly, by a model that
+compared the device ID against the ones AC'97 actually uses and noticed the part
+was pure MMIO.
+
+Three things the kernel did wrong here, none of them device-specific:
+
+1. **A sound that never happened was reported as success.** The play program
+   reached `halt` having touched the device 20 times, so `audio_tone` returned
+   9600 frames, `[app_call cap=audio.tone ... -> ok]` was printed, and the model
+   told the operator it had heard a 440 Hz note. The WAV captured **zero frames**.
+   `tools/audio_tools.c` now says plainly, on every VM-sink play, that this only
+   establishes that the program ran and touched the device.
+2. **Installing a sink makes the device unrepairable.** Once `driver_install`
+   binds a card, `driver_targets` stops offering it (`usable=2` becomes
+   `usable=1`), so `driver_run` can no longer probe it. The model hit this exactly:
+   *"the sink is bound to a device the driver VM won't let me touch."* A bad play
+   program can therefore only be replaced blind.
+3. **There is no way to read an installed play program back.** *"I don't have the
+   existing program's source."* Correcting a sink means rewriting it from memory.
+
+## `ac97-reentry-fix.*` and `ac97-io-limit.*` — the play budget, and the run that found it
+
+Two runs from the session that fixed the surviving high-severity defects. Same
+prompt both times, same card, one kernel change between them.
+
+`ac97-io-limit.log` is the failure and it is the more useful file. The model found
+the card, brought it up, reasoned a descriptor list out of the play contract and
+installed a play program — and the first `audio_tone` died with **`IO_LIMIT`**. It
+diagnosed itself correctly in its own last message: its status-poll loop spent the
+device-access budget before the DMA reported done. That was a KERNEL gap, not a
+model error. The contract says "poll until the device has finished reading that
+memory"; the budget the sink inherited from `driver_run` was `DRV_MAX_IO` = 1024
+accesses, sized for bring-up. One poll per millisecond of an 800 ms sound is 800
+accesses before the program does anything else, and a 1 s sound is over the whole
+budget — so the documented instruction and the enforced limit disagreed, and a
+correct program trapped. `core/audio.c` now raises the access budget in proportion
+to the sound the same way it already raised the delay budget, and
+`AUDIO_VM_CONTRACT` states both numbers and the poll shape that fits them.
+
+`ac97-reentry-fix.*` is the run after that, and it makes a sound:
+
+```
+captured    : 12046 frames = 0.251 s
+amplitude   : peak 7998 (audio_tone was asked for 8000)
+frequency   : 438.4 Hz by zero crossings, 440.4 Hz by Goertzel
+tonality    : 99.5% of energy at 440.4 Hz
+per 50 ms   : 440.0 Hz, tonal 100.0%, at every one of the five windows
+```
+
+**Read the length, not just the pitch.** It asked for 1000 ms and produced 251 ms.
+The frequency, amplitude and purity are exactly right, so the driver is genuinely
+driving the codec; the duration is wrong for the reason `ac97-fullloop` showed and
+this run reproduces at a different rate: one descriptor, a 16-bit length field.
+44100 frames of stereo is 88200 samples, and `88200 & 0xFFFF` is 22664 samples =
+0.257 s. The screenshot is worth reading for the model's own account — it argues
+from the fact that the program reached its normal `halt` rather than its `abort`
+that the DMA-halted status bit really flipped, which is correct reasoning about the
+wrong amount of data. Splitting the buffer across descriptors is the fix, and the
+kernel cannot make it: the length field's width is device knowledge.
+
+A third attempt on the same prompt died to three consecutive upstream `529
+Overloaded` responses with the retry budget exhausted. Worth knowing before
+reading a silent WAV as a kernel fault: an unauthenticated POST to
+`api.anthropic.com/v1/messages` returning 401 proves the service is up and the
+problem is capacity, and it needs no key.
 
 ## The earlier single-card runs
 

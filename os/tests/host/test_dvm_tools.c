@@ -40,8 +40,15 @@
  *   of them, because it polices the CPU and not the DMA engine; there is no
  *   IOMMU. What the suite proves instead is that the kernel's own side is right:
  *   only the named device is made a master, the program is handed exactly one
- *   valid address, the address it gives the hardware is in the access log, and a
- *   near-miss overrun is reported with an offset.
+ *   valid address, and a near-miss overrun is reported with an offset.
+ *
+ *   NOT PROVED, AND NOT TRUE: that the address a program gives the hardware is
+ *   always on the record. The access log is a 256-entry RING against a 1024-access
+ *   budget, so it keeps the last 256 events; the serial trace is bounded the other
+ *   way and keeps the first 128 or 256. A write between the two windows — 200
+ *   polls, the descriptor address, 300 more polls — is in neither. The tests here
+ *   use short programs, i.e. only the regime where the claim holds, which is
+ *   exactly why the overclaim in tools/dvm_tools.c's header survived this suite.
  *
  * WHAT THIS SUITE CANNOT PROVE
  *   That a real model, with a real API key, writes programs like these. There
@@ -402,6 +409,7 @@ static const dvm_io_t tlk_io = {
     tlk_port_write, tlk_port_read,
     tlk_mmio_write, tlk_mmio_read,
     tlk_pci_read32, tlk_delay,
+    NULL,                       /* no syscall backend: see dvm_tools_set_sys */
 };
 
 /* ====================================================================== */
@@ -1729,11 +1737,56 @@ static void test_run_bounded(void) {
 /* 6. driver_run: target validation                                       */
 /* ====================================================================== */
 
+/* A PROGRAM WITH NO DEVICE, end to end through the tool.
+ *
+ * This is the mode that lifts the ceiling: no target, so no ports, no MMIO, no
+ * PCI function and no DMA grant — just the scratch arena and the strings. The
+ * things worth pinning here are the ones the VM's own suite cannot see: that
+ * driver_run builds that sandbox at all, that it does not try to set a bus
+ * master bit on a device that does not exist, and that what the program left in
+ * scratch memory comes back to the model. */
+static void test_run_with_no_device(void) {
+    fresh();
+    long writes_before = cfg_writes;
+
+    CHECK_EQ(call("driver_run",
+                  "{\"source\":\"mstr r1,0,\\\"status=\\\"\\n"
+                  "mitoa r1,r1,404,10\\n"
+                  "mstr r1,r1,\\\" (not found)\\\"\\n"
+                  "halt\\n\"}"), TOOL_OK);
+    CHECK_CONTAINS(rbuf, "no device (software program)");
+    CHECK_CONTAINS(rbuf, "no device;");
+    CHECK_CONTAINS(rbuf, "scratch memory");
+    /* The program's answer, read back out of the arena. */
+    CHECK_CONTAINS(rbuf, "status=404 (not found)");
+    CHECK_CONTAINS(rbuf, "r1=0x16");
+    /* No device was touched, and nothing was said about bus mastering. */
+    CHECK_EQ(forbidden, 0);
+    CHECK_EQ(cfg_writes, writes_before);
+    th_checks++;
+    if (strstr(rbuf, "pci cmd")) {
+        th_fails++;
+        printf("    FAIL a program with no device reported a config-space write\n");
+    }
+
+    /* A device opcode in that program reaches no backend rather than some
+     * other device's registers. */
+    CHECK(call("driver_run", "{\"source\":\"in8 r1,0xc000\\nhalt\\n\"}") != TOOL_OK);
+    CHECK_CONTAINS(rbuf, "PORT_DENIED");
+    CHECK_EQ(forbidden, 0);
+}
+
 static void test_run_target_validation(void) {
     fresh();
 
-    CHECK(call("driver_run", "{\"source\":\"halt\"}") != TOOL_OK);
-    CHECK_CONTAINS(rbuf, "\"target\" is required");
+    /* "target" is OPTIONAL now, and omitting it is a MODE, not an error: the
+     * program runs with no device sandbox at all. A bare `halt` still fails,
+     * but for the reason every other do-nothing program fails — it made no
+     * progress — and the message says which. */
+    CHECK_EQ(call("driver_run", "{\"source\":\"halt\"}"), TOOL_OK);
+    CHECK_CONTAINS(rbuf, "no device (software program)");
+    CHECK_CONTAINS(rbuf, "touching memory or calling the kernel");
+    CHECK_CONTAINS(rbuf, "no device;");
 
     CHECK(call("driver_run", "{\"target\":\"pci00:05.0\"}") != TOOL_OK);
     CHECK_CONTAINS(rbuf, "\"source\" is required");
@@ -1997,13 +2050,171 @@ static void test_budget_is_not_self_service(void) {
  * decode path to the character memory vm/dvm.c's deny list protects at 0xb8000.
  * driver_run's description promises a program "can only reach the device you
  * named - not ... the console"; this is what makes that true. */
+/* THE MODEL'S RESULT IS 1024 BYTES, NOT 4096, AND A ROW IS ~300 OF THEM.
+ *
+ * Every test in this file above used TOOL_RESULT_MAX (4096) because that is what
+ * a host suite can conveniently read. The model never sees 4096: net/chat.c keeps
+ * one shared result buffer of CHAT_TOOL_RESULT_CAP = 1024 bytes. So the listing a
+ * model actually reads is four times smaller than the one every test checked, and
+ * that is how the following survived:
+ *
+ * DRV_ROW_MARGIN was 200 bytes and was checked BEFORE a row was emitted. The
+ * footer is ~240 bytes and a usable row is ~300. At len ~= 780 the check passed,
+ * the row was written, the result hard-truncated MID-TOKEN, and neither the
+ * "...more not shown" line nor the "targets: N known, M can be driven, K shown"
+ * summary was written at all. The model was handed a listing that stopped in the
+ * middle of a word, with no count and nothing saying anything was missing. On a
+ * machine with several unclaimed functions the sound card could be one of the ones
+ * that fell off, and nothing told the model to look further. The advice that DID
+ * print at larger caps — 'raise "limit"' — could not work either, because the
+ * binding constraint was bytes.
+ *
+ * These tests run at the REAL cap. */
+static void test_the_listing_a_model_reads_is_not_truncated_mid_row(void) {
+    fresh();
+
+    /* Everything: the 17-function synthetic bus plus the reasons. This is the
+     * largest answer this tool can be asked for. */
+    CHECK_EQ(call_cap("driver_targets", "{\"limit\":64,\"include_unusable\":true}",
+                      CHAT_TOOL_RESULT_CAP), TOOL_OK);
+
+    /* THE FOOTER IS PRESENT. It was not, before. */
+    CHECK_CONTAINS(rbuf, "targets: ");
+    CHECK_CONTAINS(rbuf, "PCI function(s) known");
+
+    /* NOT CUT MID-ROW. Every line that starts a row must be complete, which for
+     * this tool means the result ends with a newline and the last line is one of
+     * the footer lines rather than half of a device row. */
+    size_t n = strlen(rbuf);
+    CHECK(n > 0);
+    if (n) CHECK_EQ(rbuf[n - 1], '\n');
+    CHECK(strstr(rbuf, "[result truncated") == NULL);
+
+    /* It says how many were left out, and it says so with a NUMBER. */
+    CHECK_CONTAINS(rbuf, "more matched but this result is full");
+    /* ...and the advice is one that can actually work. */
+    CHECK_CONTAINS(rbuf, "\"offset\"");
+    CHECK(strstr(rbuf, "more not shown (raise \"limit\")") == NULL);
+
+    /* At least one whole usable row got through: a listing that reserves so much
+     * for its footer that it shows nothing would pass every check above and be
+     * useless. */
+    CHECK_CONTAINS(rbuf, "target=");
+    CHECK_CONTAINS(rbuf, "usable: yes");
+}
+
+/* And the rest is REACHABLE, which is the half that makes the honesty useful. */
+static void test_offset_pages_through_every_function(void) {
+    fresh();
+
+    /* Page through with the offset the tool itself suggests, and collect every
+     * target name. The whole bus must appear, and no name twice. */
+    char seen[64][40];
+    int  nseen = 0;
+    int  guard = 0;
+    int  offset = 0;
+
+    for (;;) {
+        char input[96];
+        snprintf(input, sizeof input,
+                 "{\"limit\":64,\"include_unusable\":true,\"offset\":%d}", offset);
+        CHECK_EQ(call_cap("driver_targets", input, CHAT_TOOL_RESULT_CAP), TOOL_OK);
+        CHECK_CONTAINS(rbuf, "targets: ");
+
+        int this_page = 0;
+        for (const char *p = rbuf; (p = strstr(p, "target=")) != NULL; ) {
+            p += 7;
+            char name[40];
+            size_t k = 0;
+            while (p[k] && p[k] != ' ' && k < sizeof name - 1) { name[k] = p[k]; k++; }
+            name[k] = '\0';
+            for (int j = 0; j < nseen; j++)
+                CHECK(strcmp(seen[j], name) != 0);      /* no row appears twice */
+            if (nseen < 64) snprintf(seen[nseen++], 40, "%s", name);
+            this_page++;
+        }
+        CHECK(this_page > 0);                            /* progress every call */
+        offset += this_page;
+
+        if (strstr(rbuf, "more matched but this result is full") == NULL &&
+            strstr(rbuf, "more not shown") == NULL) break;
+        if (++guard > 32) { CHECK(0); break; }           /* no infinite paging */
+    }
+
+    printf("    (paged the whole bus in %d call(s): %d function(s))\n",
+           guard + 1, nseen);
+
+    /* The number of rows collected must equal what the summary claimed exists. */
+    const char *sum = strstr(rbuf, "targets: ");
+    CHECK(sum != NULL);
+    if (sum) {
+        int known = atoi(sum + 9);
+        CHECK_EQ(nseen, known);
+        CHECK(known > 3);        /* i.e. more than one page: the point of the test */
+    }
+
+    /* An offset past the end is not an error; it is an empty page with a summary,
+     * which is what lets a caller stop without guessing. */
+    CHECK_EQ(call_cap("driver_targets",
+                      "{\"include_unusable\":true,\"offset\":4096}",
+                      CHAT_TOOL_RESULT_CAP), TOOL_OK);
+    CHECK_CONTAINS(rbuf, "targets: ");
+    CHECK(strstr(rbuf, "target=") == NULL);
+
+    /* And a bad offset is refused with a sentence, not clamped silently. */
+    CHECK(call_cap("driver_targets", "{\"offset\":-1}", CHAT_TOOL_RESULT_CAP)
+          != TOOL_OK);
+    CHECK_CONTAINS(rbuf, "\"offset\"");
+    CHECK(call_cap("driver_targets", "{\"offset\":99999}", CHAT_TOOL_RESULT_CAP)
+          != TOOL_OK);
+}
+
+/* A USABLE ROW STILL COMES FIRST. The reason the tool sorts usable before
+ * unusable is that the row a model can act on must not be the one that falls off
+ * the end; reserving the footer must not have quietly broken that. */
+static void test_a_usable_target_is_on_the_first_page(void) {
+    fresh();
+    CHECK_EQ(call_cap("driver_targets", "{\"include_unusable\":true}",
+                      CHAT_TOOL_RESULT_CAP), TOOL_OK);
+    const char *first_usable   = strstr(rbuf, "usable: yes");
+    const char *first_unusable = strstr(rbuf, "usable: no");
+    CHECK(first_usable != NULL);
+    if (first_usable && first_unusable) CHECK(first_usable < first_unusable);
+}
+
+/* Page through driver_targets until `name`'s row is in rbuf, and leave it there.
+ *
+ * A single driver_targets result cannot hold the whole bus: one row is up to
+ * DRV_ROW_MAX bytes and the tool reserves DRV_FOOTER_RESERVE so the summary
+ * always prints, so even at TOOL_RESULT_MAX a long listing pages. A test that
+ * wants a specific device's row has to ask for it the way a model would, and
+ * doing that here means these tests also prove the paging works from the caller's
+ * side. Returns 1 if the row was found. */
+static int page_to_target(const char *name, size_t cap) {
+    char needle[64];
+    snprintf(needle, sizeof needle, "target=%s", name);
+    for (int offset = 0, guard = 0; guard < 64; guard++) {
+        char input[96];
+        snprintf(input, sizeof input,
+                 "{\"limit\":64,\"include_unusable\":true,\"offset\":%d}", offset);
+        if (call_cap("driver_targets", input, cap) != TOOL_OK) return 0;
+        if (strstr(rbuf, needle)) return 1;
+        int rows = 0;
+        for (const char *q = rbuf; (q = strstr(q, "target=")) != NULL; q += 7) rows++;
+        if (rows == 0) return 0;
+        offset += rows;
+        if (strstr(rbuf, "more matched but this result is full") == NULL &&
+            strstr(rbuf, "more not shown") == NULL) return 0;
+    }
+    return 0;
+}
+
 static void test_console_is_not_a_target(void) {
     fresh();
 
-    /* driver_targets lists it, and says no. */
-    CHECK_EQ(call_cap("driver_targets",
-                      "{\"limit\":64,\"include_unusable\":true}", sizeof rbuf),
-             TOOL_OK);
+    /* driver_targets lists it, and says no. Paged for, because one result cannot
+     * carry seventeen functions — see page_to_target(). */
+    CHECK_EQ(page_to_target("pci01:02.0", sizeof rbuf), 1);
     CHECK_CONTAINS(rbuf, "target=pci01:02.0");
     CHECK_CONTAINS(rbuf, "display controller");
     CHECK_CONTAINS(rbuf, "operator's console");
@@ -2428,9 +2639,13 @@ int main(void) {
 
     RUN(test_run_bounded);
     RUN(test_run_target_validation);
+    RUN(test_run_with_no_device);
     RUN(test_garbage_input);
     RUN(test_attempt_budget);
     RUN(test_budget_is_not_self_service);
+    RUN(test_the_listing_a_model_reads_is_not_truncated_mid_row);
+    RUN(test_offset_pages_through_every_function);
+    RUN(test_a_usable_target_is_on_the_first_page);
     RUN(test_console_is_not_a_target);
     RUN(test_trace_tool);
     RUN(test_no_backend);

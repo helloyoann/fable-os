@@ -34,10 +34,92 @@
  *   Two flags, set by CMP and TEST, read by the six conditional branches.
  *   Comparisons are UNSIGNED: these are hardware values, not arithmetic.
  *
- *   No general writable data memory. Device registers, the stack, and ONE
- *   caller-granted DMA scratch buffer (below) are the only mutable state a
- *   driver program has. Leaving out a heap removes an entire class of
- *   containment problem.
+ *   SCRATCH MEMORY (below): DVM_MEM_SIZE bytes of byte-addressed working store
+ *   in an address space of its own, plus the string operations that make it
+ *   useful. A DMA buffer alone was enough to drive hardware and nothing else;
+ *   the scratch arena is what lets a program hold, compare and build TEXT, and
+ *   therefore what lets the model author something that is not a device driver.
+ *
+ * THE SCRATCH ARENA — the program's own memory, and why it is a second one
+ *   The DMA buffer is memory the HARDWARE reads: its address is a physical
+ *   address, it is granted per run, and whatever a program leaves in it is
+ *   still being fetched by a DMA engine after the run ends. That makes it a
+ *   terrible place to think in, and sharing it between "samples the codec is
+ *   playing" and "the HTTP header I am parsing" would put the two one bug
+ *   apart.
+ *
+ *   So there is a second region with the opposite properties:
+ *
+ *     - It is addressed by OFFSET, 0 .. DVM_MEM_SIZE-1, not by address. There
+ *       is no arithmetic in the ISA that turns an offset into a machine
+ *       address, so a scratch access cannot reach kernel memory even in
+ *       principle: the worst a wrong offset can do is trap.
+ *     - It is ZEROED at the start of every dvm_run(), so one program can never
+ *       read what another left. Nothing can seed it either; the only ways bytes
+ *       get in are the program's own instructions and a syscall's output.
+ *       (A caller may READ it afterwards with dvm_mem_peek() — that is how a
+ *       program returns more than sixteen registers' worth of answer.)
+ *       This is why dvm_run() REFUSES to be re-entered with
+ *       DVM_TRAP_REENTRY: there is one arena, it is zeroed at entry, so a
+ *       nested run would erase the outer program's working store mid-execution
+ *       and every later mld would silently read zeros. See dvm_run().
+ *     - No device can see it. It is not the DMA arena, it is never handed to
+ *       hardware, and mld/mst never perform a bus cycle.
+ *     - Every access is bounds-checked against DVM_MEM_SIZE, and the total
+ *       number of BYTES the memory and string instructions touch is bounded by
+ *       max_mem_bytes — because one `mcpy` is one instruction and 64 KiB of
+ *       work, so the step budget alone would not bound it.
+ *
+ *   Unlike MMIO, scratch accesses need no alignment: mld32 at offset 1 is a
+ *   little-endian byte gather. Device registers need alignment because the bus
+ *   does; memory does not, and an alignment trap in the middle of parsing a
+ *   header would be a cost with nothing bought.
+ *
+ * STRINGS ARE SPANS, NEVER C STRINGS
+ *   A string in this machine is two register values: an offset and a LENGTH.
+ *   Nothing is NUL-terminated, nothing scans for a terminator, and no
+ *   instruction's bound comes from the data it is reading — the length is
+ *   always supplied and always checked against DVM_MEM_SIZE first. That is a
+ *   deliberate refusal to import C string semantics into a sandbox whose input
+ *   is model output.
+ *
+ *   Because a span is just two numbers, SLICING needs no instruction: the
+ *   second half of a span is (off+n, len-n), which is `add`. What does need
+ *   instructions is everything that touches the bytes, and those are the `m`
+ *   family: mstr (write a literal), mcpy (copy, overlap-safe), mset (fill),
+ *   mcmp (compare, sets the flags), mfind (find a literal), mchr (find a byte),
+ *   matoi (digits -> value) and mitoa (value -> digits). Every one of them that
+ *   writes returns the END offset of what it wrote, so building a message is a
+ *   chain: mstr, mcpy, mitoa, mstr, each starting where the last one stopped.
+ *
+ * SYSCALLS — the deliberate holes, enumerated
+ *   `sys` is the only instruction that reaches the kernel. Arguments are PUSHed
+ *   onto the data stack in order and popped by the call, so arity varies
+ *   without a wider instruction; the result lands in the destination register
+ *   and the ZERO FLAG says whether it succeeded. Every syscall is denied by
+ *   default: dvm_policy_allow_sys() opens exactly one, and there is no "allow
+ *   all". What each one validates before the kernel sees it is written next to
+ *   dvm_sys_nr_t. In one line each:
+ *
+ *     con.write   spans checked, bytes forced to printable ASCII, length
+ *                 capped, counted against max_prints. It goes out as a kernel
+ *                 trace line, so the '[' in column zero is still the kernel's.
+ *     fs.read     path built from a checked span: absolute, printable, bounded,
+ *     fs.write    no "." or ".." component, and inside the policy's fs_root.
+ *     fs.size     The destination/source spans are checked like any other.
+ *     audio.tone  frequency and duration range-checked here, not in audio.c.
+ *     time.ms     no arguments, no state, reads the millisecond clock.
+ *
+ *   THE HONEST PART, again. fs.write is a real hole: a program that may write
+ *   files can rewrite something a later turn will read and believe. fs_root is
+ *   what bounds it, and a caller that sets fs_root to "/" has given the program
+ *   the whole filesystem. There is no network syscall, not because it would be
+ *   safe to add, but because this kernel has no synchronous fetch to call.
+ *
+ *   The one thing NO syscall does is hand the program an address. Buffers cross
+ *   the boundary as (offset, length) into the scratch arena, resolved and
+ *   bounds-checked by the VM; dvm_sys_t sees kernel pointers it can trust and
+ *   never a number the program chose.
  *
  * THE DMA SCRATCH BUFFER — the one memory grant, and what it really costs
  *   A driver that only pokes registers can reset a codec. It can never play a
@@ -107,6 +189,20 @@
  *   MMIO +      ld8/ld16/ld32 rd, [base+disp]
  *   DMA buffer  st8/st16/st32 [base+disp], a
  *
+ *   scratch     mld8/mld16/mld32/mld64 rd, [off]    little-endian, unaligned ok
+ *   memory      mst8/mst16/mst32/mst64 [off], a
+ *
+ *   strings     mstr  rd, dst, "text"    rd = end offset
+ *               mcpy  rd, dst, src, len  overlap-safe; rd = end offset
+ *               mset  rd, dst, byte, len rd = end offset
+ *               mcmp  a, b, len          sets the flags, like cmp
+ *               mfind rd, hay, len, "t"  zero flag = found; rd = offset
+ *               mchr  rd, hay, len, byte zero flag = found; rd = offset
+ *               matoi rd, off, len, base zero flag = ok; rd = value
+ *               mitoa rd, dst, val, base rd = end offset
+ *
+ *   kernel      sys   rd, name           args pushed first; zero flag = ok
+ *
  *   PCI         pcicfg rd, bdf, off      one 32-bit config-space READ
  *
  *   time        delay a                  microseconds (see DELAY below)
@@ -163,14 +259,32 @@
  *   compares the request against this module's own static array and refuses
  *   anything else, so the only way to widen the grant is to edit vm/dvm.c.
  *
+ *   The scratch arena is not a hole in "all memory below the kernel top is
+ *   denied" either, for a stronger reason than the DMA arena: it is not in that
+ *   address space at all. mld/mst take an OFFSET, the offset is compared
+ *   against DVM_MEM_SIZE, and the resulting pointer is formed by the VM from
+ *   its own array. No policy governs it because no policy could widen it.
+ *
+ *   Syscalls are deny-all and opened one at a time by dvm_policy_allow_sys().
+ *   A program with no syscalls granted cannot reach the kernel at all, which is
+ *   what dvm_policy_init() leaves behind.
+ *
  *   Everything else is a budget, all of them enforced per run:
  *     max_steps      instructions executed  (this is the cycle limit; a program
  *                    that loops forever stops here with DVM_TRAP_STEPS)
  *     max_io         port + MMIO + PCI accesses (NOT DMA-buffer accesses)
  *     max_dma_ops    ld/st into the DMA scratch buffer
+ *     max_mem_bytes  BYTES touched by the scratch-memory and string ops. Not a
+ *                    count of instructions: `mcpy` is one instruction and up to
+ *                    64 KiB of work, and `mfind` is one instruction and up to
+ *                    len*needle byte comparisons, so the budget has to be
+ *                    denominated in bytes or it does not bound anything. It is
+ *                    charged as the work happens, so a long search stops in the
+ *                    middle rather than after.
+ *     max_sys        syscalls
  *     max_delay_us   cumulative microseconds spent in DELAY
  *     max_single_delay_us  the largest one DELAY may request
- *     max_prints     PRINT lines
+ *     max_prints     PRINT lines, and con.write calls
  *     max_trace      trace lines, after which tracing goes quiet (once, loudly)
  *
  *   And the structural bounds, checked by the assembler and re-checked by
@@ -201,9 +315,14 @@
  *   dvm_policy_allow_*()    open one port range / MMIO window / PCI function
  *   dvm_dma_region()        the one DMA scratch arena this module owns
  *   dvm_policy_allow_dma()  grant all or part of it to one run
+ *   dvm_policy_allow_sys()  open one syscall
+ *   dvm_policy_set_fs_root() the subtree fs.* syscalls are confined to
+ *   dvm_mem_peek()          read the scratch arena after a run
+ *   dvm_sys_name()          "fs.read", ... for a message or a trace line
  *   dvm_run()               execute; returns dvm_status_t, fills dvm_result_t
  *   dvm_status_name()       symbolic status for a message or a trace line
  *   dvm_io_hardware()       the real-hardware backend (NULL on a host build)
+ *   dvm_sys_kernel()        the real syscall backend (NULL on a host build)
  *
  * DEPENDENCIES
  *   trace.h for the execution trace, and the libc shim's snprintf. No heap: the
@@ -213,8 +332,9 @@
  *
  * SIZE NOTE
  *   The DMA arena adds DVM_DMA_SIZE bytes of .bss to any kernel that links this
- *   file. It is static and always present, because a buffer that is sometimes
- *   there is a buffer no program can rely on.
+ *   file, and the scratch arena a further DVM_MEM_SIZE. Both are static and
+ *   always present, because a buffer that is sometimes there is a buffer no
+ *   program can rely on.
  *
  *   dvm_program_t is ~12 KB (256 instructions plus the label and string tables).
  *   The kernel stack is 64 KiB and shared with lwIP and mbedTLS — make one
@@ -244,7 +364,19 @@
  *     the honest description of the DMA path is "trusted driver", not "sandbox".
  *   - A second concurrent grant (two devices DMAing out of disjoint halves of
  *     the arena) needs the policy to carry a list rather than one range. The
- *     single-range shape is deliberate while exactly one program runs at a time.
+ *     single-range shape is deliberate while exactly one program runs at a time,
+ *     which dvm_run() now ENFORCES (DVM_TRAP_REENTRY) rather than assuming — it
+ *     was assumed for a while, and a syscall serviced by a second program was
+ *     quietly falsifying it.
+ *   - A NETWORK syscall is the obvious next hole and is deliberately absent:
+ *     net.h publishes net_ask() (the model transport) and nothing that fetches
+ *     a URL synchronously, and inventing one belongs in net/, not here. When it
+ *     exists it is one hook in dvm_sys_t, one dvm_sys_nr_t, one arity entry and
+ *     one line of ISA text — the shape is already cut for it. The strings the
+ *     `m` family builds are the half of that job this file could do alone.
+ *   - Scratch memory is one flat arena because one program runs at a time. If
+ *     that ever stops being true it wants a per-run window (base+size) rather
+ *     than a second array, so that "offset" keeps meaning the same thing.
  */
 #ifndef DVM_H
 #define DVM_H
@@ -298,6 +430,33 @@
  * this, or a completely wrong address, is not caught by anything. */
 #define DVM_DMA_GUARD        0x10000ull   /* 64 KiB */
 
+/* ---- the scratch memory arena ----
+ *
+ * SIZE. 64 KiB. It has to hold the largest thing a program is asked to reason
+ * about in one piece, and on this machine that is an HTTP response: a request
+ * plus a response plus the working copies of the fields picked out of it, with
+ * room left that a model does not have to think about. 64 KiB is also the point
+ * where every offset fits in 16 bits, so a program can hold four of them in a
+ * register with shifts if it ever wants to, and it costs a sixteenth of what
+ * the DMA arena already costs in .bss.
+ *
+ * There is no alignment requirement, because nothing but the VM ever reads it:
+ * see the header comment. Offsets run 0..DVM_MEM_SIZE-1, and a span may end
+ * exactly at DVM_MEM_SIZE (an empty span there is legal, which is what makes
+ * "the end offset" a usable return value from every op that writes). */
+#define DVM_MEM_SIZE         0x10000u     /* 64 KiB of byte-addressed scratch */
+
+/* Longest path a fs.* syscall may name, including the NUL. Deliberately below
+ * VFS_PATH_MAX: this file does not include vfs.h (it compiles on a host with no
+ * kernel at all), and a path the VFS would refuse is better refused here, where
+ * the program gets told which of its bytes was the problem. */
+#define DVM_PATH_MAX         96
+
+/* Longest single con.write. A console line is the operator's attention, and an
+ * unbounded one would let a program paint the whole screen from a loop. Longer
+ * spans are a trap that names this number, not a silent truncation. */
+#define DVM_SAY_MAX          160
+
 /* ---- the entry argument vector ----
  *
  * dvm_run() preloads r0..r(nargs-1) from `args`, so the meaning of a register on
@@ -340,6 +499,11 @@ typedef enum {
     DVM_TRAP_NOIO,            /* backend has no hook for this access class   */
     DVM_TRAP_POLICY,          /* the caller's policy is itself invalid       */
     DVM_TRAP_DMA_BUDGET,      /* too many ld/st into the DMA scratch buffer  */
+    DVM_TRAP_MEM,             /* scratch offset/length outside the arena     */
+    DVM_TRAP_MEM_BUDGET,      /* max_mem_bytes of memory/string work spent   */
+    DVM_TRAP_SYS_DENIED,      /* syscall not granted, or its argument refused */
+    DVM_TRAP_SYS_BUDGET,      /* too many syscalls                           */
+    DVM_TRAP_REENTRY,         /* dvm_run() called while a program is running  */
     DVM_STATUS__COUNT
 } dvm_status_t;
 
@@ -365,8 +529,44 @@ typedef enum {
     DVM_PCICFG,
     DVM_DELAY,
     DVM_PRINT,
+    /* Appended, never inserted: core/audio.c keeps an assembled image across
+     * calls, so an opcode number is a value that outlives one run. */
+    DVM_MLD8, DVM_MLD16, DVM_MLD32, DVM_MLD64,
+    DVM_MST8, DVM_MST16, DVM_MST32, DVM_MST64,
+    DVM_MSTR, DVM_MCPY, DVM_MSET, DVM_MCMP,
+    DVM_MFIND, DVM_MCHR, DVM_MATOI, DVM_MITOA,
+    DVM_SYS,
     DVM_OP__COUNT
 } dvm_op_t;
+
+/* ====================================================================== */
+/* syscalls — the enumerated holes                                        */
+/* ====================================================================== */
+
+/* Arguments are PUSHed left to right and popped by the call; the arity is fixed
+ * per number and is what `sys` pops. `off`/`len` name a span of the scratch
+ * arena, checked before the backend is entered.
+ *
+ * The return value lands in the destination register and the ZERO FLAG says
+ * whether the call succeeded, so the idiom is `sys r1, fs.read` followed by
+ * `bne failed`. On failure the register holds the positive error code instead
+ * of the result, and the reason is in dvm_result_t.sys_msg and on the trace. */
+typedef enum {
+    DVM_SYS_CON_WRITE = 0,  /* (off,len)             -> bytes. Printable-only,
+                             * at most DVM_SAY_MAX, charged to max_prints.    */
+    DVM_SYS_FS_READ,        /* (poff,plen,dst,cap)   -> bytes read            */
+    DVM_SYS_FS_WRITE,       /* (poff,plen,src,len)   -> bytes written         */
+    DVM_SYS_FS_SIZE,        /* (poff,plen)           -> file size in bytes    */
+    DVM_SYS_AUDIO_TONE,     /* (hz,ms)               -> 0. Ranges checked.    */
+    DVM_SYS_TIME_MS,        /* ()                    -> milliseconds since boot */
+    DVM_SYS__COUNT
+} dvm_sys_nr_t;
+
+/* "fs.read", ... Never NULL; "?" for a number that is not a syscall. */
+const char *dvm_sys_name(dvm_sys_nr_t nr);
+
+/* How many values `sys` pops for this number, or -1 if it is not a syscall. */
+int dvm_sys_arity(dvm_sys_nr_t nr);
 
 /* "add", "out32", ... Never NULL. */
 const char *dvm_op_name(dvm_op_t op);
@@ -482,9 +682,21 @@ typedef struct {
     uint64_t         dma_base;
     uint64_t         dma_size;
 
+    /* One bit per dvm_sys_nr_t. 0 — what dvm_policy_init() leaves — means the
+     * program cannot reach the kernel at all. Only dvm_policy_allow_sys()
+     * should set these; it is the function that knows which numbers exist. */
+    uint32_t         sys_allow;
+
+    /* The subtree fs.* is confined to, e.g. "/vm". Empty means "no path is
+     * acceptable", so granting an fs syscall without setting this is refused by
+     * dvm_policy_check() rather than quietly opening the whole tree. */
+    char             fs_root[DVM_PATH_MAX];
+
     uint64_t         max_steps;
     uint64_t         max_io;
     uint64_t         max_dma_ops;
+    uint64_t         max_mem_bytes;
+    uint32_t         max_sys;
     uint64_t         max_delay_us;
     uint32_t         max_single_delay_us;
     uint32_t         max_prints;
@@ -492,10 +704,12 @@ typedef struct {
     dvm_trace_t      trace;
 } dvm_policy_t;
 
-/* Deny everything — including the DMA buffer — with the default budgets:
- *   max_steps 100000, max_io 4096, max_dma_ops 131072, max_delay_us 200000
- *   (200 ms), max_single_delay_us 50000, max_prints 64, max_trace 512,
- *   trace = IO. */
+/* Deny everything — the DMA buffer and every syscall included — with the
+ * default budgets: max_steps 100000, max_io 4096, max_dma_ops 131072,
+ * max_mem_bytes 4194304, max_sys 64, max_delay_us 200000 (200 ms),
+ * max_single_delay_us 50000, max_prints 64, max_trace 512, trace = IO.
+ * The scratch arena itself is always reachable and always DVM_MEM_SIZE bytes:
+ * it needs no grant because no grant could make it bigger. */
 void dvm_policy_init(dvm_policy_t *p);
 
 /* Open one window. Return 0, or -1 if the table is full or the request is
@@ -530,6 +744,26 @@ void dvm_dma_region(uint64_t *base, uint64_t *size);
  * POSSIBLE, and the VM cannot police that half — see the header comment. */
 int dvm_policy_allow_dma  (dvm_policy_t *p, uint64_t base, uint64_t size);
 
+/* Open ONE syscall. Returns 0, or -1 if `nr` is not a syscall this VM has. One
+ * call per number on purpose: there is no allow-all, so widening a program's
+ * reach into the kernel is always a line of C somebody wrote deliberately. */
+int dvm_policy_allow_sys(dvm_policy_t *p, dvm_sys_nr_t nr);
+
+/* Confine fs.* to `root` and its descendants. `root` must be absolute, at most
+ * DVM_PATH_MAX-1 bytes, printable, and free of "." and ".." components.
+ * Returns 0, or -1 leaving the policy unchanged. "/" is accepted and means the
+ * whole filesystem, which is a decision a caller has to type. */
+int dvm_policy_set_fs_root(dvm_policy_t *p, const char *root);
+
+/* Read `n` bytes of the scratch arena from `off` into `dst`. Returns the number
+ * of bytes copied, which is 0 if the span is outside [0, DVM_MEM_SIZE).
+ *
+ * This is how a caller collects a program's OUTPUT: the arena still holds what
+ * the last run left until the next dvm_run() zeroes it. It is deliberately a
+ * copy rather than a pointer — the arena is this module's, and a caller holding
+ * a pointer into it across a run would be reading the next program's bytes. */
+size_t dvm_mem_peek(uint64_t off, void *dst, size_t n);
+
 /* Did a DEVICE write outside the arena? The arena is embedded in a larger block
  * with 64 KiB of poison either side, re-armed by every dvm_run() that carries a
  * DMA grant. Returns 0 if both guard bands are intact, or 1 with a sentence in
@@ -540,7 +774,15 @@ int dvm_policy_allow_dma  (dvm_policy_t *p, uint64_t base, uint64_t size);
  * notices a bad DMA address at all, and it only notices near misses: an overrun
  * of up to 64 KiB, or an underrun of the same. A device pointed somewhere else
  * entirely corrupts that somewhere else silently. Do not read a clean result as
- * "the DMA was correct"; read it as "it was not wrong in the usual way". */
+ * "the DMA was correct"; read it as "it was not wrong in the usual way".
+ *
+ * There is ONE pair of guard bands, and arming is what makes damage attributable
+ * to a particular run. That is the second reason dvm_run() refuses re-entry
+ * (DVM_TRAP_REENTRY): a nested run's arming would re-poison both bands while the
+ * outer program's device had already overrun, erasing the evidence before the
+ * outer caller ever looked — and callers turn an overrun into a spent attempt
+ * rather than progress, so erasing it handed unlimited retries to the one
+ * program that must not have them. */
 int dvm_dma_check(char *msg, size_t cap);
 
 /* Validate a policy against the compiled-in deny list and the structural rules.
@@ -557,6 +799,34 @@ dvm_status_t dvm_policy_check(const dvm_policy_t *p, char *msg, size_t cap);
  * access class": the corresponding opcode traps with DVM_TRAP_NOIO instead of
  * being skipped, so a program can never believe an access happened when it did
  * not. Every hook is called ONLY after the access passed policy. */
+/* The kernel-call backend. Separate from dvm_io_t because it is a different
+ * kind of thing — a service, not a bus cycle — and because a caller that wants
+ * hardware without syscalls (an installed audio sink, say) just leaves it NULL.
+ *
+ * EVERY POINTER A HOOK RECEIVES IS THE VM'S. Paths arrive NUL-terminated,
+ * validated and copied into a kernel buffer; buffers arrive as a pointer into
+ * the scratch arena with a length the VM has already bounded. A hook never sees
+ * a number the program chose being used as an address.
+ *
+ * Return >= 0 for success (the value the program gets back) or < 0 for failure,
+ * in which case `err` should be a short sentence the model can act on. `err` is
+ * always non-NULL and `errcap` at least 64. A NULL hook means "this machine has
+ * no such service": the syscall traps with DVM_TRAP_NOIO rather than pretending
+ * it happened. */
+typedef struct dvm_sys {
+    void    *ctx;
+    int64_t (*con_write )(void *ctx, const char *text, size_t len,
+                          char *err, size_t errcap);
+    int64_t (*fs_read   )(void *ctx, const char *path, void *dst, size_t cap,
+                          char *err, size_t errcap);
+    int64_t (*fs_write  )(void *ctx, const char *path, const void *src, size_t len,
+                          char *err, size_t errcap);
+    int64_t (*fs_size   )(void *ctx, const char *path, char *err, size_t errcap);
+    int64_t (*audio_tone)(void *ctx, uint32_t hz, uint32_t ms,
+                          char *err, size_t errcap);
+    int64_t (*time_ms   )(void *ctx, char *err, size_t errcap);
+} dvm_sys_t;
+
 typedef struct dvm_io {
     void     *ctx;
     void     (*port_write)(void *ctx, uint16_t port, uint8_t width, uint32_t val);
@@ -566,11 +836,19 @@ typedef struct dvm_io {
     uint32_t (*pci_read32)(void *ctx, uint8_t bus, uint8_t dev, uint8_t fn,
                            uint8_t off);
     void     (*delay_us  )(void *ctx, uint32_t us);
+    /* The kernel side of the same backend, or NULL for "no syscalls". It lives
+     * here rather than as a parameter of dvm_run() so that adding it did not
+     * change a signature every caller in the tree implements. */
+    const dvm_sys_t *sys;
 } dvm_io_t;
 
 /* The real machine: port I/O instructions, volatile MMIO, pci_cfg_read32(),
  * mdelay()+TSC. NULL on a host build, where none of that exists. */
 const dvm_io_t *dvm_io_hardware(void);
+
+/* The real kernel: vfs_*, the audio service, the console, millis(). NULL on a
+ * host build, where tests supply a synthetic one. */
+const dvm_sys_t *dvm_sys_kernel(void);
 
 /* ====================================================================== */
 /* execution                                                              */
@@ -590,10 +868,21 @@ typedef struct {
     /* ld/st into the DMA scratch buffer. Their SUM is what max_dma_ops bounds;
      * there is no third counter, so the budget and the report cannot disagree. */
     uint32_t     n_dma_rd, n_dma_wr;
+    /* Scratch memory: instruction counts, and the BYTES they touched, which is
+     * what max_mem_bytes bounds. mem_hwm is the highest offset any store
+     * reached, so a caller knows how much of the arena is worth reading back. */
+    uint32_t     n_mem_rd, n_mem_wr;
+    uint64_t     mem_bytes;
+    uint32_t     mem_hwm;
+    uint32_t     n_sys;
     uint32_t     trace_lines;
     uint32_t     trace_dropped;
     uint64_t     reg[DVM_NREGS];   /* final register file — the program's output */
     char         msg[DVM_MSG_MAX]; /* "" on a clean halt, else the exact reason  */
+    /* The last syscall failure's reason, "" if none failed. A failed syscall is
+     * not a trap — the program is expected to branch on the zero flag — so this
+     * is the only place the backend's own words survive the run. */
+    char         sys_msg[DVM_MSG_MAX];
 } dvm_result_t;
 
 /* Run `p` under `pol` against `io`. r0..r(nargs-1) are preloaded from `args`

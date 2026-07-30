@@ -661,6 +661,33 @@ static int run_vm(uint32_t bytes, uint32_t frames, uint32_t ms) {
     uint64_t need = (uint64_t)ms * 1000ull + (uint64_t)AUDIO_PLAY_MARGIN_US;
     if (pol.max_delay_us < need) pol.max_delay_us = need;
 
+    /* AND THE ACCESS BUDGET, for the same reason and on the same copy.
+     *
+     * The policy a sink is registered with came from driver_run, where it was
+     * sized for BRING-UP: driver_run's DRV_MAX_IO is 1024 device accesses, which
+     * is generous for "reset the chip and read some registers back" and is not
+     * enough for the thing this contract actually asks for. The contract tells a
+     * play program to "poll until the device has finished reading that memory",
+     * and polling a device for the length of a sound costs one access per poll: an
+     * 800 ms sound at one read per millisecond is 800 accesses before anything
+     * else the program does, and a 1000 ms sound is over the whole budget. So the
+     * documented instruction and the enforced budget disagreed, and the program
+     * trapped with IO_LIMIT through no fault of its author.
+     *
+     * That is not hypothetical. It is what a live model hit: it found the card,
+     * brought it up, installed a correct-looking play program, and its first tone
+     * died on IO_LIMIT inside the poll loop.
+     *
+     * One access per millisecond of sound, doubled for a program that also reads a
+     * status register per poll, on top of whatever the registrar already had. It is
+     * proportional to the work asked for rather than a bigger constant, and it
+     * stays far below the VM's own ceiling. It does not widen what the program may
+     * TOUCH — the port and MMIO windows are unchanged — only how many times it may
+     * touch the same allowed registers, and how long that can take is separately
+     * bounded by max_delay_us above. */
+    uint64_t polls = (uint64_t)ms * 2ull + 256ull;
+    if (pol.max_io < polls) pol.max_io = polls;
+
     /* A GUARD, not a live path, and worth saying which. The policy was already
      * accepted by dvm_policy_check() at registration, and the only field raised
      * here is bounded by AUDIO_MAX_MS + AUDIO_PLAY_MARGIN_US = 1.25 s, which is

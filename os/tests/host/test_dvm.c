@@ -182,7 +182,7 @@ static const dvm_io_t DEV = {
 };
 
 /* A backend with no hooks at all: every access class must trap NO_BACKEND. */
-static const dvm_io_t NULLDEV = { 0, 0, 0, 0, 0, 0, 0 };
+static const dvm_io_t NULLDEV = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
 /* ====================================================================== */
 /* harness helpers                                                        */
@@ -378,6 +378,20 @@ static void test_all_mnemonics(void) {
         { "pcird r0,0,0", DVM_PCICFG },
         { "delay 1", DVM_DELAY }, { "udelay 1", DVM_DELAY }, { "usleep 1", DVM_DELAY },
         { "print \"x\"", DVM_PRINT }, { "log \"x\"", DVM_PRINT },
+        { "mld8 r0,[r1]", DVM_MLD8 }, { "mld16 r0,[r1]", DVM_MLD16 },
+        { "mld32 r0,[r1]", DVM_MLD32 }, { "mld64 r0,[r1]", DVM_MLD64 },
+        { "mst8 [r1],r0", DVM_MST8 }, { "mst16 [r1],r0", DVM_MST16 },
+        { "mst32 [r1],r0", DVM_MST32 }, { "mst64 [r1],r0", DVM_MST64 },
+        { "mstr r0,0,\"x\"", DVM_MSTR },
+        { "mcpy r0,0,1,2", DVM_MCPY }, { "mmove r0,0,1,2", DVM_MCPY },
+        { "mset r0,0,32,2", DVM_MSET }, { "mfill r0,0,32,2", DVM_MSET },
+        { "mcmp 0,1,2", DVM_MCMP },
+        { "mfind r0,0,8,\"x\"", DVM_MFIND },
+        { "mchr r0,0,8,32", DVM_MCHR },
+        { "matoi r0,0,3,10", DVM_MATOI }, { "atoi r0,0,3,10", DVM_MATOI },
+        { "mitoa r0,0,7,10", DVM_MITOA }, { "itoa r0,0,7,10", DVM_MITOA },
+        { "sys r0,time.ms", DVM_SYS }, { "syscall r0,con.write", DVM_SYS },
+        { "sys r0,0", DVM_SYS },
     };
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) {
         if (dvm_assemble(t[i].src, strlen(t[i].src), &P, &E) != 0) {
@@ -1731,6 +1745,373 @@ static void test_dma_grant_is_traced(void) {
     CHECK_CONTAINS(kcap_text(), "[dvm.grant dma none -> ok]");
 }
 
+/* ====================================================================== */
+/* scratch memory, strings and syscalls — the shape, in this suite        */
+/* ====================================================================== */
+
+/* The deep coverage of this family (every bound, every off-by-one, overlapping
+ * copies, conversion edges, fuzz) is tests/host/test_dvm_mem.c. What belongs
+ * HERE is that the instructions exist, execute, and are counted — this suite
+ * owns the "every opcode in the ISA ran" invariant at the bottom of main(). */
+
+static char     sysdev_said[256];
+static int64_t  sysdev_time;
+
+static int64_t sd_con_write(void *ctx, const char *text, size_t len,
+                            char *err, size_t errcap) {
+    (void)ctx; (void)err; (void)errcap;
+    size_t n = len < sizeof sysdev_said - 1 ? len : sizeof sysdev_said - 1;
+    memcpy(sysdev_said, text, n);
+    sysdev_said[n] = '\0';
+    return (int64_t)len;
+}
+static int64_t sd_time_ms(void *ctx, char *err, size_t errcap) {
+    (void)ctx; (void)err; (void)errcap;
+    return sysdev_time;
+}
+
+static const dvm_sys_t SYSDEV = {
+    .ctx = NULL, .con_write = sd_con_write, .time_ms = sd_time_ms,
+};
+
+/* The synthetic device again, this time with a kernel behind it. */
+static const dvm_io_t DEVSYS = {
+    .ctx = NULL,
+    .port_write = io_port_write, .port_read = io_port_read,
+    .mmio_write = io_mmio_write, .mmio_read = io_mmio_read,
+    .pci_read32 = io_pci_read32, .delay_us  = io_delay,
+    .sys = &SYSDEV,
+};
+
+/* ---------------------------------------------------------------------
+ * ONE PROGRAM AT A TIME
+ *
+ * The DMA guard bands and the scratch arena are single, machine-wide, and both
+ * are (re)initialised at dvm_run() entry. So a nested dvm_run() does not share
+ * them with the outer program, it DESTROYS the outer program's copy while the
+ * outer program is still executing. That was reachable through a syscall: a
+ * driver_run program is granted audio.tone, and once the model has installed its
+ * own audio driver the sink IS a driver program, so servicing the syscall meant
+ * starting a second run.
+ *
+ * The damage was silent in both directions. Scratch went to zeros with no trap,
+ * so every later mld read 0 and the tool reported the program's answer as NUL
+ * bytes. And the guard bands were re-poisoned, erasing an overrun the outer
+ * program's device had ALREADY committed — which mattered far more than the
+ * diagnostic, because callers turn an overrun into a spent attempt rather than
+ * progress, so erasing it gave unlimited retries to a program corrupting memory.
+ *
+ * These tests drive the mechanism directly: a syscall hook that itself calls
+ * dvm_run. That is exactly what k_audio_tone does, without needing core/audio.c
+ * here (tests/host/test_audio.c covers the real audio path).
+ * ------------------------------------------------------------------ */
+
+static int      reent_attempts;      /* how many times the hook tried to nest */
+static dvm_status_t reent_status;    /* what the nested dvm_run returned      */
+static char     reent_msg[DVM_MSG_MAX];
+static int      reent_inner_ran;     /* did the inner program execute at all? */
+
+static int64_t reent_tone(void *ctx, uint32_t hz, uint32_t ms,
+                          char *err, size_t cap) {
+    (void)ctx; (void)hz; (void)ms;
+    reent_attempts++;
+
+    /* A second, unrelated program, with its own policy and result. The inner
+     * program stores a byte in scratch, which is how the test can tell whether
+     * it executed. */
+    static dvm_program_t inner;
+    static dvm_policy_t  ipol;
+    static dvm_result_t  ires;
+    dvm_asm_err_t ierr;
+    const char *isrc = "mst8 [0], 0x5a\nhalt\n";
+    if (dvm_assemble(isrc, strlen(isrc), &inner, &ierr) != 0) {
+        snprintf(err, cap, "inner assembly failed");
+        return -1;
+    }
+    dvm_policy_init(&ipol);
+    ipol.trace = DVM_TRACE_OFF;
+    /* Carry a DMA grant, because that is what makes the nested run re-arm the
+     * guard bands — the half of this defect that erased evidence. */
+    uint64_t dbase = 0, dsize = 0;
+    dvm_dma_region(&dbase, &dsize);
+    dvm_policy_allow_dma(&ipol, dbase, dsize);
+
+    reent_status = dvm_run(&inner, &ipol, &NULLDEV, NULL, 0, &ires);
+    snprintf(reent_msg, sizeof reent_msg, "%s", ires.msg);
+    reent_inner_ran = (reent_status == DVM_OK);
+    if (reent_status != DVM_OK) {
+        snprintf(err, cap, "%s", ires.msg);
+        return -1;
+    }
+    return 0;
+}
+
+static const dvm_sys_t REENT_SYS = {
+    .ctx = NULL, .con_write = sd_con_write, .audio_tone = reent_tone,
+    .time_ms = sd_time_ms,
+};
+static const dvm_io_t REENT_IO = {
+    .ctx = NULL,
+    .port_write = io_port_write, .port_read = io_port_read,
+    .mmio_write = io_mmio_write, .mmio_read = io_mmio_read,
+    .pci_read32 = io_pci_read32, .delay_us  = io_delay,
+    .sys = &REENT_SYS,
+};
+
+static void reent_reset(void) {
+    reent_attempts = 0;
+    reent_status = DVM_OK;
+    reent_msg[0] = '\0';
+    reent_inner_ran = 0;
+}
+
+static void test_a_nested_run_is_refused(void) {
+    reent_reset();
+    std_policy();
+    dvm_policy_allow_sys(&POL, DVM_SYS_AUDIO_TONE);
+    POL.max_sys = 8;
+    POL.max_mem_bytes = 4096;
+
+    CHECK_EQ(assemble("push 440\npush 20\nsys r1, audio.tone\nhalt\n"), 0);
+    dev_reset();
+    CHECK_STATUS(dvm_run(&P, &POL, &REENT_IO, NULL, 0, &R), DVM_OK);
+
+    /* The hook really was called — otherwise this test proves nothing. */
+    CHECK_EQ(reent_attempts, 1);
+    /* ...and the nested run was refused, before doing anything. */
+    CHECK_EQ((int)reent_status, (int)DVM_TRAP_REENTRY);
+    CHECK_EQ(reent_inner_ran, 0);
+    CHECK_EQ((int)strcmp(dvm_status_name(DVM_TRAP_REENTRY), "REENTRY"), 0);
+
+    /* The refusal has to be a sentence the model can act on: it must name the
+     * cause and say what to do instead, not just fail. */
+    CHECK_CONTAINS(reent_msg, "one driver program at a time");
+    CHECK_CONTAINS(reent_msg, "after the run finishes");
+
+    /* The whole sentence has to SURVIVE the trip back to the program. sys_fail()
+     * prefixes the syscall name and truncates to DVM_MSG_MAX, and the clause
+     * that says what to do instead is at the end — so it is the first thing lost
+     * if the message is too long. Assert the model really receives it. */
+    CHECK_CONTAINS(R.sys_msg, "audio.tone");
+    CHECK_CONTAINS(R.sys_msg, "after the run finishes");
+
+    /* The documented convention (driver_run's ISA text): zero flag set means it
+     * worked, otherwise rd holds an error code. So the program can branch on it
+     * rather than believing a tone played. */
+    CHECK(R.reg[1] != 0);
+}
+
+/* The property the refusal exists to protect, measured rather than argued: the
+ * outer program's scratch memory must still be there after the syscall. */
+static void test_scratch_survives_a_syscall(void) {
+    reent_reset();
+    std_policy();
+    dvm_policy_allow_sys(&POL, DVM_SYS_AUDIO_TONE);
+    POL.max_sys = 8;
+    POL.max_mem_bytes = 4096;
+
+    CHECK_EQ(assemble("mst32 [0], 0xdeadbeef\n"
+                      "mld32 r1, [0]\n"          /* before the syscall */
+                      "push 440\npush 20\n"
+                      "sys r3, audio.tone\n"
+                      "mld32 r2, [0]\n"          /* after it           */
+                      "halt\n"), 0);
+    dev_reset();
+    CHECK_STATUS(dvm_run(&P, &POL, &REENT_IO, NULL, 0, &R), DVM_OK);
+
+    CHECK_EQ(reent_attempts, 1);
+    CHECK_EQ(R.reg[1], 0xdeadbeefu);
+    CHECK_EQ(R.reg[2], 0xdeadbeefu);   /* was 0 before the guard existed */
+
+    /* And the caller's window is intact too: dvm_mem_peek must show the bytes
+     * the program stored, not a zeroed arena. put_scratch() in dvm_tools.c
+     * dumps mem_hwm bytes from here, so a zeroed arena made the tool report the
+     * program's answer as NULs. */
+    unsigned char peek[4] = { 1, 2, 3, 4 };
+    CHECK_EQ((int)dvm_mem_peek(0, peek, 4), 4);
+    CHECK_EQ(peek[0], 0xef);
+    CHECK_EQ(peek[1], 0xbe);
+    CHECK_EQ(peek[2], 0xad);
+    CHECK_EQ(peek[3], 0xde);
+}
+
+/* The other half: a syscall must not re-arm the DMA guard bands, because that
+ * erases an overrun this run's device has already committed. Damage the guard
+ * by hand first, then make the syscall, then check the damage is still
+ * reportable. */
+static void test_a_syscall_cannot_erase_dma_evidence(void) {
+    reent_reset();
+
+    /* Consume any pending report so the check below is about THIS test. */
+    char scratch[DVM_MSG_MAX];
+    (void)dvm_dma_check(scratch, sizeof scratch);
+
+    std_policy();
+    dvm_policy_allow_sys(&POL, DVM_SYS_AUDIO_TONE);
+    POL.max_sys = 8;
+    uint64_t dbase = 0, dsize = 0;
+    dvm_dma_region(&dbase, &dsize);
+    CHECK_EQ(dvm_policy_allow_dma(&POL, dbase, dsize), 0);
+
+    CHECK_EQ(assemble("push 440\npush 20\nsys r1, audio.tone\nhalt\n"), 0);
+    dev_reset();
+
+    /* dvm_run arms the bands at entry, so the damage has to be done from inside
+     * the run to model a device overrunning mid-flight. The syscall hook is the
+     * only code that runs inside, so scribble from there — after it has tried
+     * (and failed) to nest, which is the ordering that used to lose the
+     * evidence. Writing one byte just past the end of the arena is exactly what
+     * a descriptor length one too large produces. */
+    volatile unsigned char *overrun = (volatile unsigned char *)(uintptr_t)(dbase + dsize);
+    CHECK_STATUS(dvm_run(&P, &POL, &REENT_IO, NULL, 0, &R), DVM_OK);
+    CHECK_EQ(reent_attempts, 1);
+    CHECK_EQ((int)reent_status, (int)DVM_TRAP_REENTRY);
+
+    /* Now damage it and confirm the report still arrives. If a nested run had
+     * been allowed it would have re-poisoned this byte and the check would come
+     * back clean — which is the bug, stated as a test. */
+    *overrun = 0x77;
+    char msg[DVM_MSG_MAX];
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 1);
+    CHECK_CONTAINS(msg, "past the end");
+
+    /* Reported once, then re-armed. */
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 0);
+}
+
+/* A refused nested run must leave NOTHING locked. If the guard flag leaked, the
+ * next ordinary run on the machine would be refused too, and driver_run would
+ * be permanently broken after one audio.tone. */
+static void test_the_guard_does_not_leak(void) {
+    reent_reset();
+    std_policy();
+    dvm_policy_allow_sys(&POL, DVM_SYS_AUDIO_TONE);
+    POL.max_sys = 8;
+    CHECK_EQ(assemble("push 440\npush 20\nsys r1, audio.tone\nhalt\n"), 0);
+    dev_reset();
+    CHECK_STATUS(dvm_run(&P, &POL, &REENT_IO, NULL, 0, &R), DVM_OK);
+    CHECK_EQ(reent_attempts, 1);
+
+    /* An ordinary run, straight afterwards, must be completely unaffected. */
+    std_policy();
+    CHECK_STATUS(run("mov r1, 7\nhalt\n"), DVM_OK);
+    CHECK_EQ(R.reg[1], 7u);
+
+    /* And a validation failure must not lock it either: those return before the
+     * flag is ever set, but that is a property worth pinning, because moving the
+     * flag one line earlier would break it silently. */
+    dvm_policy_t bad;
+    dvm_policy_init(&bad);
+    bad.max_steps = 0;                     /* structurally invalid */
+    dvm_result_t r2;
+    CHECK(dvm_run(&P, &bad, &REENT_IO, NULL, 0, &r2) != DVM_OK);
+    std_policy();
+    CHECK_STATUS(run("mov r2, 9\nhalt\n"), DVM_OK);
+    CHECK_EQ(R.reg[2], 9u);
+}
+
+static void test_scratch_memory_and_strings(void) {
+    std_policy();
+
+    /* Build "GET /x" out of two literals and a byte, then find and slice it. */
+    CHECK_STATUS(run("mstr  r1, 0, \"GET \"\n"       /* r1 = 4              */
+                     "mstr  r2, r1, \"/x\"\n"        /* r2 = 6              */
+                     "mchr  r3, 0, r2, 0x2f\n"       /* '/' at offset 4     */
+                     "mcpy  r4, 16, 0, r2\n"         /* copy the lot to 16  */
+                     "mcmp  0, 16, r2\n"             /* and it is identical */
+                     "beq   same\n"
+                     "abort \"copy differs\"\n"
+                     "same:\n"
+                     "mset  r5, 32, 0x41, 4\n"       /* "AAAA" at 32        */
+                     "mld32 r6, [32]\n"              /* little-endian gather */
+                     "mst64 [40], r6\n"
+                     "mld64 r7, [40]\n"
+                     "mitoa r8, 48, 200, 10\n"       /* "200" at 48         */
+                     "matoi r9, 48, 3, 10\n"
+                     "halt\n"), DVM_OK);
+    CHECK_EQ(R.reg[1], 4);
+    CHECK_EQ(R.reg[2], 6);
+    CHECK_EQ(R.reg[3], 4);
+    CHECK_EQ(R.reg[4], 22);
+    CHECK_EQ(R.reg[5], 36);
+    CHECK_EQ(R.reg[6], 0x41414141u);
+    CHECK_EQ(R.reg[7], 0x41414141u);
+    CHECK_EQ(R.reg[8], 51);
+    CHECK_EQ(R.reg[9], 200);
+    CHECK(R.mem_bytes > 0);
+    CHECK(R.n_mem_rd > 0 && R.n_mem_wr > 0);
+
+    /* mfind, both outcomes, and the flag that distinguishes them. */
+    CHECK_STATUS(run("mstr  r1, 0, \"HTTP/1.1 404 Not Found\"\n"
+                     "mfind r2, 0, r1, \"404\"\n"
+                     "bne   nope\n"
+                     "mfind r3, 0, r1, \"zzz\"\n"
+                     "beq   nope\n"
+                     "halt\n"
+                     "nope:\n"
+                     "abort \"mfind disagreed with itself\"\n"), DVM_OK);
+    CHECK_EQ(R.reg[2], 9);
+    CHECK_EQ(R.reg[3], 22);           /* not found == the end of the span */
+
+    /* The arena is zeroed between runs, so the bytes above are gone. */
+    CHECK_STATUS(run("mld64 r1, [0]\nmld64 r2, [16]\nhalt\n"), DVM_OK);
+    CHECK_EQ(R.reg[1], 0);
+    CHECK_EQ(R.reg[2], 0);
+
+    /* And out of bounds is a trap, not a wrap. */
+    CHECK_STATUS(run("mld8 r1, [0x10000]\nhalt\n"), DVM_TRAP_MEM);
+    CHECK_CONTAINS(R.msg, "outside the 65536-byte arena");
+}
+
+static void test_syscalls_reach_the_kernel(void) {
+    std_policy();
+    POL.trace = DVM_TRACE_OFF;
+    CHECK_EQ(dvm_policy_allow_sys(&POL, DVM_SYS_CON_WRITE), 0);
+    CHECK_EQ(dvm_policy_allow_sys(&POL, DVM_SYS_TIME_MS), 0);
+
+    sysdev_said[0] = '\0';
+    sysdev_time = 1234;
+
+    dev_reset();
+    CHECK_EQ(assemble("mstr r1, 0, \"hello from a program\"\n"
+                      "push 0\n"
+                      "push r1\n"
+                      "sys  r2, con.write\n"
+                      "bne  bad\n"
+                      "sys  r3, time.ms\n"
+                      "bne  bad\n"
+                      "halt\n"
+                      "bad:\n"
+                      "abort \"a syscall failed\"\n"), 0);
+    mark_ops(&P);
+    CHECK_STATUS(dvm_run(&P, &POL, &DEVSYS, NULL, 0, &R), DVM_OK);
+    CHECK_STR(sysdev_said, "hello from a program");
+    CHECK_EQ(R.reg[2], 20);
+    CHECK_EQ(R.reg[3], 1234);
+    CHECK_EQ(R.n_sys, 2);
+
+    /* A syscall that was not granted is refused by name, and the message says
+     * what the program does have. */
+    dev_reset();
+    CHECK_EQ(assemble("push 0\npush 0\nsys r1, fs.size\nhalt\n"), 0);
+    CHECK_STATUS(dvm_run(&P, &POL, &DEVSYS, NULL, 0, &R), DVM_TRAP_SYS_DENIED);
+    CHECK_CONTAINS(R.msg, "fs.size");
+    CHECK_CONTAINS(R.msg, "con.write,time.ms");
+
+    /* A granted syscall with no backend hook is NO_BACKEND, never a pretend
+     * success. */
+    dev_reset();
+    CHECK_EQ(dvm_policy_allow_sys(&POL, DVM_SYS_AUDIO_TONE), 0);
+    CHECK_EQ(assemble("push 440\npush 10\nsys r1, audio.tone\nhalt\n"), 0);
+    CHECK_STATUS(dvm_run(&P, &POL, &DEVSYS, NULL, 0, &R), DVM_TRAP_NOIO);
+
+    /* ...and with no kernel at all, likewise. */
+    dev_reset();
+    CHECK_EQ(assemble("sys r1, time.ms\nhalt\n"), 0);
+    CHECK_STATUS(dvm_run(&P, &POL, &DEV, NULL, 0, &R), DVM_TRAP_NOIO);
+    CHECK_CONTAINS(R.msg, "no kernel backend");
+}
+
 /* A program that never went through the assembler must not be able to escape:
  * the validator re-checks everything the assembler guarantees. */
 static void test_validator_rejects_handbuilt(void) {
@@ -2241,9 +2622,16 @@ int main(void) {
     RUN(test_dma_region_shape);
     RUN(test_dma_grant_is_bounded_to_the_arena);
     RUN(test_dma_stores_land_in_the_arena);
+    RUN(test_a_nested_run_is_refused);
+    RUN(test_scratch_survives_a_syscall);
+    RUN(test_a_syscall_cannot_erase_dma_evidence);
+    RUN(test_the_guard_does_not_leak);
     RUN(test_dma_bounds_alignment_and_budget);
     RUN(test_dma_guard_band_catches_a_device_overrun);
     RUN(test_dma_grant_is_traced);
+
+    RUN(test_scratch_memory_and_strings);
+    RUN(test_syscalls_reach_the_kernel);
 
     RUN(test_validator_rejects_handbuilt);
 

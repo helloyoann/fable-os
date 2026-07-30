@@ -33,6 +33,14 @@ kernel.bin
 # Packet capture from `make run-pcap`
 net.pcap
 
+# The persistent disk (`make disk`, attached by `make run`). It is the machine's
+# own storage: whatever the model wrote last time is in there, it can be
+# hundreds of MiB, and it is not source. Never committed — but note the reason
+# is size and churn, NOT secrecy: nothing secret is ever put in the image (the
+# API key travels over fw_cfg into RAM and is never written to disk).
+disk.img
+*.img
+
 # Bootable media from `make iso` (a 4 MB ISO and its staging tree)
 talkos.iso
 os/build/

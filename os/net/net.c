@@ -39,6 +39,27 @@
  * Swap model_tls_transport() for model_mock_transport() and the exact same
  * net_ask() logic runs on the host with no network — which is how the tool-use
  * loop will be tested.
+ *
+ * ============================================================================
+ * ONE CONNECTION ENGINE, TWO USERS.
+ * ============================================================================
+ * There is a second user of everything below: tools/net_tools.c, the model's
+ * general "fetch a URL" verb, through the seam in include/fetch.h. It is NOT a
+ * second copy of any of this. http_exchange() below is the whole
+ * connect/handshake/pump/receive/teardown machine, parameterised by destination,
+ * SNI and whether TLS is used at all, and both the model transport and a general
+ * fetch call it:
+ *
+ *     tls_send()        Anthropic framing (x-api-key!)  -> http_exchange()
+ *     fetch_exchange()  arbitrary framing, no secrets   -> http_exchange()
+ *
+ * That matters for more than duplication. The generation-stamped callbacks, the
+ * single teardown, the ERR_MEM-aware tx_pump and the "a stale connection must
+ * never write this request's body" rule below were all learned the hard way, and
+ * a second implementation would have had to learn them again. It also matters
+ * for the secret: the engine takes an ALREADY-ASSEMBLED request buffer, so the
+ * x-api-key header exists in exactly one function in this tree, and a fetch has
+ * no code path that could grow one. See DECISION 2 in include/fetch.h.
  */
 
 #include "kernel.h"
@@ -46,19 +67,27 @@
 #include "e1000.h"
 #include "json.h"
 #include "model.h"
+#include "fiber.h"
+#include "fetch.h"
+#include "tls_ca.h"
+/* Only for CHAT_REQ_BYTES, and only so the _Static_assert on TLS_REQ_BYTES below
+ * can compare the two numbers instead of a comment claiming they agree. */
+#include "chat.h"
 
 #include "lwip/init.h"
 #include "lwip/netif.h"
 #include "lwip/etharp.h"
 #include "lwip/dns.h"
 #include "lwip/altcp.h"
+#include "lwip/altcp_tcp.h"
 #include "lwip/altcp_tls.h"
 #include "lwip/timeouts.h"
 #include "netif/ethernet.h"
 #include "mbedtls/ssl.h"
 
+#include <stdio.h>      /* snprintf, for the one-line TLS verdict */
+
 #ifdef TALKOS_VERIFY_CERTS
-#include "tls_ca.h"
 #include "rtc.h"
 #include "mbedtls/x509_crt.h"
 
@@ -187,9 +216,55 @@ static void net_poll_rx(void) {
     }
 }
 
+/* THE YIELD POINT THAT MATTERS.
+ *
+ * Every wait in this file is `while (!done && millis() < deadline)
+ * net_service();`, and a model turn spends seconds in one of them. Before
+ * fibers, those seconds were the whole machine: the pointer froze, windows
+ * stopped repainting and an app's tick handler stopped running. Adding
+ * fiber_yield() here is what makes an API call something the machine does
+ * rather than something it suffers.
+ *
+ * WHAT IT DOES NOT FIX, so nobody reads more into it than is there: the
+ * KEYBOARD is still unserviced during a turn. Only input_poll() drains it and
+ * that is called from kernel/main.c's wait_for_sentence(), i.e. from the fiber
+ * that is sitting in this loop. Characters typed mid-turn still queue in the
+ * 8042 and appear when the turn ends, exactly as before. Moving the drain into
+ * the ui fiber would give one device two owners racing for individual
+ * keystrokes, which is a worse bug than a late echo; the fix is a keyboard
+ * fiber that owns the port outright, and that is not this change.
+ *
+ * WHY *HERE* AND NOT INSIDE THE CALLERS' LOOPS. This is the one place where
+ * every network wait passes through a point at which lwIP is quiescent:
+ * net_poll_rx() has returned every pbuf it took to netif->input, and
+ * sys_check_timeouts() has finished running the timer list. Nothing is
+ * half-modified, no pbuf is held, no pcb is mid-callback. Yield one line
+ * earlier — between those two calls, or from inside a callback — and another
+ * fiber could observe lwIP in a state NO_SYS=1 says cannot exist.
+ *
+ * WHAT THE OTHER FIBER MAY NOT DO: touch the network, and — learned the hard way
+ * — touch HARDWARE OF ANY KIND that can block. Nothing in this kernel calls into
+ * lwIP except this file, and the ui fiber's whole body is app_tick_handlers() +
+ * gui_tick(), neither of which can reach a socket (include/app.h limits an app to
+ * the widget expression language plus one brokered capability call).
+ *
+ * It used to call app_tick(), which ends with app_service() — the one function in
+ * apps/ that reaches a driver — so a model-authored document with a periodic
+ * handler could make the machine play a sound from inside this loop. audio.h's
+ * play path is synchronous, so lwIP went unpolled for the length of it, in the
+ * middle of a TLS round trip; and apps/cap.c's stated safety argument ("nothing
+ * is started during a model turn") quietly stopped being true. Splitting the pump
+ * out of the handlers fixed it, in apps/runtime.c and kernel/main.c.
+ *
+ * If a future fiber ever wants the network, it needs its own transport state, not
+ * a second caller of these statics — see the cur_pcb comment below for what
+ * sharing them costs.
+ *
+ * COST WHEN NOTHING ELSE IS RUNNABLE: one compare and a return. */
 static void net_service(void) {
     net_poll_rx();
     sys_check_timeouts();
+    fiber_yield();
 }
 
 /* ====================================================================== */
@@ -205,6 +280,10 @@ static volatile int dns_done, dns_ok;
  * Gates net_retry_resolve(); see the comment on resolve_api_host(). */
 static int stack_up;
 
+/* Did the API host's name last resolve? Reported by net_status (fetch_ifstat)
+ * so "the model is unreachable" can be told apart from "there is no link". */
+static int api_resolved;
+
 /* A retry is paid for by an operator waiting at a prompt, so it is bounded far
  * more tightly than the boot attempt: long enough for a lost query and one
  * lwIP retransmit, short enough that a machine with no network answers quickly
@@ -213,15 +292,38 @@ static int stack_up;
 
 static int resolve_api_host(uint32_t timeout_ms);
 
+static ip_addr_t dns_result;
+
 static void dns_cb(const char *name, const ip_addr_t *ipaddr, void *arg) {
     (void)name; (void)arg;
-    if (ipaddr) { server_ip = *ipaddr; dns_ok = 1; }
+    if (ipaddr) { dns_result = *ipaddr; dns_ok = 1; }
     dns_done = 1;
 }
 
-#ifdef TALKOS_VERIFY_CERTS
+/* Resolve ANY name, bounded. Factored out of resolve_api_host() so the general
+ * fetch path (include/fetch.h) uses the same resolver, the same service loop and
+ * the same deadline discipline as the model transport rather than a second copy
+ * that would drift. `host` must be NUL-terminated; lwIP short-circuits a dotted
+ * quad without a query, which is why fetch.c can pass literals straight in.
+ * Returns 0 on success. */
+static int dns_lookup(const char *host, ip_addr_t *out, uint32_t timeout_ms) {
+    if (!host || !host[0] || !out) return -1;
+
+    dns_done = dns_ok = 0;
+    err_t e = dns_gethostbyname(host, &dns_result, dns_cb, NULL);
+    if (e == ERR_OK)                 { dns_ok = 1; dns_done = 1; }
+    else if (e != ERR_INPROGRESS)    { return -1; }
+
+    uint64_t deadline = millis() + timeout_ms;
+    while (!dns_done && millis() < deadline) net_service();
+    if (!dns_ok) return -1;
+
+    *out = dns_result;
+    return 0;
+}
+
 /* ---------------------------------------------------------------------- */
-/* certificate verification: setup and reporting                           */
+/* what the current connection is, and what it proved                      */
 /* ---------------------------------------------------------------------- */
 
 /* The ssl context of the connection currently being attempted, so a handshake
@@ -232,8 +334,67 @@ static void dns_cb(const char *name, const ip_addr_t *ipaddr, void *arg) {
  * attempt ends. lwIP calls the error callback *before* it frees the mbedTLS
  * state (altcp_mbedtls_lower_recv_process() and altcp_mbedtls_lower_err() both
  * invoke conn->err and only then close/free), so the context is still alive
- * inside err_cb — and nowhere else. Nothing outside this file may touch it. */
+ * inside err_cb — and nowhere else. Nothing outside this file may touch it.
+ *
+ * Not under TALKOS_VERIFY_CERTS: record_tls_state() below needs it in EVERY
+ * build, because the honest answer to "was this peer authenticated?" is exactly
+ * the question a general fetch has to answer for the model, and in the default
+ * build that answer is no. */
 static mbedtls_ssl_context *cur_ssl;
+
+/* The name being asked for on the connection in progress — API_SNI for the model
+ * transport, the URL's host for a fetch. Used for SNI, for the verifier's
+ * hostname check, and in every message about a certificate. */
+static const char *xc_sni;
+
+/* FETCH_TLS_* plus one sentence, recorded from the LIVE session at handshake
+ * time. See record_tls_state(). */
+static int  xc_tls_state;
+static char xc_tls_note[FETCH_NOTE_MAX];
+
+/* WHAT THIS CONNECTION ACTUALLY PROVED — asked of mbedTLS, never inferred.
+ *
+ * "Compiled with TALKOS_VERIFY_CERTS" is not the same claim as "this handshake
+ * verified anything", and the two live in different object files:
+ * ALTCP_MBEDTLS_AUTHMODE is consumed by lwIP's altcp_tls_mbedtls.c, and one
+ * stale object is enough to separate them. Worse, under VERIFY_NONE mbedTLS
+ * skips verification and leaves verify_result at 0, which is byte-identical to
+ * success. So the only sound source is the config the handshake really used,
+ * and both halves are checked: authmode must be VERIFY_REQUIRED *and* the
+ * verify result must be clean.
+ *
+ * tools/net_tools.c prints the resulting sentence above the body of every fetch,
+ * because a model that acts on fetched content must know whether the content
+ * came from the host it named or from anything that could answer on that port. */
+static void record_tls_state(mbedtls_ssl_context *ssl) {
+    xc_tls_state  = FETCH_TLS_NONE;
+    xc_tls_note[0] = '\0';
+    if (!ssl) return;
+
+    int      mode = ssl->conf ? (int)ssl->conf->authmode : -1;
+    uint32_t vr   = mbedtls_ssl_get_verify_result(ssl);
+
+    if (mode == MBEDTLS_SSL_VERIFY_REQUIRED && vr == 0) {
+        xc_tls_state = FETCH_TLS_VERIFIED;
+        snprintf(xc_tls_note, sizeof xc_tls_note,
+                 "chain built to one of this kernel's %d pinned roots and the "
+                 "certificate names %s",
+                 tls_ca_root_count(), xc_sni ? xc_sni : "?");
+    } else {
+        xc_tls_state = FETCH_TLS_UNVERIFIED;
+        snprintf(xc_tls_note, sizeof xc_tls_note,
+                 "ENCRYPTED BUT NOT AUTHENTICATED: this kernel was built "
+                 "without TALKOS_VERIFY_CERTS (mbedTLS authmode %d), so the "
+                 "certificate %s presented was parsed and then believed. "
+                 "Anything able to answer on this port could be the far end.",
+                 mode, xc_sni ? xc_sni : "the peer");
+    }
+}
+
+#ifdef TALKOS_VERIFY_CERTS
+/* ---------------------------------------------------------------------- */
+/* certificate verification: setup and reporting                           */
+/* ---------------------------------------------------------------------- */
 
 /* One line describing why a certificate was refused, pointed at by tls_err.
  * Static because tls_err outlives the call that produced it. */
@@ -339,7 +500,7 @@ static const char *tls_verify_failure_reason(void) {
         tls_ca_now_unix() == TLS_CA_NO_CLOCK) {
         kprintf("\n[tls] cannot judge %s: the CMOS clock is unreadable, so every "
                 "certificate looks not-yet-valid. This is a clock fault, not a "
-                "certificate fault.\n", API_SNI);
+                "certificate fault.\n", xc_sni ? xc_sni : "the peer");
         return "wall clock unreadable - certificate dates cannot be checked";
     }
 
@@ -364,7 +525,7 @@ static const char *tls_verify_failure_reason(void) {
     verify_line[w] = '\0';
 
     kprintf("\n[tls] certificate REJECTED for %s (verify flags 0x%x)\n",
-            API_SNI, (unsigned)flags);
+            xc_sni ? xc_sni : "the peer", (unsigned)flags);
     kprintf("[tls] %s\n", verify_line);
     return verify_line;
 }
@@ -385,7 +546,8 @@ static void tls_report_verify_success(mbedtls_ssl_context *ssl) {
         return;
     }
 
-    kprintf("[tls] verified: chain trusted, hostname %s matches", API_SNI);
+    kprintf("[tls] verified: chain trusted, hostname %s matches",
+            xc_sni ? xc_sni : "?");
 
     const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(ssl);
     if (peer) {
@@ -398,6 +560,14 @@ static void tls_report_verify_success(mbedtls_ssl_context *ssl) {
 #endif /* TALKOS_VERIFY_CERTS */
 
 int net_init(void) {
+    /* ARM THE CREDENTIAL GUARD FIRST, before anything below can fail and take an
+     * early return with it. fetch_scan_secret() falls back to the "sk-ant-"
+     * shape rule without a source, but the rule that matters — refuse any
+     * request containing THIS machine's key, whatever it looks like — needs the
+     * source installed. It is one assignment and it can never be the reason a
+     * fetch is allowed through unchecked. See include/fetch.h DECISION 2. */
+    fetch_set_secret_source(fwcfg_apikey);
+
     lwip_init();
 
     ip4_addr_t ip, nm, gw;
@@ -424,6 +594,14 @@ int net_init(void) {
 #endif
 
     stack_up = 1;
+
+    /* Bind the general network verbs (tools/net_tools.c) HERE, before the API
+     * host lookup, and deliberately not after it. Resolving api.anthropic.com has
+     * nothing to do with whether this machine can reach example.com or report its
+     * own link state — and a boot whose model lookup failed is exactly the boot
+     * where an operator most needs the machine to be able to say why. */
+    fetch_set_backend(net_fetch_backend());
+
     return resolve_api_host(10000);
 }
 
@@ -444,16 +622,13 @@ int net_init(void) {
  * a retry from being attempted on a machine that never got that far (no NIC),
  * where it would burn the timeout per sentence and could not possibly work. */
 static int resolve_api_host(uint32_t timeout_ms) {
-    dns_done = dns_ok = 0;
-
     kprintf("net: resolving %s ...\n", API_HOST);
-    err_t e = dns_gethostbyname(API_HOST, &server_ip, dns_cb, NULL);
-    if (e == ERR_OK) { dns_ok = 1; dns_done = 1; }
-    else if (e != ERR_INPROGRESS) { kprintf("net: dns error %d\n", e); return -1; }
-
-    uint64_t deadline = millis() + timeout_ms;
-    while (!dns_done && millis() < deadline) net_service();
-    if (!dns_ok) { kprintf("net: DNS resolution failed\n"); return -1; }
+    if (dns_lookup(API_HOST, &server_ip, timeout_ms) != 0) {
+        kprintf("net: DNS resolution failed\n");
+        api_resolved = 0;
+        return -1;
+    }
+    api_resolved = 1;
     kprintf("net: %s -> %s, TLS ready\n", API_HOST, ipaddr_ntoa(&server_ip));
     return 0;
 }
@@ -495,6 +670,25 @@ static const char  *tx_ptr;
 static int          tx_left;
 
 static const char  *tls_err = "";
+
+/* PER-ATTEMPT MODE BITS. The engine below serves two callers with different
+ * needs, and these are the only differences between them:
+ *
+ *   xc_stream  feed received bytes to the SSE machine instead of the raw buffer.
+ *              Only the model transport ever sets it, and only under
+ *              TALKOS_STREAM; a fetch is always buffered.
+ *   xc_probe   there is no request and no response — the question is only
+ *              "does anything complete a TCP handshake here?", so the attempt
+ *              finishes the moment connected_cb fires.
+ *
+ * They are set by http_exchange() before any callback can run and are never
+ * touched from inside one. */
+static int xc_stream;
+static int xc_probe;
+
+/* The lwIP error the last failed attempt died of, kept so http_exchange() can
+ * classify it for the fetch layer instead of every caller re-deriving it. */
+static err_t xc_lwip_err;
 
 /* THE CONNECTION IN PROGRESS, and how this file knows a callback belongs to it.
  *
@@ -580,18 +774,40 @@ static err_t recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t err
 #ifdef TALKOS_STREAM
         /* Straight into the state machine: it prints text deltas as they land
          * and reassembles the response body in place. Segments split an event
-         * at arbitrary byte boundaries, which is sse.c's whole job. */
-        sse_http_feed(&stream, d, (size_t)q->len);
-#else
+         * at arbitrary byte boundaries, which is sse.c's whole job.
+         *
+         * Only for the model transport. A fetch's response is somebody else's
+         * HTML and must never be interpreted as a model event stream, nor
+         * printed to the console delta by delta — hence the mode bit rather than
+         * a bare #ifdef, which is what this used to be. */
+        if (xc_stream) { sse_http_feed(&stream, d, (size_t)q->len); continue; }
+#endif
         for (int i = 0; i < q->len; i++) {
             if (rx_len < rx_cap - 1) rx_buf[rx_len++] = d[i];
             else                     rx_overflow = 1;
         }
-#endif
     }
     altcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     return ERR_OK;
+}
+
+/* An lwIP err_t as a sentence a model can act on. */
+static const char *lwip_err_text(err_t e) {
+    switch (e) {
+    case ERR_RST:     return "the peer reset the connection - nothing is "
+                             "listening on that port, or it hung up";
+    case ERR_ABRT:    return "the connection was aborted";
+    case ERR_CLSD:    return "the peer closed the connection without answering "
+                             "- for an https URL that is usually a TLS "
+                             "handshake the server refused";
+    case ERR_CONN:    return "not connected";
+    case ERR_TIMEOUT: return "the connection attempt timed out";
+    case ERR_RTE:     return "no route to that address";
+    case ERR_MEM:     return "the network stack ran out of memory";
+    case ERR_BUF:     return "the network stack ran out of buffers";
+    default:          return "the connection failed";
+    }
 }
 
 static void err_cb(void *arg, err_t err) {
@@ -600,6 +816,7 @@ static void err_cb(void *arg, err_t err) {
     /* lwIP frees the pcb the moment this returns, so it is no longer ours to
      * tear down — and following the pointer again would be a use-after-free. */
     cur_pcb = (struct altcp_pcb *)0;
+    xc_lwip_err = err;
 #ifdef TALKOS_VERIFY_CERTS
     /* A refused certificate arrives here as a bare ERR_CLSD, which is
      * indistinguishable from the peer hanging up. Ask mbedTLS what it decided
@@ -608,6 +825,11 @@ static void err_cb(void *arg, err_t err) {
     const char *why = tls_verify_failure_reason();
     if (why) { tls_err = why; ask_done = 1; return; }
 #endif
+    /* Say what lwIP meant, not just what it numbered. Before this the transport
+     * reported every one of these as the generic "TLS/connect failed", which is
+     * the same sentence for "nothing is listening" and "the handshake was
+     * refused" — a distinction the model needs to retry differently. */
+    tls_err = lwip_err_text(err);
     kprintf("\n[net error %d]\n", err);
     ask_done = 1;
 }
@@ -653,13 +875,24 @@ static err_t sent_cb(void *arg, struct altcp_pcb *pcb, u16_t len) {
 
 static err_t connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
     if (stale_cb(arg)) return ERR_OK;
-    if (err != ERR_OK) { ask_done = 1; return err; }
+    if (err != ERR_OK) { xc_lwip_err = err; ask_done = 1; return err; }
     ask_ok = 1;                                  /* TLS handshake completed */
+
+    /* Ask the live session what it proved, while it is still alive. Both
+     * builds, because "not authenticated" is a fact a fetch has to report just
+     * as loudly as "authenticated". */
+    if (cur_ssl) record_tls_state(cur_ssl);
 #ifdef TALKOS_VERIFY_CERTS
     /* Reaching here under VERIFY_REQUIRED means the chain built to a pinned
      * root, the name matched, and the validity period contained now. */
-    if (cur_ssl) { tls_report_verify_success(cur_ssl); cur_ssl = (mbedtls_ssl_context *)0; }
+    if (cur_ssl) tls_report_verify_success(cur_ssl);
 #endif
+    cur_ssl = (mbedtls_ssl_context *)0;
+
+    /* A connect probe has its answer already: something completed a handshake
+     * here. There is no request to send and nothing to wait for. */
+    if (xc_probe) { ask_done = 1; return ERR_OK; }
+
     tx_ptr  = req_buf;
     tx_left = req_len;
     altcp_sent(pcb, sent_cb);
@@ -717,6 +950,164 @@ static int split_http(char *buf, int len, model_response_t *out) {
 }
 #endif /* !TALKOS_STREAM — sse.c does the splitting on the streaming path */
 
+/* ====================================================================== */
+/* the connection engine — shared by the model transport and every fetch   */
+/* ====================================================================== */
+
+/* Everything one attempt differs by. Nothing else about the machinery above
+ * changes between a model request and a fetch of somebody's HTML. */
+typedef struct xchg {
+    const ip_addr_t *ip;
+    uint16_t         port;
+    const char      *sni;        /* NULL => plaintext TCP, no TLS at all      */
+    const char      *req;        /* ALREADY ASSEMBLED. The engine adds nothing */
+    int              req_len;
+    char            *rx;
+    int              rx_cap;
+    uint32_t         timeout_ms;
+    int              stream;     /* feed the SSE machine (model transport only)*/
+    int              probe;      /* finish as soon as the handshake completes  */
+} xchg_t;
+
+/* Run one attempt to completion, servicing the stack while it runs.
+ *
+ * THE ENGINE TAKES BYTES, NOT INTENT. It is handed a finished request buffer and
+ * appends nothing of its own — no host, no credential, no framing. That is what
+ * makes it safe to point at an arbitrary host: the x-api-key header is written
+ * in exactly one function (tls_send, below) and there is no path from a fetch to
+ * that function. See include/fetch.h DECISION 2.
+ *
+ * Returns MODEL_OK when a response completed, MODEL_ETIMEOUT, or
+ * MODEL_ETRANSPORT. Leaves rx_len/rx_overflow describing what was received and
+ * tls_err/xc_tls_state/xc_tls_note describing the peer. */
+static int http_exchange(const xchg_t *x) {
+    if (!x || !x->rx || x->rx_cap < 64) {
+        tls_err = "response buffer too small";
+        return MODEL_EINVAL;
+    }
+    if (x->sni && !tls_conf) {
+        tls_err = "TLS not initialised";
+        return MODEL_ETRANSPORT;
+    }
+
+    req_buf      = x->req;
+    req_len      = x->req_len;
+    rx_buf       = x->rx;
+    rx_cap       = x->rx_cap;
+    rx_len       = 0;
+    rx_overflow  = 0;
+    ask_done     = 0;
+    ask_ok       = 0;
+    tx_ptr       = x->req;
+    tx_left      = 0;
+    tls_err      = "";
+    xc_stream    = x->stream;
+    xc_probe     = x->probe;
+    xc_sni       = x->sni;
+    xc_lwip_err  = ERR_OK;
+    xc_tls_state = FETCH_TLS_NONE;
+    xc_tls_note[0] = '\0';
+#ifdef TALKOS_STREAM
+    if (xc_stream)
+        sse_http_init(&stream, x->rx, (size_t)x->rx_cap, stream_text, (void *)0);
+#endif
+
+    struct altcp_pcb *pcb = x->sni ? altcp_tls_new(tls_conf, IPADDR_TYPE_V4)
+                                   : altcp_tcp_new_ip_type(IPADDR_TYPE_V4);
+    if (!pcb) {
+        tls_err = x->sni ? "could not allocate a TLS connection (out of memory)"
+                         : "could not allocate a TCP connection (out of memory)";
+        return MODEL_ETRANSPORT;
+    }
+
+    /* Claim it before any callback can fire, and stamp this attempt's generation
+     * on it so every callback can tell whose connection it is. */
+    cur_pcb = pcb;
+    tls_gen++;
+    altcp_arg(pcb, (void *)tls_gen);
+
+    /* Send SNI so CDN-fronted hosts present the right certificate. Under
+     * TALKOS_VERIFY_CERTS this same string is what mbedTLS matches the
+     * certificate's CN/subjectAltName against, so a failure to set it would
+     * quietly downgrade verification to "signed by someone we trust, for
+     * whatever name they liked" — hence the hard failure below. */
+    if (x->sni) {
+        mbedtls_ssl_context *ssl = (mbedtls_ssl_context *)altcp_tls_context(pcb);
+#ifdef TALKOS_VERIFY_CERTS
+        if (!ssl || mbedtls_ssl_set_hostname(ssl, x->sni) != 0) {
+            tls_drop(pcb);
+            cur_pcb = (struct altcp_pcb *)0;
+            tls_err = "could not set the hostname to verify against";
+            return MODEL_ETRANSPORT;
+        }
+#else
+        if (ssl) mbedtls_ssl_set_hostname(ssl, x->sni);
+#endif
+        cur_ssl = ssl;
+    } else {
+        cur_ssl = (mbedtls_ssl_context *)0;
+    }
+
+    altcp_recv(pcb, recv_cb);
+    altcp_err(pcb, err_cb);
+    altcp_connect(pcb, x->ip, x->port, connected_cb);
+
+    uint64_t deadline = millis() + x->timeout_ms;
+    while (!ask_done && millis() < deadline) net_service();
+
+    /* Past this point the pcb (and the mbedTLS state inside it) may already be
+     * gone, and on the timeout path it is still alive but about to be. Either
+     * way nobody may follow this pointer again. */
+    cur_ssl = (mbedtls_ssl_context *)0;
+
+    /* THE ONE TEARDOWN. Every return below is a return from a request that is
+     * over, so no connection may outlive this point. On the success path recv_cb
+     * already closed it and cur_pcb is NULL; every other path — the timeout, a
+     * write failure, a connect lwIP refused, a close that could not get a pbuf —
+     * leaves a live pcb still wired to our callbacks. See cur_pcb's comment for
+     * what such a survivor does to the next request. */
+    if (cur_pcb) { tls_drop(cur_pcb); cur_pcb = (struct altcp_pcb *)0; }
+
+    /* xc_sni points at the caller's storage (a URL host on the stack, for a
+     * fetch). Nothing may read it after this call, and the sentence that needed
+     * it is already copied into xc_tls_note. */
+    xc_sni = (const char *)0;
+
+    if (!ask_done) { tls_err = "timed out";           return MODEL_ETIMEOUT; }
+    /* Do not overwrite a reason we already have. err_cb turns mbedTLS's verify
+     * flags into a sentence and parks it here; clobbering that with a generic
+     * string is how "the certificate expired" used to reach the operator as
+     * "TLS/connect failed". */
+    if (!ask_ok)   { if (!tls_err || !tls_err[0]) tls_err = "TLS/connect failed";
+                     return MODEL_ETRANSPORT; }
+    return MODEL_OK;
+}
+
+/* ====================================================================== */
+/* the model transport: Anthropic framing over the engine above            */
+/* ====================================================================== */
+
+/* THE OUTERMOST BOUND IN THE REQUEST-SIZE CHAIN.
+ *
+ * This buffer holds the request line, the headers (including x-api-key) and the
+ * whole JSON body, so it has to be strictly larger than chat.h's CHAT_REQ_BYTES.
+ * It used to be 64 KiB against a CHAT_REQ_BYTES of 61440, which left 25 bytes of
+ * slack in the WORST-CASE request that chat.h works out — i.e. the tool registry
+ * was one description away from the machine silently forgetting the middle of
+ * every long job. chat.h names this buffer as the thing that has to grow first,
+ * and adding the network tool family is the change that needed it.
+ *
+ * The relationship is asserted rather than described, because a comment that
+ * says "must hold CHAT_REQ_BYTES" has already been wrong once in this tree. If
+ * CHAT_REQ_BYTES moves past this, the build stops here with both numbers in the
+ * message instead of the kernel getting MODEL_ENOSPC at run time. */
+#define TLS_REQ_BYTES 90112
+#define TLS_REQ_HEADROOM 2048   /* request line + headers + the API key */
+_Static_assert(TLS_REQ_BYTES >= CHAT_REQ_BYTES + TLS_REQ_HEADROOM,
+               "net.c's HTTP framing buffer must hold CHAT_REQ_BYTES plus the "
+               "request line and headers - raise TLS_REQ_BYTES (net/net.c) "
+               "before raising CHAT_REQ_BYTES (include/chat.h)");
+
 static int tls_send(model_transport_t *t,
                     const char *body, size_t body_len,
                     char *resp_buf, size_t resp_cap,
@@ -727,19 +1118,10 @@ static int tls_send(model_transport_t *t,
     if (resp_cap < 64) { tls_err = "response buffer too small"; return MODEL_EINVAL; }
 
     /* Build the HTTP/1.0 request (close-delimited response, no chunking). The
-     * JSON writer is just a bounded appender, so it serves for plain text too. */
-    /* Headers plus the whole JSON body. The turn loop's request carries every
-     * registered tool's schema on top of the system prompt and the conversation,
-     * so this has to stay well clear of chat.h's CHAT_REQ_BYTES or the tool-use
-     * path dies with ENOSPC.
+     * JSON writer is just a bounded appender, so it serves for plain text too.
      *
-     * `req` is that clearance, and it is the outermost bound in the chain: this
-     * 64 KiB has to hold CHAT_REQ_BYTES (61440) plus the request line and
-     * headers. The boot banner prints the schema size actually assembled — 32764
-     * bytes at 45 tools on this build — and include/chat.h works the whole budget
-     * out against these 64 KiB, including how little slack is left. Do not grow
-     * CHAT_REQ_BYTES without growing this buffer first. */
-    static char   req[65536];
+     * THIS IS THE ONLY PLACE IN THE KERNEL THAT READS THE API KEY. */
+    static char   req[TLS_REQ_BYTES];
     json_writer_t w;
     json_writer_init(&w, req, sizeof req);
     json_put(&w,
@@ -781,78 +1163,22 @@ static int tls_send(model_transport_t *t,
 #endif
     if (!json_writer_ok(&w)) { tls_err = "request too large"; return MODEL_ENOSPC; }
 
-    req_buf = req;
-    req_len = (int)json_writer_len(&w);
-
-    rx_buf      = resp_buf;
-    rx_cap      = (int)(resp_cap > 0x7FFFFFFF ? 0x7FFFFFFF : resp_cap);
-    rx_len      = 0;
-    rx_overflow = 0;
-    ask_done    = 0;
-    ask_ok      = 0;
-    tx_ptr      = req;
-    tx_left     = 0;
-    tls_err     = "";
+    xchg_t x;
+    memset(&x, 0, sizeof x);
+    x.ip         = &server_ip;
+    x.port       = API_PORT;
+    x.sni        = API_SNI;
+    x.req        = req;
+    x.req_len    = (int)json_writer_len(&w);
+    x.rx         = resp_buf;
+    x.rx_cap     = (int)(resp_cap > 0x7FFFFFFF ? 0x7FFFFFFF : resp_cap);
+    x.timeout_ms = 90000;                   /* handshake + model latency */
 #ifdef TALKOS_STREAM
-    sse_http_init(&stream, resp_buf, resp_cap, stream_text, (void *)0);
+    x.stream     = 1;
 #endif
 
-    struct altcp_pcb *pcb = altcp_tls_new(tls_conf, IPADDR_TYPE_V4);
-    if (!pcb) { tls_err = "altcp_tls_new failed"; return MODEL_ETRANSPORT; }
-
-    /* Claim it before any callback can fire, and stamp this attempt's generation
-     * on it so every callback can tell whose connection it is. */
-    cur_pcb = pcb;
-    tls_gen++;
-    altcp_arg(pcb, (void *)tls_gen);
-
-    /* Send SNI so CDN-fronted hosts present the right certificate. Under
-     * TALKOS_VERIFY_CERTS this same string is what mbedTLS matches the
-     * certificate's CN/subjectAltName against, so a failure to set it would
-     * quietly downgrade verification to "signed by someone we trust, for
-     * whatever name they liked" — hence the hard failure below. */
-    mbedtls_ssl_context *ssl = (mbedtls_ssl_context *)altcp_tls_context(pcb);
-#ifdef TALKOS_VERIFY_CERTS
-    if (!ssl || mbedtls_ssl_set_hostname(ssl, API_SNI) != 0) {
-        tls_drop(pcb);
-        cur_pcb = (struct altcp_pcb *)0;
-        tls_err = "could not set the hostname to verify against";
-        return MODEL_ETRANSPORT;
-    }
-    cur_ssl = ssl;
-#else
-    if (ssl) mbedtls_ssl_set_hostname(ssl, API_SNI);
-#endif
-
-    altcp_recv(pcb, recv_cb);
-    altcp_err(pcb, err_cb);
-    altcp_connect(pcb, &server_ip, API_PORT, connected_cb);
-
-    uint64_t deadline = millis() + 90000;   /* handshake + model latency */
-    while (!ask_done && millis() < deadline) net_service();
-
-#ifdef TALKOS_VERIFY_CERTS
-    /* Past this point the pcb (and the mbedTLS state inside it) may already be
-     * gone, and on the timeout path it is still alive but about to be. Either
-     * way nobody may follow this pointer again. */
-    cur_ssl = (mbedtls_ssl_context *)0;
-#endif
-
-    /* THE ONE TEARDOWN. Every return below is a return from a request that is
-     * over, so no connection may outlive this point. On the success path recv_cb
-     * already closed it and cur_pcb is NULL; every other path — the timeout, a
-     * write failure, a connect lwIP refused, a close that could not get a pbuf —
-     * leaves a live pcb still wired to our callbacks. See cur_pcb's comment for
-     * what such a survivor does to the next request. */
-    if (cur_pcb) { tls_drop(cur_pcb); cur_pcb = (struct altcp_pcb *)0; }
-
-    if (!ask_done) { tls_err = "timed out";           return MODEL_ETIMEOUT; }
-    /* Do not overwrite a reason we already have. err_cb turns mbedTLS's verify
-     * flags into a sentence and parks it here; clobbering that with a generic
-     * string is how "the certificate expired" used to reach the operator as
-     * "TLS/connect failed". */
-    if (!ask_ok)   { if (!tls_err || !tls_err[0]) tls_err = "TLS/connect failed";
-                     return MODEL_ETRANSPORT; }
+    int xrc = http_exchange(&x);
+    if (xrc != MODEL_OK) return xrc;
 
 #ifdef TALKOS_STREAM
     /* The body was consumed as it arrived; all that is left is to close the
@@ -884,6 +1210,199 @@ static model_transport_t tls_transport = {
 model_transport_t *model_tls_transport(void) {
     return tls_conf ? &tls_transport : NULL;
 }
+
+/* ====================================================================== */
+/* the fetch backend (implements fetch_backend_t)                          */
+/* ====================================================================== */
+
+/* This is the whole lwIP half of include/fetch.h: four functions that hand the
+ * engine above a destination and hand the answer back as plain bytes. Every
+ * decision about WHAT to send, and every rule about what may not be sent, lives
+ * in net/fetch.c, which knows nothing about sockets and is host-tested. */
+
+/* Ask the hardware, not the software. netif_set_up() succeeds whether or not a
+ * card was ever found, so lwIP's idea of "up" says nothing; a live STATUS.LU
+ * read is the difference between "try again" and "there is no network on this
+ * machine". Without this a NIC-less boot burns the whole timeout on every verb
+ * before refusing, which reads as a hang — the same measurement that motivated
+ * the identical check in net_retry_resolve(). */
+static const char *no_link(void) {
+    if (!stack_up)
+        return "the network stack never came up on this machine (net_init "
+               "failed) - nothing can be reached";
+    if (!e1000_link_up())
+        return e1000_is_suspended()
+             ? "the NIC is powered down (the driver suspended it); resume it "
+               "before using the network"
+             : "there is no network link: no supported NIC was found, or the "
+               "link is down. Call net_status for the detail.";
+    return (const char *)0;
+}
+
+static void put_ip(char *dst, size_t cap, const ip_addr_t *a) {
+    const char *s = a ? ipaddr_ntoa(a) : "";
+    size_t i = 0;
+    if (!cap) return;
+    for (; s && s[i] && i + 1 < cap; i++) dst[i] = s[i];
+    dst[i] = '\0';
+}
+
+static int backend_resolve(const char *host, char *ip, size_t ipcap,
+                           uint32_t timeout_ms) {
+    if (!host || !ip || ipcap < 8) return FETCH_EINVAL;
+    if (no_link()) return FETCH_ECONNECT;
+
+    ip_addr_t a;
+    if (dns_lookup(host, &a, timeout_ms) != 0) return FETCH_EDNS;
+    put_ip(ip, ipcap, &a);
+    return FETCH_OK;
+}
+
+/* MODEL_* out of the engine -> FETCH_* for the model to read.
+ *
+ * The one judgement call is which side of a failed https attempt died. lwIP
+ * hands both back as a bare error on the same callback, so the discriminator is
+ * the code itself: a reset or an abort is the transport refusing to carry us at
+ * all, while a clean close partway through is what a server does when it will
+ * not complete a handshake. Being wrong here costs the model one wasted retry;
+ * saying "it failed" costs it the ability to choose a different retry at all. */
+static int classify(int rc, int tls) {
+    if (rc == MODEL_OK)       return FETCH_OK;
+    if (rc == MODEL_ETIMEOUT) return FETCH_ETIMEOUT;
+    if (rc == MODEL_EINVAL)   return FETCH_EINVAL;
+    if (tls && xc_lwip_err == ERR_CLSD) return FETCH_ETLS;
+    if (tls && xc_lwip_err == ERR_OK)   return FETCH_ETLS;  /* alert, no err_cb */
+    return FETCH_ECONNECT;
+}
+
+static void fill_wire(fetch_wire_t *w, int tls, uint64_t t0) {
+    w->rx_len     = (size_t)rx_len;
+    w->overflow   = rx_overflow;
+    w->elapsed_ms = (uint32_t)(millis() - t0);
+    w->tls        = tls ? xc_tls_state : FETCH_TLS_NONE;
+    w->err        = (tls_err && tls_err[0]) ? tls_err : (const char *)0;
+
+    size_t i = 0;
+    for (; xc_tls_note[i] && i + 1 < sizeof w->tls_note; i++)
+        w->tls_note[i] = xc_tls_note[i];
+    w->tls_note[i] = '\0';
+}
+
+static int backend_exchange(const fetch_conn_t *c, fetch_wire_t *w) {
+    if (!c || !w || !c->rx) return FETCH_EINVAL;
+
+    const char *nl = no_link();
+    if (nl) { w->err = nl; return FETCH_ECONNECT; }
+
+    ip_addr_t a;
+    if (!ipaddr_aton(c->ip, &a)) {
+        w->err = "internal: the resolved address did not parse back";
+        return FETCH_EINVAL;
+    }
+
+    uint64_t t0 = millis();
+    xchg_t   x;
+    memset(&x, 0, sizeof x);
+    x.ip         = &a;
+    x.port       = c->port;
+    x.sni        = c->sni;
+    x.req        = c->req;
+    x.req_len    = (int)c->req_len;
+    x.rx         = c->rx;
+    x.rx_cap     = (int)(c->rx_cap > 0x7FFFFFFF ? 0x7FFFFFFF : c->rx_cap);
+    x.timeout_ms = c->timeout_ms;
+
+    int rc = http_exchange(&x);
+    fill_wire(w, c->sni != (const char *)0, t0);
+    return classify(rc, c->sni != (const char *)0);
+}
+
+static int backend_probe(const char *ip, uint16_t port, uint32_t timeout_ms,
+                         fetch_wire_t *w) {
+    if (!ip || !w) return FETCH_EINVAL;
+
+    const char *nl = no_link();
+    if (nl) { w->err = nl; return FETCH_ECONNECT; }
+
+    ip_addr_t a;
+    if (!ipaddr_aton(ip, &a)) {
+        w->err = "internal: the resolved address did not parse back";
+        return FETCH_EINVAL;
+    }
+
+    /* A probe is a plaintext TCP handshake and nothing else: no TLS (that would
+     * answer a different question, and a plain-TCP service would refuse it) and
+     * no request bytes, so there is nothing to scan and nothing to leak. One
+     * byte of scratch, because the engine insists on a real buffer. */
+    static char scratch[64];
+    uint64_t t0 = millis();
+    xchg_t   x;
+    memset(&x, 0, sizeof x);
+    x.ip         = &a;
+    x.port       = port;
+    x.sni        = (const char *)0;
+    x.req        = "";
+    x.req_len    = 0;
+    x.rx         = scratch;
+    x.rx_cap     = (int)sizeof scratch;
+    x.timeout_ms = timeout_ms;
+    x.probe      = 1;
+
+    int rc = http_exchange(&x);
+    fill_wire(w, 0, t0);
+    return classify(rc, 0);
+}
+
+static int backend_ifstat(fetch_ifstat_t *out) {
+    if (!out) return FETCH_EINVAL;
+
+    e1000_get_mac(out->mac);
+    /* There is no e1000_present(): the station address is read out of the card's
+     * RAL/RAH registers during init and stays zero if no card was ever mapped,
+     * so a nonzero MAC is the honest test for "a NIC was found". */
+    out->have_nic  = (out->mac[0] | out->mac[1] | out->mac[2] |
+                      out->mac[3] | out->mac[4] | out->mac[5]) != 0;
+    out->link_up   = e1000_link_up();
+    out->suspended = e1000_is_suspended();
+    out->stack_up  = stack_up;
+
+    out->ifname[0] = e1000_netif.name[0] ? e1000_netif.name[0] : 'e';
+    out->ifname[1] = e1000_netif.name[1] ? e1000_netif.name[1] : 'n';
+    out->ifname[2] = '0';
+    out->ifname[3] = '\0';
+
+    put_ip(out->ip,      sizeof out->ip,      netif_ip_addr4(&e1000_netif));
+    put_ip(out->netmask, sizeof out->netmask, netif_ip_netmask4(&e1000_netif));
+    put_ip(out->gateway, sizeof out->gateway, netif_ip_gw4(&e1000_netif));
+    put_ip(out->dns,     sizeof out->dns,     dns_getserver(0));
+
+    {
+        const char *h = API_HOST;
+        size_t i = 0;
+        for (; h[i] && i + 1 < sizeof out->api_host; i++) out->api_host[i] = h[i];
+        out->api_host[i] = '\0';
+    }
+    out->api_resolved = api_resolved;
+    if (api_resolved) put_ip(out->api_ip, sizeof out->api_ip, &server_ip);
+
+#ifdef TALKOS_VERIFY_CERTS
+    out->verify_build = 1;
+#else
+    out->verify_build = 0;
+#endif
+    out->trust_roots = tls_ca_root_count();
+    return FETCH_OK;
+}
+
+static const fetch_backend_t lwip_backend = {
+    "lwip+mbedtls",
+    backend_resolve,
+    backend_exchange,
+    backend_probe,
+    backend_ifstat,
+};
+
+const fetch_backend_t *net_fetch_backend(void) { return &lwip_backend; }
 
 /* ====================================================================== */
 /* net_ask — the protocol side: build, send, read, print                   */

@@ -152,9 +152,19 @@ check [net]: heap_integrity max_live=64 max_used_kib=64 min_allocs=1000
 # direction, with everything green. This makes growing a description a two-line
 # change instead of a one-line change plus a lie: the failure names the new
 # number to paste in.
+#
+# max_schema_bytes IS NOT WRITTEN HERE, ON PURPOSE, and it used to be. This line
+# carried a literal max_schema_bytes=57344, which is a hand-copy of
+# CHAT_TOOLS_BYTES in include/chat.h — the exact stale-mirror shape that has cost
+# this project days. It had already been wrong once: chat.h said 57344 while these
+# three files still pinned 49152, so the binding limit was 8 KiB below the one the
+# header declared and nobody could tell which number was real. harness.py's default
+# for max_schema_bytes is CHAT_TOOLS_BYTES, parsed out of the header, so omitting
+# the argument means there is exactly one copy of that bound in the tree and it is
+# the one the kernel compiles against.
 expect-re [net]: ^  tools  : \d+ registered \(\d+ bytes of schema\)$
 expect-re [net]: ^  model  : reachable over TLS$
-check [net]: tool_registry min_tools=12 min_schema_bytes=2000 max_schema_bytes=40960 min_bytes_per_tool=80 expect_schema_bytes=header
+check [net]: tool_registry min_tools=12 min_schema_bytes=2000 min_bytes_per_tool=80 expect_schema_bytes=header
 
 # (The network-less side of the same banner is covered by no-nic.case, which
 # reaches the prompt with the model genuinely unreachable.)

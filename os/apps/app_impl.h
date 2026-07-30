@@ -368,6 +368,13 @@ int app_cap_pending(void);
  * there was nothing to do. `now_ms` is a fresh monotonic reading. */
 int app_cap_service(uint64_t now_ms);
 
+/* One monotonic millisecond reading through the installed time source, provided
+ * by apps/runtime.c. apps/cap.c needs it to read the clock AFTER a capability
+ * call as well as before, because how long the call actually blocked the machine
+ * is not knowable in advance: a sound's requested duration is not the same number
+ * as the time a driver spends polling a device to play it. */
+uint64_t app_now_ms(void);
+
 /* Write `text` into a var or widget of a running app. Implemented in runtime.c
  * (it owns the pool) and called by cap.c to report an outcome that is only known
  * after the sound has played. A no-op if that app has closed in the meantime. */

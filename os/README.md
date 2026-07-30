@@ -3,7 +3,7 @@
 A from-scratch x86_64 kernel, built and run on macOS via QEMU. It boots into a
 prompt with no shell and no commands: you type a sentence, the kernel sends it to
 the Anthropic Claude API **directly over HTTPS** from ring 0, and the model drives
-the machine through 49 registered tools. It has a framebuffer console, a window
+the machine through 61 registered tools. It has a framebuffer console, a window
 manager, clickable apps described as JSON documents, a PS/2 mouse, ACPI power
 control, and a sandboxed driver VM in which the model can **write a driver for a
 sound card this kernel has never heard of and then play a tone through it** —
@@ -39,8 +39,16 @@ which it has done, live, from one typed sentence.
 | A model-authored driver can *become* the audio output (`driver_install`) | ✅ done, proven live |
 | An AC'97 driver in the kernel tree | ⬜ **deliberately none** — test fixture only, `-DTALKOS_AC97_REFERENCE` |
 | Apps can call kernel capabilities (`{"call":"audio.tone"}`) | ✅ done |
-| The turn loop — 49 tools, 16 rounds, budget notes, retries, a journal | ✅ done |
-| Disk-backed filesystem (FAT32/ext2), ATA/block layer | ⬜ future (VFS ready) |
+| The turn loop — 61 tools, 16 rounds, budget notes, retries, a journal | ✅ done |
+| Disk-backed filesystem (FAT32 read/write, VFAT long names, own mkfs) | ✅ done |
+| ATA PIO driver + block layer (LBA28, no DMA, no IRQs) | ✅ done |
+| Cooperative fibers — the screen stays alive during a model turn | ✅ done |
+| Capability registry — the model saves what it builds, and reuses it | ✅ done, proven live |
+| Agenda — bounded, persistent, acts at boot with nobody present | ✅ done, proven live |
+| Fault guard + live `.text` patching — the machine repairs itself | ✅ done, flag-gated demo |
+| General HTTP(S) fetch, DNS and connect probes as tools | ✅ done |
+| Driver-VM scratch memory, strings and six syscalls | ✅ done |
+| A C compiler, or any way to load compiled code | ⬜ **none** — see below |
 | Certificate verification (pinned roots + hostname + expiry) | ✅ done, **off by default** — `-DTALKOS_VERIFY_CERTS` |
 | CSPRNG entropy | ⬜ future (see caveat) |
 | Userspace, processes, memory protection, a scheduler | ⬜ none, by design so far |
@@ -52,28 +60,64 @@ Everything below is reproducible from a clean checkout on macOS + QEMU.
 | Check | Command | Result |
 |---|---|---|
 | Build | `make clean && make -j8` | clean; the only warning is the intentional RWX one |
-| Host unit tests | `make test-host` | **31 suites, 9,160,031 assertions, all pass** |
-| The same under ASan + UBSan | `make test-host-asan` | 31 suites pass |
+| Host unit tests | `make test-host` | **37 suites, 9,568,493 assertions, all pass** |
+| The same under ASan + UBSan | `make test-host-asan` | 37 suites pass |
 | Boot tests | `make test-qemu` | **6 / 6** |
 | Headless boot + screenshot | `./capture.sh 20` | reaches `> `, 0 panics |
 | The kernel knows nothing about sound cards | `make test-qemu` (`audio-unclaimed`) | two cards attached, both `driver=-`, nothing played |
+| ...and with real cards on a real boot | `QEMU_EXTRA="-audiodev none,id=a0 -device AC97,audiodev=a0 -device intel-hda -device hda-duplex,audiodev=a0" ./capture.sh 20` | both enumerate, both `driver=-`, zero audio lines in the log |
+| The kernel's own `vsnprintf` matches C99 | `make test-host` (`kfmt`) | 9,472 assertions, differential against the host libc |
+| No format string outside what it implements | `make test-qemu` (runs the lint first) | `lint_printf.py`: clean |
 | Real audio out of the driver VM | `vm/programs/capture_audio.sh` | 440 Hz then 660 Hz, measured from the captured WAV — needs `-DTALKOS_AC97_REFERENCE` |
 | The hardening build | `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS` | links, boots, verifies a live certificate |
 
-**The headline experiment, run once, live.** A default (audio-ignorant) kernel was
-booted with a sound card QEMU recorded to a WAV, and the operator typed one
-sentence: *"There is a sound card attached to this machine that you have no driver
-for. Write one and play me a 440 Hz tone."* The model called `driver_targets`,
-read the function's config space, wrote a bring-up program, had one rejected by
-the assembler, ran the corrected one, reasoned out a descriptor list from the
-published `audio_status` contract, checked it with the free `driver_assemble`,
-installed it with `driver_install`, and called `audio_tone`. The recording holds
-**exactly 1.000 s at 440.0 Hz** (Goertzel and zero-crossing agree; zero energy at
-220/660/880 Hz). No line of that driver exists in this repository.
+**The headline experiment, live.** A default (audio-ignorant) kernel was booted
+with a sound card QEMU recorded to a WAV, and the operator typed one sentence:
+*"there's a sound card in this machine with no driver. find it and write one,
+install it as the audio sink, then play me a 440 Hz tone."* The model called
+`driver_targets`, read the function's config space, wrote and ran a bring-up
+program, reasoned a descriptor list out of the published play contract, checked it
+with the free `driver_assemble`, installed it with `driver_install`, and called
+`audio_tone`. No line of that driver exists in this repository.
 
-That is one run. It is not a benchmark, it says nothing about how often it works,
-and the same turn evicted its own oldest exchange from memory four times while
-doing it (see the schema-budget note below).
+The recording is `vm/transcripts/ac97-reentry-fix.wav.txt`, with the serial log and
+a screenshot beside it. Measured, by `tests/qemu/wavcheck.py`:
+
+```
+captured    : 12046 frames = 0.251 s
+amplitude   : peak 7998 (asked for 8000)
+frequency   : 438.4 Hz by zero crossings, 440.4 Hz by Goertzel
+tonality    : 99.5% of energy at 440.4 Hz
+stereo      : left == right: True
+per 50 ms   : 440.0 Hz, tonal 100.0%, at every window
+```
+
+**It asked for 1000 ms and got 251 ms, and that is in the artifact rather than
+smoothed over.** The pitch, the amplitude and the purity are exactly right; the
+*length* is wrong, because the driver the model wrote uses one descriptor and this
+chip's length field is 16 bits — 44100 frames of stereo is 88200 samples, and
+88200 truncated to 16 bits is 22664, which is 0.257 s. That is a bug the model made
+*inside* the spec it had correctly worked out, and the fix is splitting the buffer
+across descriptors. The kernel cannot detect it: DMA is a read, so memory is
+unchanged either way, and the position counter that would settle it is device
+knowledge this kernel refuses to have. `audio_tone` therefore says on every VM-sink
+play that reaching `halt` is not proof of sound.
+
+An earlier attempt on the same prompt (`vm/transcripts/ac97-io-limit.log`) got as
+far as `driver_install` and then died on `IO_LIMIT`: the contract told it to poll
+until the device finished, and the budget it was given was sized for bring-up. That
+was a kernel gap, not a model error, and it is fixed — see the play-budget note
+below. A third attempt died to three consecutive upstream `529 Overloaded`
+responses, which is worth knowing before blaming the kernel for a silent WAV.
+
+These are single runs. They are not a benchmark, they say nothing about how often
+it works, and every one of them evicted its own oldest exchange from memory several
+times while doing it (see the schema-budget note below).
+
+For the record, the claim that used to be in this paragraph — "exactly 1.000 s at
+440.0 Hz ... zero energy at 220/660/880 Hz" — was not supported by any artifact in
+this repository. The longest 440-ish tone on disk is 500 ms at 81.6% tonality. It
+has been replaced with a measurement that has a file behind it.
 
 **What that does and does not prove.** The host suites are the real evidence: they
 drive whole jobs through the actual turn loop against a scripted transport
@@ -94,9 +138,11 @@ unchanged.
 ## ⚠️ Security caveat
 
 This kernel has **no isolation of any kind**: ring 0, no userspace, no memory
-protection, every page mapped read-write-execute, and a language model holding
-`mem_write` and a driver VM. See "Known weaknesses and things nobody has tested"
-at the end of this file for the whole list. The network-facing half is here.
+protection, no privilege separation, no IOMMU, every page mapped
+read-write-execute, and a language model holding `mem_write`, a driver VM, a
+writable disk, an agenda that acts unprompted, and the ability to rewrite the
+running kernel's `.text`. See "Known weaknesses and things nobody has tested" at
+the end of this file for the whole list. The network-facing half is here.
 
 **The default build does not authenticate the server.** TLS runs with
 `MBEDTLS_SSL_VERIFY_NONE` (`ALTCP_MBEDTLS_AUTHMODE 0` in `port/lwipopts.h`): the
@@ -344,7 +390,7 @@ read the brackets.
 
 ## The tool surface
 
-49 tools, assembled by the linker. A tool self-registers with `REGISTER_TOOL`
+61 tools, assembled by the linker. A tool self-registers with `REGISTER_TOOL`
 (`include/tool.h`) and `tools/*.c` is wildcarded into the build, so **adding a
 syscall to the model's surface means dropping in a `.c` file and editing nothing
 else at all** — no Makefile line, no central table.
@@ -363,6 +409,10 @@ power         power_info power_off power_reboot
 gui           gui_list gui_open gui_window gui_click
 apps          app  (launch / state / close / list / format / caps)
 agency        plan_set plan_mark plan_show action_log wait_ms
+network       net_fetch net_resolve net_probe net_status
+capabilities  capability_save capability_call capability_list capability_revert
+agenda        agenda_save agenda_list agenda_control
+repair        fault_status fault_history fault_decode fault_recover fault_patch
 ```
 
 Model input is untrusted and is read only through `net/json.c` (a hardened,
@@ -377,13 +427,25 @@ legible error the model can recover from on the next turn rather than a fault.
 this machine.** All tool schemas travel in every request. Two limits apply and the
 second is the one that bites:
 
-* `CHAT_TOOLS_BYTES` (40960) — if the array does not fit, `net/chat.c` offers the
+* `CHAT_TOOLS_BYTES` (57344) — if the array does not fit, `net/chat.c` offers the
   model **no tools at all**: the machine keeps booting and silently stops being
-  able to act. At 49 tools the schema is 39,125 bytes, so 1,835 bytes spare.
-* `CHAT_REQ_BYTES` (61440) — one request must hold that schema *plus* a full
-  history *plus* the system prompt. That sum is **61,415 of 61,440**: twenty-five
-  bytes. Past it the turn loop starts evicting the oldest exchange on every send,
-  which is the machine forgetting mid-job rather than failing loudly.
+  able to act. At 61 tools the schema is 53,021 bytes, so 4,323 bytes spare —
+  under two average tools. Read that number off the boot banner; never compute it.
+* `CHAT_REQ_BYTES` (86016) — one request must hold that schema *plus* a full
+  history *plus* the system prompt. Past it the turn loop starts evicting the
+  oldest exchange on every send, which is the machine forgetting mid-job rather
+  than failing loudly.
+
+**That "no tools at all" failure is not hypothetical — it happened during the work
+that produced this paragraph.** A four-verb tool family took the registry 86 bytes
+past `CHAT_TOOLS_BYTES`. The boot banner read `57 registered (0 bytes of schema)`,
+three QEMU cases failed, and the machine booted and talked and could do nothing
+whatever. Eighty-six bytes is the entire distance between a working agent and an
+inert one. The buffers were grown — for the **second** time — and `include/chat.h`
+now says plainly that a third time would be an admission that nobody intends to do
+the structural work. 61 tools averaging 869 bytes is roughly 14k tokens on every
+single request, on a machine whose whole point is a conversation. The real fix is
+to send the schema once per conversation rather than once per round, or to page it.
 
 This is not theoretical. The live driver-writing turn above evicted four times
 while it worked, and still finished. Adding the 49th tool cost ~900 bytes that had
@@ -561,7 +623,9 @@ to come from the model.**
 
 ```
 driver_targets    "here is an unclaimed PCI function, its BARs, and the exact
-                   sandbox a program would get"
+                   sandbox a program would get".  One row is up to 384 bytes and
+                   a tool result is 1024, so a listing PAGES: the footer says how
+                   many more matched and you call again with "offset".
 driver_run        bring the device up.  On entry:
                      r0-r5  this function's BAR bases
                      r6     its bdf (for the read-only pcicfg opcode)
@@ -579,6 +643,27 @@ Then `audio_tone` works, and so does `{"call":"audio.tone"}` in an app.
 `audio_status` prints that contract in full, paged, on request — it is not in any
 tool description, because descriptions are sent on every round and this is needed
 on one. The split is deliberate and the byte budget above is why.
+
+**Exactly one program runs at a time, and the VM enforces it.** `dvm_run()`
+refuses to be re-entered (`DVM_TRAP_REENTRY`). This matters because two pieces of
+machine state belong to "the run in progress" and there is one copy of each: the
+64 KiB scratch arena, which is zeroed at entry, and the DMA guard bands, which are
+re-poisoned at entry. A nested run therefore did not share them, it *destroyed*
+them mid-execution — silently emptying the outer program's working store, and
+wiping evidence of an overrun its device had already committed. That was reachable
+by the ordinary path: `sys audio.tone` from inside a `driver_run` program, once the
+sink is itself a driver program. It is now a refusal with a sentence saying to ask
+for the sound after the run instead. A *native* C sink is unaffected.
+
+**The play program's budgets are raised to fit the sound.** The policy a sink is
+registered with was sized for bring-up — 1024 device accesses — and the contract
+asks a play program to poll until the device has finished reading, which costs one
+access per poll. An 800 ms sound at one read per millisecond is 800 accesses, and a
+1 s sound is over the whole budget, so the documented instruction and the enforced
+limit disagreed and programs trapped with `IO_LIMIT` through no fault of their
+author. `core/audio.c` now raises both the delay budget and the access budget in
+proportion to the sound, on a copy of the policy, and the contract states both
+numbers and the poll shape that fits them.
 
 Two properties are worth calling out because they are what make the loop
 converge rather than flail. `driver_assemble` is free — it costs no hardware
@@ -628,9 +713,40 @@ is the only code in `apps/` that can cause a hardware effect: the runtime compil
 and evaluates, the broker decides what a capability is and performs it. A document
 can name a table entry and nothing else — there is no way to spell a function, a
 pointer, a handle, an address or a device. Out-of-range arguments are **refused,
-never clamped**, at most one sound starts every 500 ms machine-wide, and a handler
-only ever queues: the idle loop performs the call, so a click cannot stall the
-machine.
+never clamped**, and a handler only ever queues: the idle loop performs the call,
+so a click cannot stall the machine.
+
+Three properties here were stated as facts in the headers and were measurably
+false, so they are worth spelling out as they now actually are:
+
+* **The stall is bounded by measurement, not by `APP_CAP_AUDIO_MS_MAX`.** That
+  constant bounds the duration an app may *request*. It does not bound how long
+  performing the request *blocks*, and with the sink this project exists to produce
+  — a driver program — those differ: the program's delay budget is the sound plus a
+  250 ms margin, spent in a busy `mdelay()` that yields to nothing. A 200 ms app
+  tone was measured holding the machine for 450 ms, and because the old rate limit
+  was timed from when a sound *started*, that came out of the 500 ms gap. Measured
+  duty cycle with a driver blocking 4× what it was asked for: **99%**. The pump now
+  times every call and keeps the machine quiet for at least that long again plus
+  `APP_CAP_GAP_MS`, counted from when it finished. Same fixture, same driver: **38%**.
+* **No sound starts during a model turn — now because of the call graph.** That was
+  true while `app_tick()` was reached only from the idle loop. It stopped being true
+  when `app_tick()` became the body of the ui fiber, because `net_service()` yields
+  to that fiber on every pass of every network wait, and `app_tick()` ended with the
+  hardware pump: capability calls were firing inside TLS round trips. `apps/` now
+  publishes `app_tick_handlers()` (compute only) separately from `app_tick()`
+  (compute plus pump); the fiber calls the former, `wait_for_sentence()` the latter.
+* **Two documents both get a turn at the speaker.** There is one pending slot
+  machine-wide, deliberately. But `run_ticks()` used to scan the instance pool from
+  slot 0 every pass, and since every handler's first due time is 0 and equal-period
+  handlers share one clock reading, two identical documents were phase-locked for
+  ever: measured **132 sounds to 0** over 66 s. Worse, the refusal the starved one
+  got read as transient ("too soon"), so a model would back off — which could not
+  possibly help. The rotation now advances **on the grant**, so a document that has
+  just been heard goes last. Measured: 66/66, and 33 each with four documents.
+  Rotating on a timer instead does not work; any fixed stride aliases against the
+  tick period or the rate limit, and both simpler versions were measured still
+  starving one document.
 
 **Read that as a security boundary, because it is the only one.** This kernel is
 single-threaded and ring-0 only. There is no userspace, no processes, no memory
@@ -641,6 +757,190 @@ driver it is asking for. There is no MMU, ring transition or IOMMU behind
 enforcement**, and a bug in it is a bug with kernel privilege. The same is true of
 every tool in `tools/`. This is a machine to run in a VM, and the "Security
 caveat" section above is not boilerplate.
+
+## Autonomy: what this machine does that nobody asked for
+
+Four mechanisms landed on this branch, and every one of them exists because the
+machine was previously a very capable statue: it acted only when spoken to, forgot
+everything on reboot, and could extend itself in exactly one direction.
+
+### Concurrency, so the screen is not dead while it thinks
+
+`include/fiber.h` + `core/fiber.c` + `arch/x86_64/switch.asm`. Cooperative
+round-robin fibers over 8 slots. **No timer interrupt, no preemption, no locks** —
+IF is 0 on this machine and every device is polled, so a preemptive scheduler would
+need locking in a kernel that has none. `fiber_yield()` sits at the end of
+`net_service()`, the one point every network wait passes through with lwIP
+quiescent, and a `ui` fiber paints the screen while the model thinks. Measured:
+the ui fiber serviced the screen 56 times inside one 366 ms API call.
+
+Every created stack carries a 256-byte poison band at both ends, re-verified on
+**every** switch along with each saved stack pointer, so walking off the end is a
+named panic (`fiber "blowup" wrote into its low (overflow) poison band`) rather
+than silent heap corruption.
+
+Two honest limits:
+
+* **The root fiber has no band.** `boot/boot.asm` does not export its
+  `stack_bottom`/`stack_top`, so C cannot see the bounds of the 64 KiB boot stack.
+  Worse, the depth `fiber_report()` prints for it is **not a high-water mark**: it
+  is sampled only at yield points, and the root's deepest frames (the mbedTLS
+  handshake, inside `net_poll_rx()`) never yield. The printed figure is 656 bytes
+  on every boot; the true depth, read out of zeroed `.bss` after a real boot, is
+  5128. Directly below that stack are the 24 KiB of page tables providing the
+  identity map. Headroom is 8x, so this is a diagnostics gap and not a live
+  hazard — and the fix is one `global` line in `boot/boot.asm`.
+* **The keyboard is still unserviced during a turn.** Only `input_poll()` drains
+  the 8042 and it is called from the fiber that is sitting in the network wait.
+  Characters typed mid-turn queue and appear when the turn ends. Draining it from
+  the ui fiber would give one device two owners racing for keystrokes.
+
+### Persistence, so what it builds is still there tomorrow
+
+`drivers/block/ata.c` (ATA PIO, LBA28, no DMA, no IRQs, every wait
+deadline-bounded), `drivers/block/block.c` (validates every LBA and buffer before
+a driver sees it; a failed read returns an error, **never** a zero-filled buffer),
+and `fs/fat/` — FAT32 read/write with VFAT long names, subdirectories, truncate,
+unlink and its own mkfs, behind the existing `vnode_ops_t`. Mounted at `/disk`.
+FAT32 was chosen over something bespoke for one reason: **the operator can mount
+the image on their Mac**, and that works in both directions.
+
+The consistency guarantee, stated plainly, because there is no journal. It comes
+from write ORDER plus 512-byte sector atomicity: long-name and short directory
+records are written as one sector; data is written and flushed *before* the
+directory entry's size; truncate commits the smaller size first; unlink erases and
+flushes the entry before freeing clusters. So every file that existed before a
+crash is intact at its pre-crash size, and a file being written is at its old size
+or its new one — never the new size with a garbage tail.
+
+What that does **not** buy: clusters allocated-but-unlinked leak until reformat
+(there is no fsck), the last write before a crash can be lost entirely, a torn
+sector inside a directory is detected and skipped rather than repaired, and
+unlinking an open file is refused (ramfs allows it; here the allocator would hand
+those clusters to the next file).
+
+### A capability registry, so it does not rebuild what it already knows
+
+`include/capability.h` + `core/capability.c`. A capability is a named, documented
+program with a home on the disk (`/disk/cap/<name>.cap`: 16 hex digits of
+FNV-1a-64, a newline, then a JSON record read with `net/json.c`). One ABI for all
+of them — entry `r0..r5` are the declared parameters, halt `r0` is the result —
+so arity *is* the signature and a wrong count is refused, never padded. Two kinds:
+a **program** (driver-VM source) or a **compose** (an ordered list of calls to
+other capabilities, arguments wired from `$0`/`#1`/literals).
+
+The sandbox is the *absence* of a driver sandbox, not a weakened one: no ports, no
+MMIO, no PCI, no DMA. Five syscalls, with `fs.*` confined to a data root that is a
+**sibling** of the store, so a capability cannot rewrite the machine's
+capabilities — and that confinement lives in `vm/dvm.c`'s portable half, so a host
+test proves it rather than trusting the backend.
+
+**Discoverability was the part most likely to fail, and it is the load-bearing
+trick here.** The live list of saved capabilities is inside the tool schema, at the
+end of `capability_call`'s description, rebuilt whenever the registry changes. It is
+a **fixed 768 characters**, space-padded, free of `"`, `\` and control bytes, so the
+assembled schema size does not change when a capability is saved — which is what
+lets `CHAT_REGISTRY_BYTES` stay a compile-time constant while its contents come off
+a disk. A `_Static_assert` pins the pad literal and `capability_panel_check()`
+re-checks the rendered width at run time and prints both numbers.
+
+A cycle cannot hang the machine because a cycle can be paid for in four
+currencies, and all four decrease within one top-level call: depth 8 (kernel
+stack), 64 invocations (an unguarded tail-call loop), 2M VM steps and 1 s of delay
+summed across the **whole tree**.
+
+### An agenda, so it acts with nobody present
+
+`include/agenda.h` + `core/agenda.c`. A bounded, persistent list of things the
+machine does unasked — at boot, once, or on a period. An item either dispatches a
+registered tool with literal JSON arguments (the general case: the tool table *is*
+the syscall surface, so anything the model can do in a conversation can be
+scheduled) or hands a sentence to the turn loop as if typed.
+
+Every run is wrapped in a fault guard, so an unattended action cannot halt an
+unattended machine, and every run emits `[agenda.run ...]` before and
+`[agenda.done ...]` after, around the tool's own line — **an unattended action
+leaves more evidence than a watched one.**
+
+Seven bounds, because an autonomous loop can be paid for in seven different ways:
+items, period floor, per-item runs, per-boot runs, consecutive-failure retirement,
+one action per tick, and — the seventh, which the first six shared a blind spot
+about — **a tool whose success ends the boot may not be scheduled at all.**
+`power_off` and `power_reboot` are ordinary tools guarded only by
+`{"confirm":true}`; a `when=boot` item runs before the prompt exists and the store
+survives a power cycle, so one save was enough to make the machine switch itself
+off during every boot for ever, with no interface left to countermand it. That is
+refused in `validate()`, which the **store loader also calls**, so a store written
+by hand or by another build is disarmed on the way in and named as it is dropped.
+
+Which retirements survive a power cycle is a decision and not an accident:
+consecutive-failure and `once` are written to the store; `max_runs` and `boot` are
+deliberately per-boot, because a `when=boot` item must re-arm or it would run on
+exactly one boot in the machine's life.
+
+### Repairing itself
+
+`fault_guard_run(what, body, ctx)` is the third disposition, between "resumed" and
+"halted": it saves the callee-saved set, RSP and a resume address on its own frame,
+and a fatal fault below it is caught by the handler, which copies those into the
+live fault frame and returns — so the `IRETQ` lands back in `fault_guard_run()`
+returning `FAULT_GUARD_ESCAPED`. That is `setjmp`/`longjmp` with the CPU performing
+the `longjmp`, and it is what makes diagnosis possible at all: asking the model
+needs lwIP, mbedTLS and the heap, none of which may be entered from an exception
+handler. The handler still allocates nothing, touches no device and runs no network
+code — it patches a frame and returns.
+
+Every page here is RWX, so a function is a byte string the model can edit. Five
+gates on a patch, and the model is told all five: inside `[__text_start,
+__text_end)` (not the wider resume window, which admits `.rodata`); a **required**
+`expect` that must match the live bytes; the original span must decode to exactly
+`len` bytes via the instruction-length decoder; so must the replacement; and the
+originals are copied out before the first byte is written, so revert always works.
+**Nothing claims the new bytes are CORRECT** — only well-formed, in-bounds,
+boundary-exact and reversible, and the tool result says so.
+
+Observed live, with nothing typed: an agenda action divided by zero, the handler
+abandoned its call chain instead of halting, the kernel asked the model what
+happened, the model rewrote the faulting instruction in the running kernel's
+`.text`, and the next two scheduled runs completed without faulting. **That
+demonstration needs `-DTALKOS_REPAIR_DEMO`** — a machine whose only interface is a
+sentence must not carry a function with a deliberate bug in it, one hallucination
+away from the model. A default build links neither the bug nor the demo tool.
+
+Two limits worth stating. A guard now records **which stack** it was armed on and
+refuses an escape onto a different one (`guard-foreign`), because with fibers the
+handler's two bounds checks cannot tell stacks apart — every fiber stack is inside
+the single declared stack window, and the only thing preventing a cross-stack
+`IRETQ` was where the linker happened to put the heap. But the guard stack itself
+is still one global stack popped by index, so **a guard does not cover work the
+guarded action yielded into**: a fault while the ui fiber runs under a root-armed
+guard is refused, correctly, and the machine halts. The real fix is a guard stack
+per fiber. And the loop is one shot — it cannot read memory itself, ask a
+follow-up, or see whether its own patch worked; the next fault, or its absence, is
+the only feedback.
+
+## There is no C compiler on this machine
+
+Worth its own heading because it is the most likely thing for a reader to assume.
+**Nothing on this branch compiles C, and nothing can load compiled code.** There is
+no `cc_tools.c`, no assembler for machine code beyond the driver VM's own
+instruction set, no ELF loader and no relocation. Asked to write and compile a C
+function, the machine says so and then does the job in the VM instead — which is
+the honest answer, and it is the one it gave live.
+
+So "the model writes code that runs" means exactly one thing here: it authors
+programs in the driver VM's ISA (`include/dvm.h`), which the kernel assembles and
+interprets under a policy that bounds cycles, delay, I/O and DMA and traces every
+access. Those programs got general memory this branch — a 64 KiB scratch arena in
+its **own address space** (`mld`/`mst` take an offset, and no instruction turns an
+offset into a machine address), string ops over (offset, length) spans that are
+never NUL-terminated, and six deny-by-default syscalls. That is what makes a
+capability able to be something other than a device driver.
+
+The consequence for anyone reading the security section: **there is no
+compiled-code symbol table to be the boundary, because there is no compiled code.**
+The boundaries are the VM's policy, `apps/cap.c`'s argument validation, and the
+five gates on a `.text` patch. Nothing else.
 
 ## The driver model
 
@@ -790,7 +1090,23 @@ handed to a language model, bounded only by checks inside each tool.
 **The model can read the key out of RAM.** No memory protection plus `mem_read`
 means the `x-api-key` header sitting in `net.c`'s request buffer is reachable. The
 runtime injection work removed the key from five files on disk; it did not and
-cannot make RAM opaque.
+cannot make RAM opaque. `net_fetch` scans every assembled request for the live key
+and for any `sk-ant-` shaped token and refuses to send it — which stops the key
+leaving in one piece, and stops nothing else. A model that can read the key can
+still leak it a character per fetch, base64'd, or hidden in a path. No content
+filter stops a covert channel; the honest fix is that the key should not be
+readable by the model at all, which is a privilege question this machine has no
+mechanism for.
+
+**Anything with write access to `/disk` has write access to this kernel.** The
+capability store, the agenda and the boot log all live on a FAT32 volume the model
+can write through `write_file`, which has no reserved-path list. The store's
+checksums detect rot, not tampering. Two consequences were real defects and are
+fixed: a planted agenda item naming `power_off` at boot made the machine
+permanently unbootable, and stored filenames and boot-log lines were printed
+unescaped, so a 124-character log line could render a byte-exact forged kernel
+trace line in column zero. Both are now refused or defanged, and both are the shape
+of thing to look for next.
 
 **Certificate verification is off by default** (see the caveat above), so in a
 default build "the model" is whatever answers on 443. Everything a 4xx/5xx
@@ -798,6 +1114,18 @@ response prints is therefore treated as hostile and escaped, including the raw
 body — a `[` from the far end gets shifted out of column zero and a `\b` is
 rendered as `\x08`, because backspaces from column zero walk *up* into genuine
 trace lines and overwrite them.
+
+**No model has ever been observed doing several of the things this file claims are
+possible.** Verified live, with a real key, and readable in a serial log: writing an
+AC'97 driver from a sentence and playing a tone through it; writing, debugging and
+saving a capability, then reusing it after a power cycle; fetching a URL; refusing
+to compile C and doing the job in the VM instead; and — under
+`-DTALKOS_REPAIR_DEMO` — diagnosing a `#DE` and patching the running kernel's
+`.text`. **Not** verified with a live model: an agenda item authored by the model
+that reinstalls a *driver* at boot (the autonomous boot path is proven with a
+capability, and with a hand-planted store), a self-repair on a bug nobody planted,
+and a capability composition the model reached for on its own rather than
+re-implementing inline.
 
 **Never booted on physical hardware.** Everything here is QEMU. Several things
 would probably break on real silicon: e1000 MMIO goes through a write-back
@@ -810,14 +1138,61 @@ change long before that.
 **Interrupts are never enabled.** IF stays 0, all 16 PIC lines are masked, and
 everything is polled. An IDT exists and captures faults, which is why
 `fault_report` can say anything useful, but no device interrupt is serviced. The
-consequence a user sees: `chat_ask()` blocks for as long as the model takes, and
-during a turn the GUI does not repaint and mouse bytes are lost to the one-byte
-i8042 buffer. Nothing is corrupted — the decoder resynchronises — but a click
-during a turn does not happen. The fix is one line (`net_service()` should call
-`gui_tick()`) and has not been made; see the reasoning under "deliberately left
-in place" below. The same gap freezes an app's `tick` handler for the length of a
-round-trip: `wait_ms` pumps it, and the loop between sentences pumps it, but the
-transport does not, so a clock loses the seconds the model spends thinking.
+consequence a user sees: `chat_ask()` blocks for as long as the model takes.
+
+A long driver-VM program or an `mdelay()` still blocks everything: neither has a
+yield point, so a program near its cycle bound freezes the screen for its duration
+and can make a periodic agenda item arbitrarily late.
+
+The GUI half of that has been fixed, by fibers rather than by interrupts: the
+window manager and app tick handlers live in their own cooperative fiber
+(`core/fiber.c`), and `net_service()` yields to it on every pass of every network
+wait, so a clock keeps ticking and the screen keeps repainting during a model turn
+(measured: ~2000 fiber passes inside one 657 ms API call). The **keyboard** is
+still unserviced during a turn — only `input_poll()` drains it, from the fiber that
+is sitting in the network wait — so characters typed mid-turn queue in the 8042 and
+appear when the turn ends. Giving the keyboard its own fiber is the fix; two fibers
+draining one port would race for individual keystrokes, which is worse.
+
+That fiber also created a subtler bug worth recording, because it is the shape of
+mistake this arrangement invites. `app_tick()` ended with the capability pump — the
+one function in `apps/` that touches hardware — so making it the fiber's body meant
+model-authored documents started playing sounds *inside* TLS round trips, blocking
+lwIP, and silently falsified the safety property `apps/cap.c` and `include/app.h`
+both cite as the reason their design is safe. Anything a fiber calls runs during a
+model turn; `app_tick_handlers()` now exists so the fiber can run documents without
+being able to touch a device.
+
+**The kernel's formatter is not the host's, and for a long time nothing checked
+that.** The kernel has no libc; `lib/kfmt.c` is a reduced `vsnprintf`. Every host
+test suite links the *real* libc, so a format string the kernel could not render
+worked perfectly everywhere except in the binary that boots. It had no star width
+or precision, and `%.*s` — the only safe way to print a token that is not
+NUL-terminated — did not merely truncate: since `*` was never consumed, it printed
+the literal characters `%*s` **and shifted every later argument by one slot**. There
+were 27 such lines in `vm/dvm.c`, all of them assembler errors, i.e. the text a
+model reads to repair a driver it just wrote. Two consequences:
+
+* where a `%d` followed, it printed the token's *length*, so the kernel told the
+  model `register "%*s" does not exist (this machine has r0-r3)` on a machine with
+  sixteen registers, and `label too long (max 3 characters)` where the limit is 23 —
+  a fabricated hard number, stated as fact;
+* where a `%s` followed, it **dereferenced the token length as a pointer**. The low
+  4 GiB is mapped present and writable from physical 0, so this did not fault; it
+  read the real-mode interrupt vector table and pushed bytes like `0xf0` into a
+  model-facing string, which `net/json.c` passes through unescaped above `0x1f` —
+  invalid UTF-8 in the outgoing request body.
+
+The parser now implements both, so all 27 became correct at once. Two things
+followed that are worth more than the fix: `lib/kfmt.c` was split out of
+`lib/libc_shim.c` (which cannot be host-compiled — it needs `kmalloc`, `millis` and
+RDRAND) so that `tests/host/test_kfmt.c` can link the **real kernel formatter**
+alongside the host libc and diff them conversion by conversion; and that
+differential immediately found four more pre-existing divergences nobody had
+noticed, including negative numbers printing as `-    10320` instead of
+`    -10320` in every fixed-width column the kernel has ever produced. A reduced
+reimplementation of a standard interface needs a differential test against the
+standard, not a table of cases someone thought of.
 
 **`kmalloc` panics instead of returning NULL.** That makes every `ENOSPC` path in
 `fs/` and `tools/` unreachable today, and it means a large enough model-driven

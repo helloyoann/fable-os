@@ -35,6 +35,11 @@ extern const uint64_t isr_stub_table[IDT_ENTRIES];
  * facts rather than constants a refactor can invalidate. */
 extern char __bss_start[];
 extern char __bss_end[];
+/* The exact executable range, for live code patching only — see linker.ld and
+ * include/fault.h's fault_patch_apply(). Deliberately separate from the code
+ * range below, which is a plausibility test for return addresses and a superset. */
+extern char __text_start[];
+extern char __text_end[];
 #define KERNEL_IMAGE_BASE 0x0000000000100000ULL
 
 /* ====================================================================== */
@@ -266,6 +271,10 @@ static void window_fill(fault_window_t *w) {
      * span is provably backed RAM. */
     w->stack_lo = (uint64_t)(uintptr_t)__bss_start;
     w->stack_hi = (uint64_t)(uintptr_t)__bss_end;
+    /* Instructions, and nothing else. A live code patch is bounded by this and
+     * not by code_lo..code_hi, so a patch cannot land in .rodata or .data. */
+    w->text_lo  = (uint64_t)(uintptr_t)__text_start;
+    w->text_hi  = (uint64_t)(uintptr_t)__text_end;
 }
 
 /* ====================================================================== */
@@ -353,9 +362,40 @@ void isr_dispatch(fault_frame_t *frame) {
      * states what was decided — the operator and the model see one account. */
     fault_fix_t fix = fault_recover(frame, &w);
 
+    /* THE THIRD DISPOSITION. No plan could fix this in place — but if some
+     * caller wrapped what it was doing in a fault guard, the frame can be
+     * patched to return to THAT instead of halting the machine. The faulting
+     * call chain is abandoned, not resumed; fault.h states what that costs and
+     * bounds how often it may happen. This is what lets a fatal fault be
+     * diagnosed at all: the ask needs lwIP, mbedTLS and the heap, none of which
+     * may be entered from here, so the handler's job is to get back to normal
+     * kernel context and let somebody else do the asking.
+     *
+     * fault_escape() itself allocates nothing, touches no device and refuses
+     * unless the guard's saved RIP and RSP still pass their bounds checks. */
+    if (fix != FAULT_FIX_OK && fix != FAULT_FIX_TRAP) {
+        fault_fix_t esc = fault_escape(frame, &w);
+        /* THE REFUSAL IS THE INTERESTING HALF, and it used to be thrown away.
+         *
+         * Only FAULT_FIX_ESCAPED was looked at, so a guard that was armed and
+         * INTACT but refused — spent budget, a scribbled-on saved context, or a
+         * guard belonging to another fiber's stack — halted the machine under
+         * fault_recover()'s verdict, which is almost always "no-plan: no recovery
+         * plan was armed". That sentence is false in every one of those cases, it
+         * is the first thing the operator and the model both read, and it sends
+         * both of them looking for a missing plan rather than at the real reason.
+         *
+         * Only a genuine "there was no guard" is left as the recover verdict; every
+         * other outcome replaces it, because it is more specific than the thing it
+         * replaces. */
+        if (esc == FAULT_FIX_ESCAPED)         fix = FAULT_FIX_ESCAPED;
+        else if (esc != FAULT_FIX_NO_GUARD)   fix = esc;
+    }
+
     kputs(fault_last_report());
 
-    if (fix == FAULT_FIX_OK || fix == FAULT_FIX_TRAP) {
+    if (fix == FAULT_FIX_OK || fix == FAULT_FIX_TRAP ||
+        fix == FAULT_FIX_ESCAPED) {
         in_handler = 0;
         return;
     }

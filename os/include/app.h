@@ -219,17 +219,26 @@
  *
  *   NOT STALLING THE MACHINE. The event loop is polled, single-threaded, and the
  *   same loop serves the operator's prompt. So a handler never performs a call:
- *   app_cap_request() validates it and QUEUES it, and app_service() — which
- *   app_tick() calls from the idle loop — is the only code in apps/ that reaches
- *   a driver. A click therefore costs the same arithmetic time it did before this
- *   existed, and no sound starts while the machine is inside a model turn.
+ *   app_cap_request() validates it and QUEUES it, and app_service() is the only
+ *   code in apps/ that reaches a driver. A click therefore costs the same
+ *   arithmetic time it did before this existed.
+ *
+ *   No sound starts while the machine is inside a model turn — and that is now a
+ *   property of the call graph rather than a hope, which it briefly was not. The
+ *   pump is reached only from app_tick(), and app_tick() belongs to the IDLE loop;
+ *   kernel/main.c's ui fiber, which net/net.c yields to on every pass of every
+ *   network wait, calls app_tick_handlers() instead and so cannot perform
+ *   hardware. When those were one function, capability calls fired inside TLS
+ *   round trips.
  *
  *   The honest remainder: audio.h's play contract is SYNCHRONOUS, because the
  *   kernel refills the one PCM buffer for the next sound and cannot ask a device
- *   where it is reading. So the drain blocks for the length of the sound. That is
- *   the reason an app's tone is capped at 200 ms and rate-limited to one per
- *   500 ms: the worst case an app can impose on the prompt is 200 ms once every
- *   500 ms, which is the order of a single keystroke round trip, and the prompt
+ *   where it is reading. So the drain blocks — for the length of the sound with a
+ *   native sink, and for LONGER than that when the sink is a driver program, whose
+ *   polling budget is the sound plus AUDIO_PLAY_MARGIN_US. APP_CAP_AUDIO_MS_MAX
+ *   bounds what an app may ASK for; what bounds the stall is apps/cap.c measuring
+ *   each call and keeping the machine quiet for at least that long again
+ *   afterwards, so app sounds can never take as much as half of it. The prompt
  *   provably keeps answering (a sentence typed while a 120 ms sound repeats every
  *   second is echoed and answered between two sounds — measured, on a boot).
  *
@@ -465,21 +474,45 @@
 /* ---- capability calls (DECISION 4) ------------------------------------- */
 
 /* Longest sound one {"call":"audio.tone"} may ask for, in milliseconds, and the
- * minimum interval between two sounds the kernel will START, machine-wide.
+ * minimum QUIET INTERVAL the kernel keeps after one finishes, machine-wide.
  *
- * 200 AND 500 ARE A DUTY CYCLE, NOT A TASTE. audio.h's play contract is
- * synchronous — a driver's play() must not return until the device has finished
- * reading the buffer, because the kernel refills it for the next sound — so the
- * time a sound takes is time the single-threaded polled loop is not answering the
- * prompt. These two numbers bound that to 200 ms in any 500 ms, i.e. at most 40%
- * of the machine, in slices no longer than one keystroke round trip. That is why
- * an app's tone is capped far below audio.h's own AUDIO_MAX_MS (1000): a UI beep
+ * READ THIS BEFORE TRUSTING EITHER NUMBER. audio.h's play contract is synchronous
+ * — a driver's play() must not return until the device has finished reading the
+ * buffer, because the kernel refills it for the next sound — so the time a sound
+ * takes is time the single-threaded polled loop is not answering the prompt.
+ *
+ * APP_CAP_AUDIO_MS_MAX BOUNDS THE DURATION AN APP MAY ASK FOR. IT DOES NOT BOUND
+ * HOW LONG THE MACHINE BLOCKS. This header used to say the two constants bounded
+ * the stall to "200 ms in any 500 ms, i.e. at most 40% of the machine", and that
+ * was measurably false in the configuration this project exists to produce. When
+ * the audio sink is a driver program the model wrote, core/audio.c's run_vm()
+ * raises that program's cumulative delay budget to the sound's length PLUS
+ * AUDIO_PLAY_MARGIN_US (250 ms), and the program spends it polling the device
+ * with mdelay(), which yields to nothing. A 200 ms app tone was measured holding
+ * the machine for 450 ms, and because the old interval was timed from the moment
+ * a sound STARTED, that 450 ms came out of the 500 ms gap: 90% of the machine,
+ * not 40%.
+ *
+ * WHAT ACTUALLY BOUNDS IT NOW is measurement, in apps/cap.c: the pump reads the
+ * clock either side of every call, and refuses the next one until the machine has
+ * been free for at least as long as the last call blocked, PLUS APP_CAP_GAP_MS,
+ * counted from the moment it finished. So the worst-case duty cycle is
+ * block/(2*block + 500) — strictly under half however slow a driver is, and under
+ * 4% for the 20-150 ms beeps a document actually asks for. A slow driver buys
+ * itself a longer silence rather than a bigger share of the machine.
+ *
+ * APP_CAP_AUDIO_MS_MAX is still worth having, and is still far below audio.h's
+ * own AUDIO_MAX_MS (1000), because it bounds the size of a single slice: a UI beep
  * is 60-150 ms, and a sound long enough to be music is the model's own audio_tone
- * tool, which is a traced tool call and not on this path. Raising either number
- * without an asynchronous audio service makes the prompt visibly sluggish, which
- * is why the reasoning is here rather than in the constant. */
+ * tool, which is a traced tool call and not on this path.
+ *
+ * APP_CAP_QUIET_MAX_MS is the ceiling on a measured interval. A clock that jumps,
+ * or a driver that spins its whole budget, must not be able to mute every app for
+ * the rest of the boot; 4 s is well past any legitimate play and short enough that
+ * a document recovers on its own. */
 #define APP_CAP_AUDIO_MS_MAX  200u
 #define APP_CAP_GAP_MS        500u
+#define APP_CAP_QUIET_MAX_MS  4000u
 
 #define APP_MAX_SELECTORS   8       /* names/tags one handler may bind        */
 #define APP_MAX_STMTS       128
@@ -585,6 +618,17 @@ int app_launch(const char *doc, size_t len, int32_t x, int32_t y,
  * than freezing until the clock catches up. */
 int app_tick(void);
 
+/* The tick handlers WITHOUT the capability pump: computation and widget text
+ * only, no device access, no blocking, bounded by the same per-handler step
+ * budgets as app_tick().
+ *
+ * This exists so that a caller running inside a network wait can keep documents
+ * alive without also performing hardware. kernel/main.c's ui fiber is exactly
+ * that caller: net/net.c's net_service() yields to it on every pass of every
+ * network wait, so anything it calls runs DURING a model turn. Use this there,
+ * and app_tick() (or app_service()) from the idle loop. See app_service(). */
+int app_tick_handlers(void);
+
 /* ====================================================================== */
 /* the capability pump                                                    */
 /* ====================================================================== */
@@ -594,17 +638,27 @@ int app_tick(void);
  * EFFECT — a handler queues, this performs — which is what makes "a click cannot
  * block the prompt" a property of the call graph rather than a promise.
  *
- * WHERE IT BELONGS: nowhere new. app_tick() calls it, after the tick handlers, so
- * the loop in kernel/main.c's wait_for_sentence() needs no change, and a sound
- * therefore starts between two input polls and never during a model turn. It is
- * public because that placement is a decision the owner of the loop may want to
- * make differently; a second call site is harmless, since with nothing queued this
- * reads one flag and returns 0.
+ * WHERE IT BELONGS, AND WHERE IT MUST NOT GO. app_tick() calls it, and app_tick()
+ * belongs in the IDLE loop (kernel/main.c's wait_for_sentence()), so a sound
+ * starts between two input polls. It must NOT be reached from a fiber that runs
+ * inside a network wait, because net/net.c's net_service() yields to such a fiber
+ * on every pass of a DNS lookup or a model turn — which is how this invariant was
+ * broken once already, when app_tick() became the ui fiber's body and capability
+ * calls started firing inside TLS round trips. That is what app_tick_handlers()
+ * is for. A second call site in a non-waiting loop is harmless: with nothing
+ * queued this reads one flag and returns 0.
  *
- * IT CAN BLOCK FOR THE LENGTH OF ONE SOUND, which is the one thing to know before
- * moving it: audio.h's play path is synchronous, so this returns when the device
- * has finished reading. APP_CAP_AUDIO_MS_MAX and APP_CAP_GAP_MS bound that to
- * 200 ms in any 500 ms — see DECISION 4. */
+ * IT CAN BLOCK, and for LONGER THAN THE SOUND IT PLAYS. audio.h's play path is
+ * synchronous, so this returns only when the device has finished reading — and
+ * when the audio sink is a driver program (the normal outcome of driver_install),
+ * that program polls the device under a delay budget of the sound's length PLUS
+ * AUDIO_PLAY_MARGIN_US, so a 200 ms sound can hold the machine for 450 ms.
+ * APP_CAP_AUDIO_MS_MAX bounds the DURATION REQUESTED; it does not bound the
+ * blocking time, and those are not the same number. What bounds the blocking time
+ * is apps/cap.c's duty-cycle rule: the pump MEASURES how long each call blocked
+ * and then refuses the next one until the machine has been free for at least that
+ * long again, on top of APP_CAP_GAP_MS. So app sounds can never occupy as much as
+ * half the machine, whatever a driver does — see DECISION 4. */
 int app_service(void);
 
 /* The capability specification a model reads, generated from the same table the

@@ -6,9 +6,16 @@ input path. You type what you want done and the kernel acts on the machine.
 
 The kernel does its own DNS and its own TLS, in ring 0, with mbedTLS and lwIP
 compiled into `kernel.bin` and no host proxy of any kind, and it gives the model
-**45 real syscalls** into itself: a VFS, the device tree, PCI config space,
-physical memory, the framebuffer console, a window manager, an app runtime, the
-CMOS clock, a bounded driver VM, and ACPI power control.
+**61 real syscalls** into itself: a VFS, a FAT32 disk, the device tree, PCI config
+space, physical memory, the framebuffer console, a window manager, an app runtime,
+the CMOS clock, a bounded driver VM, HTTP(S) fetch, ACPI power control, a registry
+of capabilities it has taught itself, a schedule of things it does unprompted, and
+the ability to rewrite its own running machine code.
+
+It is also **awake**. It keeps what it builds across a power cycle, paints the
+screen while it is thinking, acts at boot with nobody at the keyboard, and — when
+an unattended action takes a fatal CPU fault — survives it, asks the model what
+happened, and patches the faulting instruction out of the running kernel.
 
 It really does work end to end. With a key in `os/.env`:
 
@@ -37,6 +44,42 @@ That is one real boot: the `[bracketed]` lines are this kernel printing what it
 dispatched, and a screenshot of that session shows the calculator's display
 reading `15` with the text console composited around it.
 
+And this is two boots, on the same disk, with the machine switched off in between —
+which is the whole of what "awake" means here:
+
+```
+> I need to test whether a number is a perfect square. Make that something this
+  machine can just do from now on, and check 10201 for me.
+I'll build this as a saved capability so it persists across reboots. Let me first
+check what's already saved.
+[cap.list -> 0]
+... (writes a bisection square root, finds its own infinite loop, fixes it) ...
+[cap.save is_perfect_square program -> 1]
+[cap.call is_perfect_square v1 depth=0 -> 1]
+Yes, 10201 is a perfect square (101²), and this machine now has a saved capability
+called is_perfect_square(n) that returns 1 or 0 and survives reboots.
+
+--- power off, power on ---
+capability: 1 loaded from /disk/cap (survives a reboot)
+
+> Is 46656 a perfect square?
+[cap.call is_perfect_square v1 depth=0 -> 1]
+Yes — 46656 is a perfect square (216² = 46656).
+```
+
+The second boot writes no program and assembles nothing. It read the capability
+off a FAT32 disk this kernel formatted, saw it advertised in its own tool schema,
+and called it. With **no key at all** and nobody typing, a scheduled item runs the
+same capability before the prompt is printed:
+
+```
+agenda: 1 item(s) loaded from /disk/agenda.json (survives a reboot)
+[agenda.run selfcheck boot tool runs=1 -> ok]
+[cap.call is_perfect_square v1 depth=0 -> 1]
+[agenda.done selfcheck ok -> 1]
+agenda: 1 boot item(s) ran before anyone typed anything
+```
+
 Two things it is important to be straight about up front:
 
 * **The model's replies cannot be trusted, and the kernel says so structurally.**
@@ -45,11 +88,17 @@ Two things it is important to be straight about up front:
   trail there is, so it is enforced rather than promised — see
   "The trust model" in `os/README.md`.
 * **A live model has driven tools, but almost nothing is *proven* that way.** The
-  transcript above is a handful of turns. What holds the tools up is 9,143,897
-  host assertions (`make test-host`, also green under ASan + UBSan) against a
-  scripted transport (`os/net/model_mock.c`) and four QEMU boot tests — not a live model's judgement, which nobody has characterised
-  here at any scale. Assume the failure modes of the 45-tool surface under an
-  adversarial or confused model are unexplored, because they are.
+  transcripts here are a handful of turns. What holds the tools up is millions of
+  host assertions (`make test-host` — 38 suites, also green under ASan + UBSan)
+  against a scripted transport (`os/net/model_mock.c`) and six QEMU boot tests —
+  not a live model's judgement, which nobody has characterised here at any scale.
+  Assume the failure modes of the 61-tool surface under an adversarial or confused
+  model are unexplored, because they are.
+* **There is no C compiler, and nothing can load compiled code.** When this
+  machine "writes code", it writes programs in a small bounded VM's own
+  instruction set, which the kernel assembles and interprets — not C, not machine
+  code, no ELF loader, no linker. Asked to compile a C function it says so and
+  does the job in the VM instead.
 
 Built and run on macOS via QEMU. Never booted on physical hardware.
 
@@ -130,16 +179,33 @@ RDRAND is absent — with no entropy accounting and no health tests. Functional,
 not a vetted CSPRNG.
 
 **There is no isolation of any kind, and that is the largest caveat here.** One
-CPU, ring 0, no userspace, no scheduler, no memory protection: every tool call
-runs in the kernel's own address space, and all pages are mapped read-write-EXECUTE
-(the `LOAD segment with RWX permissions` link warning is expected and intentional).
-A null dereference does not even fault, because the low 4 GiB is mapped writable
-and page 0 shares its huge page with the video framebuffer. The model is handed
-`mem_read`, `mem_write` and a driver VM that can touch I/O ports, so a model that
-is wrong in the right place can corrupt the machine — and can in principle read
-the API key out of RAM. The mitigations are bounds checks, allowlists and cycle
-limits inside each tool, not hardware. Do not run this on anything you care
-about, and do not expose it to input you did not type.
+CPU, ring 0, no userspace, no privilege separation, no memory protection, no IOMMU.
+Every tool call runs in the kernel's own address space, and all pages are mapped
+read-write-EXECUTE (the `LOAD segment with RWX permissions` link warning is expected
+and intentional — it is also what makes generated code callable). A null dereference
+does not even fault, because the low 4 GiB is mapped writable and page 0 shares its
+huge page with the video framebuffer. The model is handed `mem_read`, `mem_write`, a
+driver VM that can touch I/O ports and program DMA, a writable disk, a schedule that
+runs unprompted, and a tool that edits the running kernel's `.text`. **There is no
+compiled-code symbol table acting as a boundary, because there is no compiled
+code**: the boundaries are the VM's policy, the argument validation in `apps/cap.c`,
+and five gates on a code patch — bounds checks and allowlists inside each tool, not
+hardware. A model that is wrong in the right place can corrupt the machine.
+
+Two specific consequences, both of which were real defects found by reviewing this
+branch rather than hypotheticals:
+
+* **Anything with write access to the disk has write access to this kernel.** The
+  capability store, the schedule and the boot log are files the model itself can
+  write. A scheduled `power_off` at boot made the machine permanently unbootable
+  with no interface left to countermand it; that specific case is now refused both
+  when dictated and when read off a disk, but the class remains.
+* **The key is readable from RAM and cannot be made otherwise here.** The outbound
+  request scanner refuses to send anything key-shaped, which stops it leaving in one
+  piece and stops nothing else — no content filter stops a covert channel.
+
+Do not run this on anything you care about, and do not expose it to input you did
+not type.
 
 See `os/README.md` for the driver model, the trust model, the GUI, the app format,
 the TLS build, and what is and is not tested.

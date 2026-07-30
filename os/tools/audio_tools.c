@@ -525,10 +525,34 @@ static int t_audio_tone(const tool_call_t *c, tool_result_t *r) {
         "played %lu Hz %s for %lu ms at amplitude %lu: %lu frames through sink "
         "\"%s\"\n", (unsigned long)hz, audio_wave_name(wave), (unsigned long)ms,
         (unsigned long)amp, (unsigned long)s.frames_last, s.name);
-    if (s.kind == AUDIO_SINK_VM && s.vm_ran)
+    if (s.kind == AUDIO_SINK_VM && s.vm_ran) {
         tool_result_printf(r, "the play program ran %lu steps and made %lu device "
                               "accesses\n",
                            (unsigned long)s.vm_steps, (unsigned long)s.vm_io_ops);
+        /* WHAT "played" ABOVE ACTUALLY MEANS, said here because a live model got
+         * it wrong in the only way that matters. On an intel-hda machine a play
+         * program reached `halt` having touched the device 20 times; this tool
+         * returned 9600 frames, the app that called it logged `-> ok`, and the
+         * model told the operator it had just heard a 440 Hz note. QEMU's wav
+         * backend had captured ZERO frames. Nothing had reached the codec.
+         *
+         * The kernel cannot close that gap for a VM sink, and pretending
+         * otherwise is worse than admitting it. Success here means the program
+         * ran to completion and touched the device — that is the entire test.
+         * There is no way to ask a device "did you emit sound", the DMA buffer is
+         * READ by the engine so memory is unchanged whether it read or not, and
+         * the position counter that would settle it is device-specific knowledge
+         * this kernel deliberately does not have. The one honest move is to say
+         * so, in the result, every time, so the claim the model passes on to a
+         * human is calibrated to what was actually established. */
+        tool_result_printf(r,
+            "NOT PROOF OF SOUND: this says the play program ran and touched the "
+            "device, which is all the kernel can check. A program that programs "
+            "the wrong registers and waits out the duration looks exactly like "
+            "this. If you cannot confirm the device is really streaming (a "
+            "position counter that advances, a status bit that changes while it "
+            "plays), say the sound is unverified rather than that it played.\n");
+    }
 
     trace_ret((long)s.frames_last, "audio_tone",
               "hz=%lu ms=%lu wave=%s amp=%lu sink=%s",

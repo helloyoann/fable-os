@@ -167,6 +167,40 @@ static void inject_pf(void) {
     inject(14, 0x2, INSN_MOV_STORE, sizeof INSN_MOV_STORE, 1);
 }
 
+/* The same fault at a DIFFERENT address each time.
+ *
+ * net/faultchat.c bounds diagnoses two independent ways — per boot
+ * (FAULTCHAT_MAX_DIAGNOSES) and per faulting address (FAULTCHAT_MAX_PER_RIP) —
+ * and the second is much tighter. A storm at ONE address is stopped by the
+ * per-address bound long before the per-boot budget is reached, so a test that
+ * wants to exercise the per-boot budget has to move the fault around. That is
+ * not a workaround: it is the two bounds doing different jobs, and each one is
+ * asserted separately below. */
+static unsigned storm_slot;
+
+static void inject_pf_elsewhere(void) {
+    unsigned off = 128 + (storm_slot++ % 16u) * 16u;
+    memcpy(code_area + off, INSN_MOV_STORE, sizeof INSN_MOV_STORE);
+
+    fault_plan_t survive = { .action = FAULT_ACT_SKIP, .any_vector = 1,
+                             .uses = 1 };
+    fault_plan_arm(&survive);
+
+    fault_frame_t f;
+    memset(&f, 0, sizeof f);
+    f.vector     = 14;
+    f.error_code = 0x2;
+    f.rip        = W.code_lo + off;
+    f.rsp        = W.stack_lo + 8 * 8;
+    f.rbp        = build_chain();
+    f.cs         = 0x08;
+    f.rflags     = 0x2;
+
+    fault_note(&f, &W, 7);
+    fault_recover(&f, &W);
+    fault_plan_clear();
+}
+
 /* ====================================================================== */
 /* building Messages API response bodies                                  */
 /* ====================================================================== */
@@ -192,6 +226,7 @@ static const char *reply_body(const char *text) {
 
 static void setup(void) {
     fault_reset();               /* also clears the window and the plan */
+    storm_slot = 0;
     arena_init();
     model_mock_reset();
     faultchat_bind(model_mock_transport());
@@ -282,7 +317,13 @@ static void test_prompt_carries_what_a_model_needs(void) {
 
     /* --- the answer contract, restated --- */
     CHECK_CONTAINS(prompt, "ANSWER WITH ONE JSON OBJECT");
-    CHECK_CONTAINS(prompt, "Omit it unless");
+    CHECK_CONTAINS(prompt, "Omit them unless");
+    /* And the other half of the contract, added when the loop was closed: a
+     * recovery plan changes what happens at the NEXT fault, while a code patch
+     * removes the instruction that caused this one. A model that is not told the
+     * difference cannot choose between them. */
+    CHECK_CONTAINS(prompt, "CAN THIS BE PATCHED OUT?");
+    CHECK_CONTAINS(prompt, "to remove the faulting instruction for good");
 
     printf("      prompt is %u bytes; %u spare in FAULTCHAT_PROMPT_MAX\n",
            (unsigned)n, (unsigned)(sizeof prompt - n));
@@ -721,7 +762,9 @@ static void test_pump_with_a_diagnosis_and_no_fix(void) {
     CHECK_EQ(faultchat_pump(), FAULTCHAT_OK);
     CHECK(fault_plan_get() == NULL);
     CHECK_EQ(faultchat_fixes_armed(), 0);
-    CHECK_CONTAINS(kcap_text(), "proposed no fix, which is a complete answer");
+    CHECK_CONTAINS(kcap_text(),
+                   "proposed neither a fix nor a code patch, which is a "
+                   "complete answer");
 }
 
 static void test_pump_when_the_model_refuses(void) {
@@ -750,15 +793,41 @@ static void test_pump_without_a_transport(void) {
     CHECK_EQ(faultchat_pump(), FAULTCHAT_ENONE);
 
     /* And it costs budget. Without that, a machine with no network and a fault
-     * storm announces every single one of them for the rest of the boot. */
+     * storm announces every single one of them for the rest of the boot. Budget
+     * is spent on the ATTEMPT, not on the send, which is exactly why a machine
+     * with no transport is bounded at all. */
     CHECK_EQ(faultchat_diagnoses(), 1);
     for (unsigned i = 1; i < FAULTCHAT_MAX_DIAGNOSES; i++) {
+        inject_pf_elsewhere();
+        CHECK_EQ(faultchat_pump(), FAULTCHAT_ETRANSPORT);
+    }
+    inject_pf_elsewhere();
+    CHECK_EQ(faultchat_pump(), FAULTCHAT_EOFF);
+    CHECK_EQ(faultchat_disabled(), 1);
+}
+
+/* The tighter of the two bounds, on its own. A storm at ONE address is a machine
+ * failing to make progress rather than a machine with many problems, and every
+ * round of it is a paid API call, so it is capped well below the per-boot
+ * budget — and NOT by latching the whole feature off, because giving up on one
+ * bug is not the same as giving up on the machine. */
+static void test_pump_gives_up_on_one_address_but_not_on_the_machine(void) {
+    setup();
+    faultchat_bind(NULL);
+
+    for (unsigned i = 0; i < FAULTCHAT_MAX_PER_RIP; i++) {
         inject_pf();
         CHECK_EQ(faultchat_pump(), FAULTCHAT_ETRANSPORT);
     }
     inject_pf();
     CHECK_EQ(faultchat_pump(), FAULTCHAT_EOFF);
-    CHECK_EQ(faultchat_disabled(), 1);
+    CHECK_CONTAINS(kcap_text(), "already asked about");
+    CHECK_EQ(faultchat_diagnoses(), FAULTCHAT_MAX_PER_RIP);
+    /* Not latched: a fault somewhere else still gets asked about. */
+    CHECK_EQ(faultchat_disabled(), 0);
+    inject_pf_elsewhere();
+    CHECK_EQ(faultchat_pump(), FAULTCHAT_ETRANSPORT);
+    CHECK_EQ(faultchat_diagnoses(), FAULTCHAT_MAX_PER_RIP + 1);
 }
 
 static void test_pump_transport_and_http_failures(void) {
@@ -827,14 +896,17 @@ static void test_pump_with_a_refused_fix(void) {
 
 static void test_pump_budget_is_finite(void) {
     setup();
+    /* A different address every round, so what is being measured here is the
+     * PER-BOOT budget and not the tighter per-address one (which has its own
+     * test above). */
     for (unsigned i = 0; i < FAULTCHAT_MAX_DIAGNOSES; i++) {
-        inject_pf();
+        inject_pf_elsewhere();
         model_mock_queue(200, reply_body("{\"diagnosis\":\"again\"}"));
         CHECK_EQ(faultchat_pump(), FAULTCHAT_OK);
     }
     CHECK_EQ(faultchat_diagnoses(), FAULTCHAT_MAX_DIAGNOSES);
 
-    inject_pf();
+    inject_pf_elsewhere();
     CHECK_EQ(faultchat_pending(), 0);
     CHECK_EQ(faultchat_pump(), FAULTCHAT_EOFF);
     CHECK_CONTAINS(kcap_text(), "already spent its");
@@ -842,7 +914,7 @@ static void test_pump_budget_is_finite(void) {
     CHECK_CONTAINS(faultchat_disabled_reason(), "budget");
     /* And it stays off: no further request is built. */
     size_t sent = model_mock_request_count();
-    inject_pf();
+    inject_pf_elsewhere();
     CHECK_EQ(faultchat_pump(), FAULTCHAT_EOFF);
     CHECK_EQ(model_mock_request_count(), sent);
 }
@@ -1107,6 +1179,7 @@ int main(void) {
     RUN(test_pump_transport_and_http_failures);
     RUN(test_pump_with_an_unintelligible_reply);
     RUN(test_pump_with_a_refused_fix);
+    RUN(test_pump_gives_up_on_one_address_but_not_on_the_machine);
     RUN(test_pump_budget_is_finite);
     RUN(test_enable_switch);
 

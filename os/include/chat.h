@@ -185,56 +185,74 @@
  * is the right failure but it is a total one, so the bound is kept ahead of the
  * registry deliberately.
  *
- * THE CLIFF THIS IS APPROACHING, stated so the next agent to add a family does
- * not discover it at boot. One request must hold this schema, the system prompt
- * and the history (up to CHAT_HISTORY_BYTES), inside CHAT_REQ_BYTES, which in
- * turn must stay inside net/net.c's 64 KiB HTTP framing buffer:
+ * THE CLIFF THIS WAS ON, and how it was paid for rather than shaved.
+ * One request must hold this schema, the system prompt and the history (up to
+ * CHAT_HISTORY_BYTES), inside CHAT_REQ_BYTES, which in turn must stay inside
+ * net/net.c's HTTP framing buffer. At 49 tools those numbers were
  *
- *     40960 (tools) + 16384 (history) + 4333 (prompt) + ~1400 (framing)
- *   = 63077, against CHAT_REQ_BYTES = 61440
+ *     39125 + 16384 + 4506 + 1400 = 61415 of CHAT_REQ_BYTES = 61440
  *
- * So at this size a MAXIMAL schema plus a FULL history already spills, and the
- * loop handles that the documented way — it drops the oldest exchange and
- * rebuilds. Growing this further therefore does not just cost BSS: past roughly
- * 52 tools the machine starts forgetting mid-job on every long conversation, and
- * the fix is not another constant here. It is either a bigger request buffer in
- * net/net.c (owned elsewhere) or sending the schema more cleverly than in full
- * on every round.
+ * i.e. TWENTY-FIVE bytes of slack in the worst-case request, against a framing
+ * buffer of 64 KiB. The paragraph that used to live here said, correctly, that
+ * tool 50 could not be paid for by cutting prose again and that the STRUCTURE
+ * had to change first: "send the schema once per conversation rather than once
+ * per round, or page it, or grow net/net.c's framing buffer so CHAT_REQ_BYTES
+ * can move."
+ *
+ * The network tool family (tools/net_tools.c, four verbs, ~3 KiB of schema) is
+ * the change that needed it, and the third option is the one that was taken,
+ * because it is the only one of the three that is a size change rather than a
+ * protocol change:
+ *
+ *     net/net.c   TLS_REQ_BYTES   65536 -> 81920   (the framing buffer)
+ *     here        CHAT_REQ_BYTES  61440 -> 77824
+ *     here        CHAT_TOOLS_BYTES 40960 -> 49152
+ *
+ * AND IT HAD TO BE PAID AGAIN, ONCE, WITH THE MACHINE DEAD IN BETWEEN. Read this
+ * before adding a tool family, because it is what the failure actually looks like.
+ * A capability family (core/capability.c + tools/capability_tools.c, four verbs)
+ * took the registry from 42909 to 49238 bytes — 86 bytes OVER CHAT_TOOLS_BYTES.
+ * The overflow is not a truncation: net/chat.c's tools_load() sets tools_len = 0
+ * and the model is then offered NO TOOLS AT ALL, so the machine boots, talks, and
+ * can do nothing whatever. The boot banner read "57 registered (0 bytes of
+ * schema)" and three QEMU cases failed on it. Eighty-six bytes is the whole
+ * distance between a working agent and an inert one, which is the argument for
+ * keeping real slack rather than the minimum that fits:
+ *
+ *     net/net.c   TLS_REQ_BYTES   81920 -> 90112
+ *     here        CHAT_REQ_BYTES  77824 -> 86016
+ *     here        CHAT_TOOLS_BYTES 49152 -> 57344
+ *
+ * The worst case is now 57344 + 16384 + 4506 + 1400 = 79634 of 86016, i.e. 6382
+ * bytes of real slack in the request, with 8172 bytes spare inside
+ * CHAT_TOOLS_BYTES itself; net/net.c carries a _Static_assert that its buffer
+ * still holds CHAT_REQ_BYTES plus headers, so the two numbers cannot drift apart
+ * silently the way this comment's predecessor did. The cost is ~24 KiB more BSS on
+ * a machine with 128 MiB.
+ *
+ * WHAT THAT DOES NOT BUY. It buys ROOM, not a different design. The schema is
+ * still retransmitted in full on every round of every turn, so the real cost of
+ * tool 57 is paid in tokens and latency on every request, and the structural fix
+ * (send it once, or page it) is still the right one. This is the SECOND time the
+ * buffers have been grown to pay for a tool family, and growing them a third time
+ * would be an admission that nobody intends to do the structural work: 57 tools
+ * averaging 863 bytes of schema is already ~13k tokens on every single request, on
+ * a machine whose whole point is a conversation. Read the two numbers below
+ * together before adding a family: the binding limit is whichever is closer.
  *
  * WHERE THE REGISTRY ACTUALLY IS, so nobody re-derives it from a stale comment.
- * The boot banner prints the truth ("tools : 45 registered (N bytes of
- * schema)"), and that number lives in exactly one place in this tree — the
- * constant below — which tests/host/test_app.c, tests/host/test_agency.c and
- * tests/qemu/harness.py all read. Against that REAL total the request is
+ * The boot banner prints the truth ("tools : N registered (M bytes of schema)"),
+ * and that number lives in exactly one place in this tree — CHAT_REGISTRY_BYTES
+ * below — which tests/host/test_app.c, tests/host/test_agency.c and
+ * tests/qemu/harness.py all read, and which `make test-qemu` FAILS on if the
+ * kernel disagrees with it.
  *
- *     39125 + 16384 + 4506 + 1400 = 61415 of 61440   ->   25 bytes of slack
- *
- * and CHAT_TOOLS_BYTES has 1835 bytes free. READ THOSE TWO NUMBERS TOGETHER: the
- * binding limit is the 25, not the 1835. It is possible to add a description that
- * fits CHAT_TOOLS_BYTES comfortably and still push the worst-case request past
- * CHAT_REQ_BYTES, and that is where the machine starts forgetting mid-job.
- *
- * 25 BYTES IS NOT HEADROOM, IT IS THE CLIFF EDGE. The 49th tool (driver_install,
- * the step that turns a driver a model just wrote into this machine's audio
- * output) cost ~900 bytes and could only be paid for by taking the same number
- * back out of nine other descriptions — deleting a false claim about the screen
- * size, a lecture on console geometry repeated in three tools, and prose that
- * said twice what it needed to say once. That worked, and it will not work again.
- * The next family cannot be paid for this way: the remaining descriptions are at
- * the point where cutting them removes facts a model needs. Whoever adds tool 50
- * has to fix the STRUCTURE first — send the schema once per conversation rather
- * than once per round, or page it, or grow net/net.c's framing buffer so
- * CHAT_REQ_BYTES can move. Do not shave another 900 bytes of prose.
- *
- * The earlier version of this paragraph said 4008 bytes of slack, computed from a
- * CHAT_REGISTRY_BYTES that was 4 KiB stale — so the slack it advertised had
- * already been spent. tests/host/test_agency.c and test_app.c assert the sum
- * above; they went red the moment the constant was corrected, which is the only
- * reason the overflow was found at all. Do not "fix" them by raising a constant:
- * raising CHAT_TOOLS_BYTES moves the maximal-request cliff, and raising
- * CHAT_REQ_BYTES needs a bigger framing buffer in net/net.c (owned elsewhere).
- * Something has to get shorter. */
-#define CHAT_TOOLS_BYTES       40960
+ * The version of this paragraph before last said 4008 bytes of slack, computed
+ * from a CHAT_REGISTRY_BYTES that was 4 KiB stale — so the slack it advertised
+ * had already been spent. Do not "fix" a red guard by raising a constant without
+ * also raising the one below it in the chain; that is what the static assert in
+ * net/net.c is there to stop. */
+#define CHAT_TOOLS_BYTES       57344
 
 /* WHAT THE 45-TOOL REGISTRY ASSEMBLES TO TODAY, in bytes, measured.
  *
@@ -253,16 +271,20 @@
  * the description, and this — and forgetting the second line is loud rather
  * than silent. Get the new value from the banner, never by arithmetic on the
  * old one; that is precisely how the last drift happened. */
-/* 39125 read off the banner, 2026-07, with 49 tools. NOTE FOR WHOEVER GROWS A
- * DESCRIPTION NEXT: this is no longer bounded by CHAT_TOOLS_BYTES (1835 bytes
- * spare) but by CHAT_REQ_BYTES, and the margin there is 25 bytes. The
- * worst-case request is REGISTRY + CHAT_HISTORY_BYTES + the system prompt +
- * framing, and tests/host/test_agency.c and test_app.c assert it fits. When this
- * value was stale at 35142 those two guards were passing on a number 4 KiB too
- * small, so the overflow they exist to catch had already happened and was
- * invisible. Read the banner, set this, and if the guards then fail, something
- * has to get shorter - the failure is real. */
-#define CHAT_REGISTRY_BYTES    39125
+/* Read off the banner. NOTE FOR WHOEVER GROWS A DESCRIPTION NEXT: the worst-case
+ * request is CHAT_TOOLS_BYTES + CHAT_HISTORY_BYTES + the system prompt +
+ * framing, and tests/host/test_agency.c and test_app.c assert it fits
+ * CHAT_REQ_BYTES. When this value was stale at 35142 those two guards were
+ * passing on a number 4 KiB too small, so the overflow they exist to catch had
+ * already happened and was invisible. Read the banner, set this, and if the
+ * guards then fail, something has to get shorter - the failure is real. */
+/* 2026-07-30: read off the banner of a default `make -j8` build carrying the
+ * fault_patch + agenda_save/list/control family (61 tools). The previous value
+ * was 48389 at 57 tools; 52821 was this value before capability_save's
+ * description gained the 200-byte paragraph saying that a program developed
+ * under driver_run's /vm root is DENIED under a capability's data root, which
+ * cost a live turn six wasted tool rounds hunting for where /vm mapped. */
+#define CHAT_REGISTRY_BYTES    53021
 
 /* The user turn that carries a round's tool_result blocks plus the kernel's
  * budget note.
@@ -282,16 +304,21 @@
  * headers — going over would earn a MODEL_ENOSPC from the transport instead of
  * a clean, evict-and-retry one from here.
  *
- * WHY THIS GREW. That framing buffer is 64 KiB and the request line, Host,
- * api-key, version, content-type and content-length headers come to well under
- * 1 KiB, so 60 KiB leaves 4 KiB of slack. It had to grow because the schema
- * did: 39 tools serialise to ~30 KiB, and 30 KiB of tools plus a full 16 KiB
- * history plus this prompt exceeded 48 KiB — at which point the loop starts
- * evicting live exchanges on every request to make a body fit, i.e. the machine
- * silently forgets the middle of the job it is doing. Forgetting is the correct
- * behaviour when the request really is too big; it is the wrong behaviour when
- * the buffer was simply undersized. */
-#define CHAT_REQ_BYTES         61440
+ * WHY THIS GREW, TWICE. It grew to 61440 because the schema did: 39 tools
+ * serialise to ~30 KiB, and 30 KiB of tools plus a full 16 KiB history plus this
+ * prompt exceeded 48 KiB — at which point the loop starts evicting live
+ * exchanges on every request to make a body fit, i.e. the machine silently
+ * forgets the middle of the job it is doing. Forgetting is the correct behaviour
+ * when the request really is too big; it is the wrong behaviour when the buffer
+ * was simply undersized.
+ *
+ * It grew to 77824 with the network tool family, for the same reason one level
+ * up: at 61440 the worst-case request had 25 bytes of slack. That was only
+ * payable by growing net/net.c's framing buffer first (TLS_REQ_BYTES, now
+ * 81920), which is the order the two MUST move in — and net/net.c now carries a
+ * _Static_assert that refuses to build if this number ever gets ahead of it.
+ * Raising this alone will not compile. */
+#define CHAT_REQ_BYTES         86016
 
 /* One response body. Whole-body buffered; the transport does not stream. */
 #define CHAT_RESP_BYTES        65536

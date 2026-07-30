@@ -666,6 +666,16 @@ static const uint8_t map2[256] = {
 
 #define X86_MAX_INSN 15   /* architectural maximum; longer never decodes */
 
+/* include/fault.h's FAULT_PATCH_MAX_BYTES calls itself "2 x the longest insn",
+ * which is a hand-copy of the number above living in a different file. It happens
+ * to be right (32 >= 30). Pin it, because a bound that mirrors a value computed
+ * elsewhere goes stale in silence, and a patch buffer smaller than the span a
+ * caller is allowed to replace is a truncated instruction stream — the one failure
+ * mode in this file that does not fault and leaves no record. */
+_Static_assert(FAULT_PATCH_MAX_BYTES >= 2 * X86_MAX_INSN,
+               "FAULT_PATCH_MAX_BYTES must hold two maximum-length x86 "
+               "instructions, as its own comment claims");
+
 int x86_insn_length(const uint8_t *code, int avail) {
     if (!code || avail <= 0) return 0;
     if (avail > X86_MAX_INSN) avail = X86_MAX_INSN;
@@ -875,6 +885,22 @@ fix_tab[FAULT_FIX_COUNT] = {
       "kernel stopped rather than loop" },
     { "exhausted",
       "the armed plan had already been used as many times as it allowed" },
+    { "escaped",
+      "no in-place fix was possible, so the faulting call chain was abandoned "
+      "and control returned to the nearest caller that armed a fault guard" },
+    { "no-guard",
+      "nothing had armed a fault guard, so there was no known-safe context to "
+      "return to and the machine halted" },
+    { "guard-spent",
+      "the per-boot escape budget is spent; a machine that has abandoned this "
+      "many call chains is one nobody can reason about, so it halts" },
+    { "guard-corrupt",
+      "the innermost fault guard's saved context does not pass its own bounds "
+      "check, so returning to it would jump somewhere nobody chose" },
+    { "guard-foreign",
+      "a fault guard is armed, but on a different stack from the one that "
+      "faulted; returning to it would resume this CPU on another fiber's stack, "
+      "so the machine halted instead" },
 };
 
 const char *fault_fix_name(int fix) {
@@ -1116,6 +1142,13 @@ static int            g_plan_armed;
 static uint64_t       g_refault_rip;
 static uint32_t       g_refaults;
 
+/* Escape accounting. Declared up here with the rest of the live state because
+ * fault_reset() below clears it; the mechanism itself is at the bottom of the
+ * file under "the fault guard". */
+static uint32_t       g_escapes;
+static const char    *g_escape_what = "";
+static uint32_t       g_escape_seq;
+
 void fault_set_window(const fault_window_t *w) {
     if (!w) { g_window_set = 0; return; }
     g_window     = *w;
@@ -1279,4 +1312,814 @@ void fault_reset(void) {
     zero(&g_window, sizeof g_window);
     g_window_set  = 0;
     fault_plan_clear();
+    /* The guard stack is deliberately NOT cleared here. fault_reset() is a test
+     * hook and a test may well be running inside a guard while it calls this;
+     * dropping the entry would leave fault_guard_run() popping a depth that no
+     * longer describes the machine. The escape COUNTERS are policy and are
+     * cleared, because they are what a test needs a clean sheet of. Live code
+     * patches are not touched either, for a much sharper reason: forgetting a
+     * patch does not un-write it, so it would strand modified .text with no way
+     * back. fault_patch_forget_all() exists for a test that really means it. */
+    g_escapes      = 0;
+    g_escape_what  = "";
+    g_escape_seq   = 0;
+}
+
+/* ====================================================================== */
+/* the fault guard — returning to a known-safe context                    */
+/* ====================================================================== */
+
+/* See include/fault.h for the whole argument. This half is bookkeeping plus two
+ * bounds checks; the only interesting code is the arch seam below it. */
+
+static fault_guard_t *g_guards[FAULT_GUARD_DEPTH_MAX];
+static int            g_gdepth;
+
+/* Who says which stack we are on. NULL = "there is only one", which was true when
+ * this was written and is still true of every host suite. See the long note beside
+ * fault_guard_t in include/fault.h for what goes wrong without it. */
+static fault_stack_id_fn g_stack_id;
+
+void fault_set_stack_id(fault_stack_id_fn fn) { g_stack_id = fn; }
+
+static const void *stack_id_now(void) {
+    return g_stack_id ? g_stack_id() : (const void *)0;
+}
+
+int fault_guard_depth(void) { return g_gdepth; }
+
+fault_guard_t *fault_guard_innermost(void) {
+    return (g_gdepth > 0) ? g_guards[g_gdepth - 1] : NULL;
+}
+
+uint32_t fault_escapes(void) { return g_escapes; }
+
+uint32_t fault_escape_budget(void) {
+    return (g_escapes >= FAULT_ESCAPE_MAX)
+               ? 0u : (uint32_t)FAULT_ESCAPE_MAX - g_escapes;
+}
+
+const char *fault_escape_what(void) { return g_escape_what; }
+uint32_t    fault_escape_seq(void)  { return g_escape_seq; }
+
+/* ---- the arch seam ----
+ *
+ * fault_guard_enter() must be the function whose OWN return address is saved:
+ * anything that wraps it would have its frame popped and then reused by the body
+ * before the escape came back to it, so the epilogue would read garbage. That is
+ * why this is hand-written rather than a C wrapper around a helper.
+ *
+ * The asm addresses `slot` at +0 in the struct, which the assertion below pins.
+ * Only the callee-saved set is saved: the kernel is built -mno-sse -mno-mmx with
+ * no x87 and IF is always 0, so there is nothing else that survives a call
+ * boundary and therefore nothing else a resume has to reconstruct. This is the
+ * identical argument arch/x86_64/switch.asm makes for fibers, and if one of them
+ * is ever wrong they are both wrong. */
+
+_Static_assert(__builtin_offsetof(fault_guard_t, slot) == 0,
+               "the asm below writes slot[] at +0 in fault_guard_t");
+_Static_assert(FAULT_GUARD_SLOTS >= 8,
+               "the x86-64 context needs eight slots");
+
+#ifdef TALKOS_HOSTTEST
+
+/* The host is a hosted environment on some other architecture entirely (this
+ * tree is developed on arm64), so the transfer is libc's. The saved x86-64
+ * context in slot[0..7] is then meaningless, which is why fault_guard_forge()
+ * exists: fault_escape()'s register arithmetic is checked against a forged
+ * context, and the control transfer is checked against this one. Two tests for
+ * what is one mechanism on the machine — said out loud because it is the one
+ * place the host build and the kernel build genuinely differ. */
+#include <setjmp.h>
+_Static_assert(sizeof(jmp_buf) <= FAULT_GUARD_SLOTS * sizeof(uint64_t),
+               "FAULT_GUARD_SLOTS must hold a host jmp_buf");
+
+int fault_guard_enter(fault_guard_t *g) {
+    return setjmp(*(jmp_buf *)(void *)g->slot);
+}
+
+void fault_guard_unwind(fault_guard_t *g, int code) {
+    longjmp(*(jmp_buf *)(void *)g->slot, code ? code : FAULT_GUARD_ESCAPED);
+}
+
+int fault_guard_forge(fault_guard_t *g, uint64_t rip, uint64_t rsp) {
+    if (!g) return -1;
+    g->slot[0] = rip;
+    g->slot[1] = rsp;
+    for (int i = 2; i < 8; i++) g->slot[i] = 0xC0DE0000ULL + (uint64_t)i;
+    return 0;
+}
+
+#elif defined(__x86_64__)
+
+/* WRITTEN IN INTEL SYNTAX ON PURPOSE, and it is not a style preference.
+ *
+ * tests/qemu/lint_printf.py scans every string literal in the first-party tree
+ * for conversions lib/kfmt.c cannot render, because a `%e` that the kernel's
+ * formatter does not implement is echoed literally AND consumes no vararg, so
+ * every later argument shifts. It cannot tell a format string from an asm
+ * template, and AT&T syntax spells registers `%eax` / `%esi` — four false
+ * findings in a file that formats a great deal of model-facing text, in a lint
+ * whose whole value is that it has no false positives to train people to ignore.
+ * `.intel_syntax noprefix` writes the same instructions with no '%' anywhere.
+ * `.att_syntax` restores the assembler's state for the compiler-generated code
+ * that follows. */
+__asm__(
+    ".text\n"
+    ".intel_syntax noprefix\n"
+
+    ".globl fault_guard_enter\n"
+    ".type  fault_guard_enter,@function\n"
+    "fault_guard_enter:\n"           /* rdi = guard                          */
+    "    mov  rax, [rsp]\n"          /* slot[0] = where to come back to       */
+    "    mov  [rdi], rax\n"
+    "    lea  rax, [rsp+8]\n"        /* slot[1] = RSP as of the call site     */
+    "    mov  [rdi+8], rax\n"
+    "    mov  [rdi+16], rbx\n"
+    "    mov  [rdi+24], rbp\n"
+    "    mov  [rdi+32], r12\n"
+    "    mov  [rdi+40], r13\n"
+    "    mov  [rdi+48], r14\n"
+    "    mov  [rdi+56], r15\n"
+    "    xor  eax, eax\n"            /* 0 = "I have just saved"               */
+    "    ret\n"
+    ".size fault_guard_enter,.-fault_guard_enter\n"
+
+    ".globl fault_guard_unwind\n"
+    ".type  fault_guard_unwind,@function\n"
+    "fault_guard_unwind:\n"          /* rdi = guard, esi = code               */
+    "    mov  eax, esi\n"
+    "    test eax, eax\n"
+    "    jne  1f\n"
+    "    mov  eax, 1\n"              /* never hand back 0: see the header     */
+    "1:\n"
+    "    mov  rbx, [rdi+16]\n"
+    "    mov  rbp, [rdi+24]\n"
+    "    mov  r12, [rdi+32]\n"
+    "    mov  r13, [rdi+40]\n"
+    "    mov  r14, [rdi+48]\n"
+    "    mov  r15, [rdi+56]\n"
+    "    mov  rsp, [rdi+8]\n"        /* last, so nothing below is needed      */
+    "    jmp  qword ptr [rdi]\n"
+    ".size fault_guard_unwind,.-fault_guard_unwind\n"
+
+    ".att_syntax\n"
+);
+
+/* Forging a context is a test affordance and must not exist on the machine: a
+ * guard whose slots anyone can write is a jump to an address anyone can choose,
+ * which is precisely what the bounds checks in fault_escape() are there to stop.
+ * So the kernel build refuses. */
+int fault_guard_forge(fault_guard_t *g, uint64_t rip, uint64_t rsp) {
+    (void)g; (void)rip; (void)rsp;
+    return -1;
+}
+
+#else
+#error "fault_guard_enter needs an implementation for this architecture"
+#endif
+
+/* ---- the portable half ---- */
+
+int fault_guard_run(const char *what, void (*body)(void *ctx), void *ctx) {
+    fault_guard_t g;
+
+    if (!body) return FAULT_GUARD_EINVAL;
+    if (g_gdepth >= FAULT_GUARD_DEPTH_MAX) return FAULT_GUARD_EDEPTH;
+
+    zero(&g, sizeof g);
+    g.magic = FAULT_GUARD_MAGIC;
+    g.depth = (uint32_t)g_gdepth;
+    g.code  = 0;
+    g.seq   = g_count;
+    g.what  = (what && what[0]) ? what : "an unnamed guarded action";
+    g.stack = stack_id_now();     /* whose stack this guard's frame lives on */
+
+    g_guards[g_gdepth++] = &g;
+
+    if (fault_guard_enter(&g) == 0)
+        body(ctx);
+
+    /* EVERYTHING BELOW THIS LINE MUST READ MEMORY, NOT REGISTERS.
+     *
+     * On the escape path execution arrives here through an IRETQ that restored
+     * only RSP, RBP, RBX and R12-R15. Any value the compiler chose to keep in a
+     * caller-saved register across the call to body() is gone — including, if it
+     * felt like it, `body`, `ctx`, or a copy of the depth. `g` is on this frame's
+     * own stack, its address is derived from the registers that WERE restored,
+     * and the escape code was written into g.code by fault_escape() precisely so
+     * that not even the return-value register has to be believed. */
+    g_gdepth = (int)g.depth;      /* pops us, and anything nested under us */
+    g.magic  = 0;                 /* a stale pointer cannot pass the check */
+
+    return g.code;
+}
+
+/* Shared by both entry points: is an escape allowed AT ALL, before any register
+ * is looked at? Vector-independent checks only; fault_escape() adds the vector
+ * and the bounds. */
+static fault_fix_t escape_allowed(fault_guard_t **out) {
+    if (out) *out = NULL;
+    if (g_gdepth <= 0)                  return FAULT_FIX_NO_GUARD;
+    if (g_escapes >= FAULT_ESCAPE_MAX)  return FAULT_FIX_GUARD_SPENT;
+
+    fault_guard_t *g = g_guards[g_gdepth - 1];
+    if (!g || g->magic != FAULT_GUARD_MAGIC) return FAULT_FIX_GUARD_CORRUPT;
+
+    /* IDENTITY, NOT ARITHMETIC. The guard's frame is on the stack of whoever armed
+     * it; restoring its RSP while a DIFFERENT stack is running would put this CPU
+     * on somebody else's stack with `current` still naming the faulting context.
+     * The bounds checks in fault_escape() cannot catch that — every fiber stack is
+     * inside the one declared stack window — so the only sound test is whether the
+     * context that faulted is the context that armed. Not searching further out for
+     * a guard that DOES match: fault_guard_run() pops by index, and unwinding past
+     * a foreign guard would remove it while its owner is still inside it. That
+     * needs a per-fiber guard stack, and fault.h says so. */
+    if (g->stack != stack_id_now()) return FAULT_FIX_GUARD_FOREIGN;
+
+    if (out) *out = g;
+    return FAULT_FIX_OK;
+}
+
+fault_fix_t fault_guard_abort(const char *why) {
+    fault_guard_t *g   = NULL;
+    fault_fix_t    rc  = escape_allowed(&g);
+    if (rc != FAULT_FIX_OK) return rc;
+
+    g_escapes++;
+    g_escape_what = why && why[0] ? why : g->what;
+    g_escape_seq  = g_count;
+    g->code       = FAULT_GUARD_ESCAPED;
+    fault_guard_unwind(g, FAULT_GUARD_ESCAPED);
+}
+
+/* A REFUSAL IS ALSO A DISPOSITION, and it used to be recorded nowhere.
+ *
+ * Only the success path wrote into the ring, so a guard that was armed and intact
+ * but refused left the record holding fault_recover()'s verdict — almost always
+ * "no-plan: no recovery plan was armed", which is FALSE when a guard was armed and
+ * is the first sentence both the operator and net/faultchat.c read. The refusal
+ * only replaces a NO_PLAN, because every other recover verdict says something
+ * specific about a plan that really did exist.
+ *
+ * Writes nothing but the record and the rendered report: the frame is untouched on
+ * every path through here, which is the property that makes refusing always safe. */
+static void note_refusal(fault_fix_t why, const char *detail) {
+    fault_record_t *r = current_record();
+    if (!r) return;
+    if (r->fix_set && r->fix != (uint8_t)FAULT_FIX_NO_PLAN) return;
+    r->fix_set   = 1;
+    r->fix       = (uint8_t)why;
+    r->recovered = 0;
+    set_detail(r, detail);
+    fault_format_report(r, g_report, sizeof g_report);
+}
+
+fault_fix_t fault_escape(fault_frame_t *frame, const fault_window_t *window) {
+    fault_guard_t *g = NULL;
+    fault_fix_t    rc;
+
+    if (!frame || !window) return FAULT_FIX_NO_GUARD;
+
+    /* #DF and #MC first, and for the same reason fault_is_recoverable() gives:
+     * every field this mechanism writes is a stack address, and #DF means the
+     * CPU has already proved the stack is unusable. There is no version of
+     * "abandon the call chain" that helps when the thing that broke is the
+     * mechanism used to abandon it. */
+    if (!fault_is_recoverable(frame->vector)) return FAULT_FIX_VECTOR;
+
+    rc = escape_allowed(&g);
+    if (rc != FAULT_FIX_OK) {
+        if (rc == FAULT_FIX_GUARD_FOREIGN)
+            note_refusal(rc, "a fault guard is armed, but it was armed on a "
+                             "different stack from the one that faulted; "
+                             "resuming on it would run this CPU on another "
+                             "fiber's stack");
+        else if (rc == FAULT_FIX_GUARD_SPENT)
+            note_refusal(rc, "a fault guard is armed and intact, but this boot's "
+                             "escape budget is spent");
+        else if (rc == FAULT_FIX_GUARD_CORRUPT)
+            note_refusal(rc, "a fault guard is armed but its magic is wrong; "
+                             "something has written over it");
+        return rc;
+    }
+
+    /* Bounds, re-checked at the moment of use against the live window. The guard
+     * lives on the stack of the code being escaped FROM, so the bug being
+     * escaped is exactly the kind of bug that could have scribbled on it. */
+    uint64_t rip = g->slot[0];
+    uint64_t rsp = g->slot[1];
+    if (!in_range(rip, 1, window->code_lo, window->code_hi)) {
+        note_refusal(FAULT_FIX_GUARD_CORRUPT,
+                     "the fault guard's saved resume address is outside this "
+                     "kernel's image, so returning to it would jump nowhere");
+        return FAULT_FIX_GUARD_CORRUPT;
+    }
+    if (!in_range(rsp, 8, window->stack_lo, window->stack_hi)) {
+        note_refusal(FAULT_FIX_GUARD_CORRUPT,
+                     "the fault guard's saved stack pointer is outside the "
+                     "kernel's stack window");
+        return FAULT_FIX_GUARD_CORRUPT;
+    }
+    /* The saved RSP must be ABOVE the faulting RSP: the guard's frame has to
+     * outlive the frames being discarded, or "return to the caller" is really
+     * "jump into memory the handler is standing on". */
+    if (rsp <= frame->rsp) {
+        note_refusal(FAULT_FIX_GUARD_CORRUPT,
+                     "the fault guard's saved stack pointer is not above the "
+                     "faulting one, so its frame does not outlive the frames "
+                     "being discarded");
+        return FAULT_FIX_GUARD_CORRUPT;
+    }
+
+    /* Committed. Nothing below can fail. */
+    g_escapes++;
+    g_escape_what = g->what;
+    g_escape_seq  = g_count;
+    g->code       = FAULT_GUARD_ESCAPED;
+
+    frame->rip = rip;
+    frame->rsp = rsp;
+    frame->rbx = g->slot[2];
+    frame->rbp = g->slot[3];
+    frame->r12 = g->slot[4];
+    frame->r13 = g->slot[5];
+    frame->r14 = g->slot[6];
+    frame->r15 = g->slot[7];
+    frame->rax = FAULT_GUARD_ESCAPED;   /* fault_guard_enter's "return value" */
+
+    /* TF would single-step the resumed code and RF would suppress the next
+     * instruction breakpoint; neither belongs to the context being resumed. */
+    frame->rflags &= ~0x00000100ULL;    /* TF */
+    frame->rflags &= ~0x00010000ULL;    /* RF */
+
+    {
+        fault_record_t *r = current_record();
+        if (r) {
+            char   why[FAULT_DETAIL_MAX];
+            size_t off = 0;
+            why[0] = '\0';
+            ap(why, sizeof why, &off,
+               "no in-place fix; abandoned %s and returned to its caller at "
+               "0x%lx (escape %lu of %u this boot)",
+               g->what, (unsigned long)rip,
+               (unsigned long)g_escapes, (unsigned)FAULT_ESCAPE_MAX);
+            r->fix_set    = 1;
+            r->fix        = (uint8_t)FAULT_FIX_ESCAPED;
+            r->recovered  = 1;
+            r->resume_rip = rip;
+            set_detail(r, why);
+            fault_format_report(r, g_report, sizeof g_report);
+        }
+    }
+    return FAULT_FIX_ESCAPED;
+}
+
+/* ====================================================================== */
+/* live code patching                                                     */
+/* ====================================================================== */
+
+static const struct { const char *name; const char *desc; }
+patch_tab[FAULT_PATCH_COUNT] = {
+    { "OK",        "the patch is legal" },
+    { "ENOWINDOW", "this build did not publish a .text range, so no address "
+                   "can be shown to be executable code and every patch is "
+                   "refused" },
+    { "ENOMEM",    "no memory accessor is bound, so nothing can be read or "
+                   "written" },
+    { "ERANGE",    "the target is not inside the kernel's .text; a patch may "
+                   "only touch instructions the linker placed" },
+    { "ELEN",      "the length is zero, over the cap, or does not match the "
+                   "number of expected bytes given" },
+    { "EEXPECT",   "the bytes at that address are not the ones stated, so the "
+                   "address is stale or wrong and something else lives there" },
+    { "EBOUNDARY", "the span does not cover a whole number of instructions, so "
+                   "the patch would leave the tail of one to be executed as an "
+                   "opcode" },
+    { "EOPAQUE",   "the replacement bytes do not decode to exactly that many "
+                   "bytes of whole instructions" },
+    { "EOVERLAP",  "a patch that is still live already covers those bytes; "
+                   "revert it before patching them again" },
+    { "ENOSPC",    "every patch slot is in use" },
+    { "ENOENT",    "there is no patch with that id" },
+    { "EGONE",     "that patch has already been reverted" },
+    { "ECHANGED",  "the bytes in memory are not the ones this patch wrote, so "
+                   "restoring the original would destroy someone else's edit" },
+    { "EIO",       "the bytes did not read back as written" },
+};
+
+const char *fault_patch_errname(int e) {
+    if (e < 0 || e >= FAULT_PATCH_COUNT) return "?";
+    return patch_tab[e].name;
+}
+
+const char *fault_patch_errdesc(int e) {
+    if (e < 0 || e >= FAULT_PATCH_COUNT) return "unknown patch result";
+    return patch_tab[e].desc;
+}
+
+static fault_patch_t g_patch[FAULT_PATCH_SLOTS];
+static uint32_t      g_patches;        /* slots used; also the next id      */
+static uint32_t      g_patch_live;
+
+static const fault_mem_ops_t *g_mem;
+
+#if !defined(TALKOS_HOSTTEST) && defined(__x86_64__)
+/* The kernel's default accessor. Legal because boot.asm identity-maps the low
+ * 4 GiB, so a virtual address below 4 GiB IS its physical address, and because
+ * every caller has already proved the span lies inside .text. volatile so the
+ * compiler cannot decide a byte it just wrote is still the byte it read. */
+static int mem_read_direct(uint64_t a, uint8_t *dst, unsigned n, void *ctx) {
+    const volatile uint8_t *p = (const volatile uint8_t *)(uintptr_t)a;
+    (void)ctx;
+    for (unsigned i = 0; i < n; i++) dst[i] = p[i];
+    return 0;
+}
+
+static int mem_write_direct(uint64_t a, const uint8_t *src, unsigned n,
+                            void *ctx) {
+    volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)a;
+    (void)ctx;
+    for (unsigned i = 0; i < n; i++) p[i] = src[i];
+    /* Intel SDM 8.1.3: after storing to an instruction that may already be in
+     * the pipeline, a serialising instruction is required before executing it.
+     * CPUID is the cheapest one that needs no privilege and no operand state. */
+    {
+        unsigned a_ = 0, b_ = 0, c_ = 0, d_ = 0;
+        __asm__ __volatile__("cpuid"
+                             : "=a"(a_), "=b"(b_), "=c"(c_), "=d"(d_)
+                             : "a"(0) : "memory");
+    }
+    return 0;
+}
+
+static const fault_mem_ops_t mem_direct = {
+    mem_read_direct, mem_write_direct, NULL
+};
+#define MEM_DEFAULT (&mem_direct)
+#else
+/* On the host there is deliberately no default: a test that forgets to bind an
+ * array gets FAULT_PATCH_ENOMEM instead of writing to address 0x1000. */
+#define MEM_DEFAULT ((const fault_mem_ops_t *)0)
+#endif
+
+void fault_patch_bind(const fault_mem_ops_t *ops) {
+    g_mem = ops ? ops : MEM_DEFAULT;
+}
+
+static const fault_mem_ops_t *mem_ops(void) {
+    return g_mem ? g_mem : MEM_DEFAULT;
+}
+
+/* Bounded copy of a kernel- or model-authored note. */
+static void note_copy(char *dst, size_t cap, const char *src) {
+    size_t i = 0;
+    if (!dst || cap == 0) return;
+    if (src) {
+        for (; src[i] && i + 1 < cap; i++) {
+            unsigned char c = (unsigned char)src[i];
+            /* This string is printed inside a kernel-prefixed line and stored in
+             * a record the model reads back. Control characters and brackets
+             * would let it forge a trace line; see include/trace.h. */
+            if (c < 0x20 || c == 0x7F) c = ' ';
+            else if (c == '[')         c = '(';
+            else if (c == ']')         c = ')';
+            dst[i] = (char)c;
+        }
+    }
+    dst[i] = '\0';
+}
+
+/* Walk instructions across exactly `len` bytes. Returns the instruction count
+ * when the lengths sum to `len` precisely, or 0 when they do not — which covers
+ * both "one instruction runs off the end" (x86_insn_length is given only the
+ * remaining bytes and refuses) and "an encoding the decoder does not know". */
+static int span_insns(const uint8_t *b, unsigned len) {
+    unsigned off = 0;
+    int      n   = 0;
+    while (off < len) {
+        int l = x86_insn_length(b + off, (int)(len - off));
+        if (l <= 0) return 0;
+        if ((unsigned)l > len - off) return 0;   /* cannot happen; never trust */
+        off += (unsigned)l;
+        n++;
+        if (n > FAULT_PATCH_MAX_BYTES) return 0;
+    }
+    return (off == len) ? n : 0;
+}
+
+/* Shared gate. `out_insns_out` / `out_insns_in` are filled on success so
+ * fault_patch_apply() does not decode twice. */
+static fault_patch_err_t patch_gate(const fault_patch_req_t *req,
+                                    const fault_window_t *w,
+                                    uint8_t *found,
+                                    int *out_insns_out, int *out_insns_in,
+                                    char *why, size_t whycap) {
+    size_t off = 0;
+    if (whycap) why[0] = '\0';
+
+    if (!req) {
+        ap(why, whycap, &off, "no patch was described");
+        return FAULT_PATCH_ELEN;
+    }
+    /* ---- gate 0: can we do this at all ---- */
+    if (!w || w->text_hi <= w->text_lo) {
+        ap(why, whycap, &off,
+           "this build published no .text range, so no address can be shown to "
+           "be executable code");
+        return FAULT_PATCH_ENOWINDOW;
+    }
+    if (!mem_ops() || !mem_ops()->read || !mem_ops()->write) {
+        ap(why, whycap, &off, "no memory accessor is bound");
+        return FAULT_PATCH_ENOMEM;
+    }
+
+    /* ---- gate 1: lengths ---- */
+    if (req->len == 0 || req->len > FAULT_PATCH_MAX_BYTES) {
+        ap(why, whycap, &off,
+           "a patch is 1 to %u bytes; this one is %u",
+           (unsigned)FAULT_PATCH_MAX_BYTES, (unsigned)req->len);
+        return FAULT_PATCH_ELEN;
+    }
+    if (req->expect_len != req->len) {
+        ap(why, whycap, &off,
+           "\"expect\" must be exactly as long as the replacement: %u byte(s) "
+           "of replacement, %u of expected",
+           (unsigned)req->len, (unsigned)req->expect_len);
+        return FAULT_PATCH_ELEN;
+    }
+
+    /* ---- gate 2: inside .text ---- */
+    if (!in_range(req->addr, req->len, w->text_lo, w->text_hi)) {
+        ap(why, whycap, &off,
+           "[0x%lx, 0x%lx) is not inside this kernel's .text, which is "
+           "[0x%lx, 0x%lx)",
+           (unsigned long)req->addr,
+           (unsigned long)(req->addr + req->len),
+           (unsigned long)w->text_lo, (unsigned long)w->text_hi);
+        return FAULT_PATCH_ERANGE;
+    }
+
+    /* ---- gate 3: the caller must already know what is there ---- */
+    if (mem_ops()->read(req->addr, found, req->len, mem_ops()->ctx) != 0) {
+        ap(why, whycap, &off, "the bytes at 0x%lx could not be read",
+           (unsigned long)req->addr);
+        return FAULT_PATCH_ENOMEM;
+    }
+    for (unsigned i = 0; i < req->len; i++) {
+        if (found[i] == req->expect[i]) continue;
+        ap(why, whycap, &off,
+           "byte %u at 0x%lx is 0x%02x, not the 0x%02x you said to expect - "
+           "the address is stale or belongs to something else. Found:",
+           i, (unsigned long)(req->addr + i),
+           (unsigned)found[i], (unsigned)req->expect[i]);
+        for (unsigned j = 0; j < req->len; j++)
+            ap(why, whycap, &off, " %02x", (unsigned)found[j]);
+        return FAULT_PATCH_EEXPECT;
+    }
+
+    /* ---- gate 4: whole instructions out ---- */
+    int nout = span_insns(found, req->len);
+    if (nout == 0) {
+        ap(why, whycap, &off,
+           "the %u byte(s) at 0x%lx are not a whole number of instructions, so "
+           "replacing them would leave the tail of one to be executed as an "
+           "opcode. Pick a span that starts and ends on an instruction",
+           (unsigned)req->len, (unsigned long)req->addr);
+        return FAULT_PATCH_EBOUNDARY;
+    }
+
+    /* ---- gate 5: whole instructions in ---- */
+    int nin = span_insns(req->bytes, req->len);
+    if (nin == 0) {
+        ap(why, whycap, &off,
+           "the replacement bytes do not decode to exactly %u byte(s) of whole "
+           "instructions. 0x90 is a one-byte nop and pads any gap",
+           (unsigned)req->len);
+        return FAULT_PATCH_EOPAQUE;
+    }
+
+    /* ---- gate 6: not on top of a live patch ---- */
+    for (uint32_t i = 0; i < g_patches && i < FAULT_PATCH_SLOTS; i++) {
+        const fault_patch_t *p = &g_patch[i];
+        if (!p->live) continue;
+        if (req->addr + req->len <= p->addr) continue;
+        if (p->addr + p->len <= req->addr)   continue;
+        ap(why, whycap, &off,
+           "patch %lu is still live over [0x%lx, 0x%lx); revert it first",
+           (unsigned long)p->id, (unsigned long)p->addr,
+           (unsigned long)(p->addr + p->len));
+        return FAULT_PATCH_EOVERLAP;
+    }
+
+    if (out_insns_out) *out_insns_out = nout;
+    if (out_insns_in)  *out_insns_in  = nin;
+    return FAULT_PATCH_OK;
+}
+
+fault_patch_err_t fault_patch_check(const fault_patch_req_t *req,
+                                    const fault_window_t *window,
+                                    char *why, size_t whycap) {
+    uint8_t found[FAULT_PATCH_MAX_BYTES];
+    return patch_gate(req, window, found, NULL, NULL, why, whycap);
+}
+
+fault_patch_err_t fault_patch_apply(const fault_patch_req_t *req,
+                                    const fault_window_t *window,
+                                    uint64_t now_ms, uint32_t *out_id,
+                                    char *why, size_t whycap) {
+    uint8_t           found[FAULT_PATCH_MAX_BYTES];
+    uint8_t           back[FAULT_PATCH_MAX_BYTES];
+    int               nout = 0, nin = 0;
+    fault_patch_err_t rc;
+    size_t            off = 0;
+
+    if (out_id) *out_id = 0;
+
+    rc = patch_gate(req, window, found, &nout, &nin, why, whycap);
+    if (rc != FAULT_PATCH_OK) return rc;
+
+    if (g_patches >= FAULT_PATCH_SLOTS) {
+        if (whycap) why[0] = '\0';
+        ap(why, whycap, &off,
+           "all %u patch slots have been used this boot",
+           (unsigned)FAULT_PATCH_SLOTS);
+        return FAULT_PATCH_ENOSPC;
+    }
+
+    /* THE ORIGINAL BYTES ARE RECORDED BEFORE THE FIRST ONE IS OVERWRITTEN.
+     * Not after, not alongside: a write that half-succeeds must still leave a
+     * complete record of what was there, or the patch is not reversible and the
+     * fifth gate in the header is a lie. */
+    fault_patch_t *p = &g_patch[g_patches];
+    zero(p, sizeof *p);
+    p->id         = g_patches + 1u;
+    p->addr       = req->addr;
+    p->len        = req->len;
+    p->insns_out  = (uint8_t)nout;
+    p->insns_in   = (uint8_t)nin;
+    p->applied_ms = now_ms;
+    for (unsigned i = 0; i < req->len; i++) {
+        p->orig[i]  = found[i];
+        p->bytes[i] = req->bytes[i];
+    }
+    note_copy(p->note, sizeof p->note, req->note);
+
+    if (mem_ops()->write(req->addr, req->bytes, req->len, mem_ops()->ctx) != 0) {
+        if (whycap) why[0] = '\0';
+        ap(why, whycap, &off, "the write to 0x%lx failed",
+           (unsigned long)req->addr);
+        zero(p, sizeof *p);
+        return FAULT_PATCH_EIO;
+    }
+
+    /* Read it back. On a machine with no memory protection this is the only
+     * evidence that the address was writable RAM and not, say, a memory-mapped
+     * register that ignored the store. */
+    if (mem_ops()->read(req->addr, back, req->len, mem_ops()->ctx) != 0) {
+        if (whycap) why[0] = '\0';
+        ap(why, whycap, &off, "the patched bytes could not be read back");
+        goto undo;
+    }
+    for (unsigned i = 0; i < req->len; i++) {
+        if (back[i] == req->bytes[i]) continue;
+        if (whycap) why[0] = '\0';
+        ap(why, whycap, &off,
+           "byte %u read back as 0x%02x, not the 0x%02x written - that address "
+           "is not plain writable RAM",
+           i, (unsigned)back[i], (unsigned)req->bytes[i]);
+        goto undo;
+    }
+
+    p->live = 1;
+    g_patches++;
+    g_patch_live++;
+    if (out_id) *out_id = p->id;
+    if (whycap) why[0] = '\0';
+    ap(why, whycap, &off,
+       "%u byte(s) at 0x%lx replaced (%d instruction(s) -> %d); the original is "
+       "kept and patch %lu can be reverted",
+       (unsigned)req->len, (unsigned long)req->addr, nout, nin,
+       (unsigned long)p->id);
+    return FAULT_PATCH_OK;
+
+undo:
+    /* Best effort: put back what we recorded, then report the failure. The slot
+     * is released because nothing durable happened. */
+    mem_ops()->write(req->addr, p->orig, req->len, mem_ops()->ctx);
+    zero(p, sizeof *p);
+    return FAULT_PATCH_EIO;
+}
+
+static fault_patch_t *patch_slot_by_id(uint32_t id) {
+    if (id == 0 || id > g_patches) return NULL;
+    fault_patch_t *p = &g_patch[id - 1];
+    return (p->id == id) ? p : NULL;
+}
+
+fault_patch_err_t fault_patch_revert(uint32_t id, uint64_t now_ms,
+                                     char *why, size_t whycap) {
+    uint8_t now[FAULT_PATCH_MAX_BYTES];
+    uint8_t back[FAULT_PATCH_MAX_BYTES];
+    size_t  off = 0;
+    if (whycap) why[0] = '\0';
+
+    fault_patch_t *p = patch_slot_by_id(id);
+    if (!p) {
+        ap(why, whycap, &off, "there is no patch %lu; %lu have been applied",
+           (unsigned long)id, (unsigned long)g_patches);
+        return FAULT_PATCH_ENOENT;
+    }
+    if (!p->live) {
+        ap(why, whycap, &off, "patch %lu was already reverted",
+           (unsigned long)id);
+        return FAULT_PATCH_EGONE;
+    }
+    if (!mem_ops() || !mem_ops()->read || !mem_ops()->write) {
+        ap(why, whycap, &off, "no memory accessor is bound");
+        return FAULT_PATCH_ENOMEM;
+    }
+    if (mem_ops()->read(p->addr, now, p->len, mem_ops()->ctx) != 0) {
+        ap(why, whycap, &off, "the bytes at 0x%lx could not be read",
+           (unsigned long)p->addr);
+        return FAULT_PATCH_ENOMEM;
+    }
+    /* Refuse to "restore" over somebody else's edit. Reverting blindly would
+     * make this the second writer to lose, silently, and there is no way to tell
+     * afterwards which generation the bytes belong to. */
+    for (unsigned i = 0; i < p->len; i++) {
+        if (now[i] == p->bytes[i]) continue;
+        ap(why, whycap, &off,
+           "byte %u at 0x%lx is 0x%02x, not the 0x%02x patch %lu wrote - "
+           "something has edited it since, and restoring the original would "
+           "destroy that instead",
+           i, (unsigned long)(p->addr + i), (unsigned)now[i],
+           (unsigned)p->bytes[i], (unsigned long)id);
+        return FAULT_PATCH_ECHANGED;
+    }
+
+    if (mem_ops()->write(p->addr, p->orig, p->len, mem_ops()->ctx) != 0) {
+        ap(why, whycap, &off, "the write to 0x%lx failed",
+           (unsigned long)p->addr);
+        return FAULT_PATCH_EIO;
+    }
+    if (mem_ops()->read(p->addr, back, p->len, mem_ops()->ctx) != 0) {
+        ap(why, whycap, &off, "the restored bytes could not be read back");
+        return FAULT_PATCH_EIO;
+    }
+    for (unsigned i = 0; i < p->len; i++) {
+        if (back[i] == p->orig[i]) continue;
+        ap(why, whycap, &off,
+           "byte %u read back as 0x%02x, not the original 0x%02x", i,
+           (unsigned)back[i], (unsigned)p->orig[i]);
+        return FAULT_PATCH_EIO;
+    }
+
+    p->live        = 0;
+    p->reverted_ms = now_ms;
+    if (g_patch_live) g_patch_live--;
+    ap(why, whycap, &off,
+       "patch %lu reverted: the original %u byte(s) are back at 0x%lx",
+       (unsigned long)id, (unsigned)p->len, (unsigned long)p->addr);
+    return FAULT_PATCH_OK;
+}
+
+uint32_t fault_patch_revert_all(uint64_t now_ms) {
+    uint32_t n = 0;
+    /* Newest first: overlapping generations cannot exist while both are live
+     * (gate 6), but a slot reverted and re-patched can, and the last edit must
+     * be the first undone. */
+    for (uint32_t i = g_patches; i > 0; i--)
+        if (g_patch[i - 1].live &&
+            fault_patch_revert(g_patch[i - 1].id, now_ms, NULL, 0)
+                == FAULT_PATCH_OK)
+            n++;
+    return n;
+}
+
+uint32_t fault_patch_count(void) { return g_patches; }
+uint32_t fault_patch_live(void)  { return g_patch_live; }
+
+const fault_patch_t *fault_patch_at(uint32_t index) {
+    if (index >= g_patches || index >= FAULT_PATCH_SLOTS) return NULL;
+    return &g_patch[index];
+}
+
+const fault_patch_t *fault_patch_by_id(uint32_t id) {
+    return patch_slot_by_id(id);
+}
+
+const fault_patch_t *fault_patch_covering(uint64_t addr) {
+    for (uint32_t i = 0; i < g_patches && i < FAULT_PATCH_SLOTS; i++) {
+        const fault_patch_t *p = &g_patch[i];
+        if (!p->live) continue;
+        if (addr >= p->addr && addr < p->addr + p->len) return p;
+    }
+    return NULL;
+}
+
+void fault_patch_forget_all(void) {
+    zero(g_patch, sizeof g_patch);
+    g_patches    = 0;
+    g_patch_live = 0;
 }

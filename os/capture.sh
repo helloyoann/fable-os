@@ -7,6 +7,19 @@
 #   $OUT_PREFIX.png   framebuffer screenshot   (default /tmp/os.png)
 #   $OUT_PREFIX.log   serial log               (default /tmp/os.log)
 #
+# ATTACHING HARDWARE: QEMU_EXTRA is appended after the NIC, exactly as it is for
+# `make run`, so the same string works with both:
+#
+#   QEMU_EXTRA="-audiodev none,id=a0 -device AC97,audiodev=a0" ./capture.sh 20
+#
+# This is not a convenience. The whole premise of this project is that an
+# operator attaches a device the kernel has never heard of and the model writes
+# the driver, and a SCREENSHOT is the only honest evidence that a window rendered
+# or that a device was left unclaimed. Without this the one script that produces
+# screenshots could not see the one machine configuration that matters, so
+# "a default kernel leaves the sound card alone" had to be verified by a
+# different tool than the one used to verify everything else.
+#
 # EXIT STATUS IS MEANINGFUL. This script is how a boot gets verified, so it must
 # not be able to print a screenshot path and exit 0 when QEMU never started. It
 # exits non-zero, and shows QEMU's own stderr, if the guest produced no serial
@@ -54,10 +67,18 @@ trap cleanup EXIT INT TERM
 
 # -no-reboot so a triple fault ends the run instead of quietly starting a second
 # boot underneath the screenshot.
+# QEMU_EXTRA is deliberately left unquoted so the shell splits it into separate
+# arguments — a device specification is several words. This is a /bin/sh script
+# with no arrays, and `set -e` is on, so the alternative (eval) would be both
+# uglier and more dangerous. The string comes from the operator's own command
+# line, which is already a shell, so word splitting adds no authority that was
+# not already there. Nothing model-controlled reaches this variable.
+# shellcheck disable=SC2086
 qemu-system-x86_64 -kernel "$DIR/kernel.bin" \
     -netdev user,id=n0 -device e1000,netdev=n0 \
     -serial "file:$SERIAL" -no-reboot \
-    -display none -monitor "unix:$MON,server,nowait" >"$QLOG" 2>&1 &
+    -display none -monitor "unix:$MON,server,nowait" \
+    $QEMU_EXTRA >"$QLOG" 2>&1 &
 QPID=$!
 
 PPM="$PPM" MON="$MON" python3 - "$DELAY" <<'EOF'

@@ -48,6 +48,12 @@
  * it is the ceiling. The default (dvm_policy_init) is half of it, which still
  * covers writing the entire buffer 16 bits at a time. */
 #define CEIL_DMA_OPS      DVM_DMA_SIZE
+/* Bytes of scratch-memory and string work. 64 MiB is a thousand passes over the
+ * whole arena: far past anything a text-shaped program does, and still a bound
+ * a polled kernel notices (memcpy at a few GB/s spends tens of milliseconds
+ * there, not seconds). The default is a sixteenth of it. */
+#define CEIL_MEM_BYTES    0x4000000ull
+#define CEIL_SYS          4096u
 
 /* Only the low 4 GiB is mapped (boot.asm maps 2 MiB huge pages up to 4 GiB), so
  * an MMIO access above this would fault instead of being refused. */
@@ -122,9 +128,18 @@ typedef enum {
     F_LBL,           /* jmp/branch/call L                       */
     F_PORT_A,        /* out8 port, a                            */
     F_RD_PORT,       /* in8 rd, port                            */
-    F_RD_ADDR,       /* ld8 rd, [base+disp]                     */
-    F_ADDR_A,        /* st8 [base+disp], a                      */
-    F_RD_BDF_OFF     /* pcicfg rd, bdf, off                     */
+    F_RD_ADDR,       /* ld8 rd, [base+disp] ; mld8 rd, [off]    */
+    F_ADDR_A,        /* st8 [base+disp], a  ; mst8 [off], a     */
+    F_RD_BDF_OFF,    /* pcicfg rd, bdf, off                     */
+    /* The string family. A string literal always lands in operand slot 0,
+     * whatever order it was written in, because dvm_program_validate() enforces
+     * "a string may only be operand 0" structurally — keeping that rule true is
+     * worth more than matching the source order in the encoding. */
+    F_RD_A_B_C,      /* mcpy rd, dst, src, len                  */
+    F_A_B_C,         /* mcmp a, b, len                          */
+    F_RD_STR_A,      /* mstr rd, dst, "text"                    */
+    F_RD_STR_A_B,    /* mfind rd, hay, len, "text"              */
+    F_SYS            /* sys rd, name                            */
 } fmt_t;
 
 static const struct { const char *name; uint8_t fmt; } op_info[DVM_OP__COUNT] = {
@@ -171,6 +186,23 @@ static const struct { const char *name; uint8_t fmt; } op_info[DVM_OP__COUNT] = 
     [DVM_PCICFG] = { "pcicfg", F_RD_BDF_OFF },
     [DVM_DELAY]  = { "delay",  F_A          },
     [DVM_PRINT]  = { "print",  F_STR_OPT_A  },
+    [DVM_MLD8]   = { "mld8",   F_RD_ADDR    },
+    [DVM_MLD16]  = { "mld16",  F_RD_ADDR    },
+    [DVM_MLD32]  = { "mld32",  F_RD_ADDR    },
+    [DVM_MLD64]  = { "mld64",  F_RD_ADDR    },
+    [DVM_MST8]   = { "mst8",   F_ADDR_A     },
+    [DVM_MST16]  = { "mst16",  F_ADDR_A     },
+    [DVM_MST32]  = { "mst32",  F_ADDR_A     },
+    [DVM_MST64]  = { "mst64",  F_ADDR_A     },
+    [DVM_MSTR]   = { "mstr",   F_RD_STR_A   },
+    [DVM_MCPY]   = { "mcpy",   F_RD_A_B_C   },
+    [DVM_MSET]   = { "mset",   F_RD_A_B_C   },
+    [DVM_MCMP]   = { "mcmp",   F_A_B_C      },
+    [DVM_MFIND]  = { "mfind",  F_RD_STR_A_B },
+    [DVM_MCHR]   = { "mchr",   F_RD_A_B_C   },
+    [DVM_MATOI]  = { "matoi",  F_RD_A_B_C   },
+    [DVM_MITOA]  = { "mitoa",  F_RD_A_B_C   },
+    [DVM_SYS]    = { "sys",    F_SYS        },
 };
 
 const char *dvm_op_name(dvm_op_t op) {
@@ -218,6 +250,16 @@ static const struct { const char *m; uint8_t op; } mnemonic[] = {
     { "pcicfg", DVM_PCICFG }, { "pciread", DVM_PCICFG }, { "pcird", DVM_PCICFG },
     { "delay", DVM_DELAY }, { "udelay", DVM_DELAY }, { "usleep", DVM_DELAY },
     { "print", DVM_PRINT }, { "log", DVM_PRINT },
+    { "mld8", DVM_MLD8 }, { "mld16", DVM_MLD16 },
+    { "mld32", DVM_MLD32 }, { "mld64", DVM_MLD64 },
+    { "mst8", DVM_MST8 }, { "mst16", DVM_MST16 },
+    { "mst32", DVM_MST32 }, { "mst64", DVM_MST64 },
+    { "mstr", DVM_MSTR }, { "mcpy", DVM_MCPY }, { "mmove", DVM_MCPY },
+    { "mset", DVM_MSET }, { "mfill", DVM_MSET },
+    { "mcmp", DVM_MCMP }, { "mfind", DVM_MFIND }, { "mchr", DVM_MCHR },
+    { "matoi", DVM_MATOI }, { "atoi", DVM_MATOI },
+    { "mitoa", DVM_MITOA }, { "itoa", DVM_MITOA },
+    { "sys", DVM_SYS }, { "syscall", DVM_SYS },
 };
 #define NMNEMONIC ((int)(sizeof mnemonic / sizeof mnemonic[0]))
 
@@ -241,9 +283,46 @@ const char *dvm_status_name(dvm_status_t s) {
         case DVM_TRAP_NOIO:         return "NO_BACKEND";
         case DVM_TRAP_POLICY:       return "BAD_POLICY";
         case DVM_TRAP_DMA_BUDGET:   return "DMA_LIMIT";
+        case DVM_TRAP_MEM:          return "MEM_RANGE";
+        case DVM_TRAP_MEM_BUDGET:   return "MEM_LIMIT";
+        case DVM_TRAP_SYS_DENIED:   return "SYS_DENIED";
+        case DVM_TRAP_SYS_BUDGET:   return "SYS_LIMIT";
+        case DVM_TRAP_REENTRY:      return "REENTRY";
         default:                    return "?";
     }
 }
+
+/* ---- the syscall table ----
+ *
+ * One row per hole. The arity is what `sys` pops off the data stack, and it
+ * lives here rather than in the interpreter so that the name a program writes,
+ * the number the policy allows and the number of arguments popped cannot drift
+ * apart. */
+static const struct { const char *name; int8_t arity; } sys_info[DVM_SYS__COUNT] = {
+    [DVM_SYS_CON_WRITE]  = { "con.write",  2 },
+    [DVM_SYS_FS_READ]    = { "fs.read",    4 },
+    [DVM_SYS_FS_WRITE]   = { "fs.write",   4 },
+    [DVM_SYS_FS_SIZE]    = { "fs.size",    2 },
+    [DVM_SYS_AUDIO_TONE] = { "audio.tone", 2 },
+    [DVM_SYS_TIME_MS]    = { "time.ms",    0 },
+};
+
+const char *dvm_sys_name(dvm_sys_nr_t nr) {
+    if ((unsigned)nr >= DVM_SYS__COUNT || !sys_info[nr].name) return "?";
+    return sys_info[nr].name;
+}
+
+int dvm_sys_arity(dvm_sys_nr_t nr) {
+    if ((unsigned)nr >= DVM_SYS__COUNT || !sys_info[nr].name) return -1;
+    return sys_info[nr].arity;
+}
+
+/* A syscall is 0 or 1 fs paths' worth of trust; the mask has to hold one bit
+ * per number and nothing here may quietly outgrow it. */
+_Static_assert(DVM_SYS__COUNT <= 32, "sys_allow is a uint32_t bitmask");
+/* The interpreter pops into a fixed four-slot array; a fifth argument needs
+ * that array widened, not a syscall row that quietly overruns it. */
+#define DVM_SYS_MAXARGS 4
 
 /* ====================================================================== */
 /* 3. the assembler                                                       */
@@ -676,6 +755,70 @@ static int assemble_insn(as_t *as, uint8_t op, tok_t *t, int nt, const char *mn)
         }
         break;
 
+    case F_RD_A_B_C:
+        if (need_operands(as, mn, nt, 4) != 0) return -1;
+        if (dst_reg(as, mn, t[0], &ins->dst) != 0) return -1;
+        for (int k = 0; k < 3; k++)
+            if (operand(as, mn, t[k + 1], &ins->kind[k], &ins->val[k]) != 0) return -1;
+        break;
+
+    case F_A_B_C:
+        if (need_operands(as, mn, nt, 3) != 0) return -1;
+        for (int k = 0; k < 3; k++)
+            if (operand(as, mn, t[k], &ins->kind[k], &ins->val[k]) != 0) return -1;
+        break;
+
+    case F_RD_STR_A:
+        if (need_operands(as, mn, nt, 3) != 0) return -1;
+        if (dst_reg(as, mn, t[0], &ins->dst) != 0) return -1;
+        /* Source order is `mstr rd, dst, "text"`; the string is interned into
+         * slot 0 and the offset into slot 1. See fmt_t. */
+        rd = intern_string(as, t[2]);
+        if (rd < 0) return -1;
+        ins->kind[0] = DVM_O_STR; ins->val[0] = (uint64_t)rd;
+        if (operand(as, mn, t[1], &ins->kind[1], &ins->val[1]) != 0) return -1;
+        break;
+
+    case F_RD_STR_A_B:
+        if (need_operands(as, mn, nt, 4) != 0) return -1;
+        if (dst_reg(as, mn, t[0], &ins->dst) != 0) return -1;
+        rd = intern_string(as, t[3]);
+        if (rd < 0) return -1;
+        ins->kind[0] = DVM_O_STR; ins->val[0] = (uint64_t)rd;
+        if (operand(as, mn, t[1], &ins->kind[1], &ins->val[1]) != 0) return -1;
+        if (operand(as, mn, t[2], &ins->kind[2], &ins->val[2]) != 0) return -1;
+        break;
+
+    case F_SYS: {
+        if (need_operands(as, mn, nt, 2) != 0) return -1;
+        if (dst_reg(as, mn, t[0], &ins->dst) != 0) return -1;
+        /* A name first, so `sys r1, fs.read` reads as what it does. A bare
+         * number still works, because a program generated from a table should
+         * not have to know the spelling. */
+        int nr = -1;
+        for (int k = 0; k < DVM_SYS__COUNT; k++)
+            if (sys_info[k].name && tok_ieq(t[1].s, t[1].len, sys_info[k].name)) {
+                nr = k; break;
+            }
+        if (nr >= 0) {
+            ins->kind[0] = DVM_O_IMM; ins->val[0] = (uint64_t)nr;
+            break;
+        }
+        uint64_t v;
+        if (parse_num(t[1].s, t[1].len, &v) == 0 && v < DVM_SYS__COUNT) {
+            ins->kind[0] = DVM_O_IMM; ins->val[0] = v;
+            break;
+        }
+        {
+            char names[160];
+            sb_t s; sb_init(&s, names, sizeof names);
+            for (int k = 0; k < DVM_SYS__COUNT; k++)
+                sb_addf(&s, "%s%s", k ? " " : "", dvm_sys_name((dvm_sys_nr_t)k));
+            return aerr(as, "sys: \"%.*s\" is not a syscall on this machine; it has %s",
+                        t[1].len, t[1].s, names);
+        }
+    }
+
     case F_RD_BDF_OFF: {
         if (need_operands(as, mn, nt, 3) != 0) return -1;
         if (dst_reg(as, mn, t[0], &ins->dst) != 0) return -1;
@@ -831,10 +974,13 @@ static int assemble_pass(as_t *as, const char *src, size_t len, int pass) {
             static const struct { const char *pfx, *hint; } near[] = {
                 { "ou", " (did you mean out8, out16 or out32?)" },
                 { "in", " (did you mean in8, in16 or in32?)"    },
-                { "ld", " (did you mean ld8, ld16 or ld32?)"    },
+                { "ld", " (did you mean ld8, ld16 or ld32? scratch memory is "
+                        "mld8/mld16/mld32/mld64)"               },
                 { "mr", " (did you mean ld8, ld16 or ld32?)"    },
-                { "st", " (did you mean st8, st16 or st32?)"    },
+                { "st", " (did you mean st8, st16 or st32? scratch memory is "
+                        "mst8/mst16/mst32/mst64)"               },
                 { "mw", " (did you mean st8, st16 or st32?)"    },
+                { "ml", " (did you mean mld8, mld16, mld32 or mld64?)" },
                 { "pc", " (did you mean pcicfg?)"               },
             };
             const char *hint = "";
@@ -902,7 +1048,14 @@ static int kind_is_value(uint8_t k) {
  * cannot, say, hand a PC-kind operand to `out32` and have it treated as data. */
 static int fmt_wants_dst(int fmt) {
     return fmt == F_RD || fmt == F_RD_A || fmt == F_RD_A_B || fmt == F_RD_PORT ||
-           fmt == F_RD_ADDR || fmt == F_RD_BDF_OFF;
+           fmt == F_RD_ADDR || fmt == F_RD_BDF_OFF || fmt == F_RD_A_B_C ||
+           fmt == F_RD_STR_A || fmt == F_RD_STR_A_B || fmt == F_SYS;
+}
+
+/* Formats whose operand 0 is a string literal, and for which it is REQUIRED. */
+static int fmt_wants_str(int fmt) {
+    return fmt == F_STR || fmt == F_STR_OPT_A || fmt == F_RD_STR_A ||
+           fmt == F_RD_STR_A_B;
 }
 
 dvm_status_t dvm_program_validate(const dvm_program_t *p, dvm_asm_err_t *err) {
@@ -947,7 +1100,7 @@ dvm_status_t dvm_program_validate(const dvm_program_t *p, dvm_asm_err_t *err) {
         /* Only a branch may carry a PC operand, and only in slot 0; only abort
          * and print may carry a string, and only in slot 0. */
         int want_pc  = (fmt == F_LBL);
-        int want_str = (fmt == F_STR || fmt == F_STR_OPT_A);
+        int want_str = fmt_wants_str(fmt);
         for (int k = 0; k < 3; k++) {
             int is_pc  = (in->kind[k] == DVM_O_PC);
             int is_str = (in->kind[k] == DVM_O_STR);
@@ -966,10 +1119,21 @@ dvm_status_t dvm_program_validate(const dvm_program_t *p, dvm_asm_err_t *err) {
                               (unsigned long)i, dvm_op_name(in->op));
             return DVM_TRAP_BADOP;
         }
-        if (fmt == F_STR && in->kind[0] != DVM_O_STR) {
+        if (fmt != F_STR_OPT_A && want_str && in->kind[0] != DVM_O_STR) {
             if (err) snprintf(err->msg, sizeof err->msg,
                               "instruction %lu (%s): operand 0 is not a string",
                               (unsigned long)i, dvm_op_name(in->op));
+            return DVM_TRAP_BADOP;
+        }
+        /* A syscall number is baked in by the assembler and is never a
+         * register: which hole a program reaches through must be decidable by
+         * reading the program, not by running it. */
+        if (fmt == F_SYS && (in->kind[0] != DVM_O_IMM || in->val[0] >= DVM_SYS__COUNT)) {
+            if (err) snprintf(err->msg, sizeof err->msg,
+                              "instruction %lu (sys): syscall number %lu is not one of "
+                              "the %d this VM has",
+                              (unsigned long)i, (unsigned long)in->val[0],
+                              (int)DVM_SYS__COUNT);
             return DVM_TRAP_BADOP;
         }
         for (int k = 0; k < 3; k++) {
@@ -1082,12 +1246,30 @@ size_t dvm_disasm(const dvm_program_t *p, uint32_t pc, char *buf, size_t cap) {
         case F_NONE:
             break;
         case F_RD: case F_RD_A: case F_RD_A_B: case F_RD_PORT: case F_RD_BDF_OFF:
+        case F_RD_A_B_C:
             sb_addf(&s, " r%u", in->dst);
             for (int k = 0; k < 3; k++)
                 if (in->kind[k] != DVM_O_NONE) {
                     sb_addf(&s, ", ");
                     put_operand(&s, p, in->kind[k], in->val[k]);
                 }
+            break;
+        /* The string is encoded in slot 0 but written last, so the listing has
+         * to reorder it back: a disassembly a model cannot paste into the next
+         * attempt is not a listing, it is a riddle. */
+        case F_RD_STR_A: case F_RD_STR_A_B:
+            sb_addf(&s, " r%u, ", in->dst);
+            put_operand(&s, p, in->kind[1], in->val[1]);
+            if (fmt == F_RD_STR_A_B) {
+                sb_addf(&s, ", ");
+                put_operand(&s, p, in->kind[2], in->val[2]);
+            }
+            sb_addf(&s, ", ");
+            put_operand(&s, p, in->kind[0], in->val[0]);
+            break;
+        case F_SYS:
+            sb_addf(&s, " r%u, %s", in->dst,
+                    dvm_sys_name((dvm_sys_nr_t)in->val[0]));
             break;
         case F_RD_ADDR:
             sb_addf(&s, " r%u, [", in->dst);
@@ -1281,6 +1463,95 @@ int dvm_dma_check(char *msg, size_t cap) {
     return 1;
 }
 
+/* ---- the scratch arena ----
+ *
+ * The program's own memory: an address space of its own, addressed by offset,
+ * that no device sees and no policy governs. Plain .bss, not volatile (nothing
+ * outside this file reads it while a program runs) and not guarded (nothing can
+ * overrun it — every access is bounds-checked against DVM_MEM_SIZE before the
+ * pointer is formed, which is a stronger property than the DMA arena's guard
+ * bands can offer, because there the threat is hardware).
+ *
+ * Zeroed by dvm_run() before the first instruction, so a program cannot read
+ * what the last one left. The kernel still can, until the next run: see
+ * dvm_mem_peek(). */
+static uint8_t dvm_mem[DVM_MEM_SIZE];
+
+size_t dvm_mem_peek(uint64_t off, void *dst, size_t n) {
+    if (!dst || !n) return 0;
+    if (off >= DVM_MEM_SIZE) return 0;
+    uint64_t room = (uint64_t)DVM_MEM_SIZE - off;
+    if ((uint64_t)n > room) n = (size_t)room;
+    uint8_t *d = (uint8_t *)dst;
+    for (size_t i = 0; i < n; i++) d[i] = dvm_mem[off + i];
+    return n;
+}
+
+/* A path is acceptable if it is absolute, printable, bounded, and made only of
+ * components that are neither "." nor "..". Shared by dvm_policy_set_fs_root()
+ * and the fs.* argument check, so a root and a path are held to one rule.
+ * Returns 0, or -1 with a reason in `why`. */
+static int path_ok(const char *s, size_t len, char *why, size_t cap) {
+    sb_t w;
+    sb_init(&w, why, cap);
+    if (!len)              { sb_addf(&w, "the path is empty"); return -1; }
+    if (len >= DVM_PATH_MAX) {
+        sb_addf(&w, "the path is %lu bytes; the limit is %d",
+                (unsigned long)len, DVM_PATH_MAX - 1);
+        return -1;
+    }
+    if (s[0] != '/')       { sb_addf(&w, "the path must be absolute (start with '/')");
+                             return -1; }
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c >= 0x7F) {
+            sb_addf(&w, "byte %lu of the path is 0x%02x, which is not printable ASCII",
+                    (unsigned long)i, (unsigned)c);
+            return -1;
+        }
+    }
+    /* Component walk. ".." is refused rather than resolved: resolving it here
+     * and in the VFS would be two implementations of one rule, and the pair
+     * that disagrees is how a confinement gets escaped. */
+    for (size_t i = 0; i < len;) {
+        while (i < len && s[i] == '/') i++;
+        size_t j = i;
+        while (j < len && s[j] != '/') j++;
+        size_t n = j - i;
+        if ((n == 1 && s[i] == '.') || (n == 2 && s[i] == '.' && s[i + 1] == '.')) {
+            sb_addf(&w, "the path contains a \"%.*s\" component; write the whole path "
+                        "out instead", (int)n, s + i);
+            return -1;
+        }
+        i = j;
+    }
+    return 0;
+}
+
+int dvm_policy_set_fs_root(dvm_policy_t *p, const char *root) {
+    if (!p || !root) return -1;
+    size_t n = 0;
+    while (n < DVM_PATH_MAX && root[n]) n++;
+    if (n >= DVM_PATH_MAX) return -1;
+    char why[DVM_MSG_MAX];
+    if (path_ok(root, n, why, sizeof why) != 0) return -1;
+    for (size_t i = 0; i < n; i++) p->fs_root[i] = root[i];
+    for (size_t i = n; i < DVM_PATH_MAX; i++) p->fs_root[i] = '\0';
+    return 0;
+}
+
+int dvm_policy_allow_sys(dvm_policy_t *p, dvm_sys_nr_t nr) {
+    if (!p || (unsigned)nr >= DVM_SYS__COUNT || !sys_info[nr].name) return -1;
+    p->sys_allow |= (uint32_t)1u << (unsigned)nr;
+    return 0;
+}
+
+/* 1 if this syscall names a file. Used twice: to demand an fs_root in
+ * dvm_policy_check(), and to know whether to build a path in the interpreter. */
+static int sys_is_fs(dvm_sys_nr_t nr) {
+    return nr == DVM_SYS_FS_READ || nr == DVM_SYS_FS_WRITE || nr == DVM_SYS_FS_SIZE;
+}
+
 int dvm_policy_allow_dma(dvm_policy_t *p, uint64_t base, uint64_t size) {
     if (!p || !size) return -1;
     if (base + size < base) return -1;                 /* wraps */
@@ -1303,6 +1574,10 @@ void dvm_policy_init(dvm_policy_t *p) {
     p->max_steps           = 100000;
     p->max_io              = 4096;
     p->max_dma_ops         = DVM_DMA_SIZE / 2;   /* the whole buffer as st16 */
+    /* 64 passes over the whole scratch arena. A text-shaped program does single
+     * digits; this is generous enough that hitting it means a loop is wrong. */
+    p->max_mem_bytes       = 64ull * DVM_MEM_SIZE;
+    p->max_sys             = 64;
     p->max_delay_us        = 200000;     /* 200 ms */
     p->max_single_delay_us = 50000;      /* 50 ms  */
     p->max_prints          = 64;
@@ -1477,6 +1752,54 @@ dvm_status_t dvm_policy_check(const dvm_policy_t *p, char *msg, size_t cap) {
                     "the scratch buffer",
                 (unsigned long)p->max_dma_ops, (unsigned long)CEIL_DMA_OPS);
         return DVM_TRAP_POLICY;
+    }
+    if (p->max_mem_bytes > CEIL_MEM_BYTES) {
+        sb_addf(&s, "max_mem_bytes %lu exceeds %lu",
+                (unsigned long)p->max_mem_bytes, (unsigned long)CEIL_MEM_BYTES);
+        return DVM_TRAP_POLICY;
+    }
+    if (p->max_sys > CEIL_SYS) {
+        sb_addf(&s, "max_sys %lu exceeds %lu",
+                (unsigned long)p->max_sys, (unsigned long)CEIL_SYS);
+        return DVM_TRAP_POLICY;
+    }
+    /* Syscalls. A bit with no syscall behind it is a corrupt policy, not a
+     * harmless one: it would mean somebody built this mask by arithmetic
+     * instead of by dvm_policy_allow_sys(), and the next number added to the
+     * enum would silently become granted. */
+    if (p->sys_allow >> DVM_SYS__COUNT) {
+        sb_addf(&s, "sys_allow 0x%lx has bits above the %d syscalls this VM has",
+                (unsigned long)p->sys_allow, (int)DVM_SYS__COUNT);
+        return DVM_TRAP_POLICY;
+    }
+    {
+        /* fs_root must be NUL-terminated inside its own array before anything
+         * reads it as a string, and must be a legal path if any fs syscall is
+         * open. An open fs syscall with no root is refused rather than treated
+         * as "/": a confinement that defaults to everything is not one. */
+        size_t rl = 0;
+        while (rl < DVM_PATH_MAX && p->fs_root[rl]) rl++;
+        if (rl >= DVM_PATH_MAX) {
+            sb_addf(&s, "fs_root is not terminated inside its %d-byte field",
+                    DVM_PATH_MAX);
+            return DVM_TRAP_POLICY;
+        }
+        int fs_open = 0;
+        for (int i = 0; i < DVM_SYS__COUNT; i++)
+            if ((p->sys_allow & ((uint32_t)1u << i)) && sys_is_fs((dvm_sys_nr_t)i))
+                fs_open = 1;
+        if (rl) {
+            char why[DVM_MSG_MAX];
+            if (path_ok(p->fs_root, rl, why, sizeof why) != 0) {
+                sb_addf(&s, "fs_root \"%s\" is not usable: %s", p->fs_root, why);
+                return DVM_TRAP_POLICY;
+            }
+        } else if (fs_open) {
+            sb_addf(&s, "a filesystem syscall is allowed but fs_root is empty; a "
+                        "program may not name a file until a caller has said which "
+                        "subtree it may name one in");
+            return DVM_TRAP_POLICY;
+        }
     }
     if (p->max_delay_us > CEIL_DELAY_US) {
         sb_addf(&s, "max_delay_us %lu exceeds %lu",
@@ -1803,6 +2126,260 @@ static dvm_status_t mmio_gate(run_t *st, uint64_t addr, uint32_t width, int writ
     return DVM_OK;
 }
 
+/* ====================================================================== */
+/* scratch memory and the string family                                   */
+/* ====================================================================== */
+
+/* Bound one span against the arena. `len` may be 0, and a zero-length span at
+ * DVM_MEM_SIZE is legal — that is the value every writing op returns, and
+ * refusing to accept it back would make "the end offset" a trap waiting for the
+ * program that filled the arena exactly. */
+static dvm_status_t mem_span(run_t *st, uint64_t off, uint64_t len, const char *what) {
+    if (off > DVM_MEM_SIZE || len > (uint64_t)DVM_MEM_SIZE - off)
+        return trap(st, DVM_TRAP_MEM,
+                    "%s: scratch offset 0x%lx+%lu runs outside the %u-byte arena "
+                    "(valid offsets are 0-%u)",
+                    what, (unsigned long)off, (unsigned long)len,
+                    (unsigned)DVM_MEM_SIZE, (unsigned)DVM_MEM_SIZE - 1);
+    return DVM_OK;
+}
+
+/* Charge `n` bytes of memory work. Called as the work happens, not before it,
+ * so a search that runs away stops part-done instead of after. */
+static dvm_status_t mem_charge(run_t *st, uint64_t n, const char *what) {
+    if (st->res->mem_bytes + n < st->res->mem_bytes ||
+        st->res->mem_bytes + n > st->pol->max_mem_bytes)
+        return trap(st, DVM_TRAP_MEM_BUDGET,
+                    "%s: the %lu-byte scratch memory budget is spent (%lu used). "
+                    "Copy less, or search a shorter span",
+                    what, (unsigned long)st->pol->max_mem_bytes,
+                    (unsigned long)st->res->mem_bytes);
+    st->res->mem_bytes += n;
+    return DVM_OK;
+}
+
+/* Both of these are called only after mem_span() has proved the range, which is
+ * why they index without checking. Little-endian and unaligned by design: see
+ * include/dvm.h. */
+static uint64_t mem_load(uint64_t off, uint32_t width) {
+    uint64_t v = 0;
+    for (uint32_t i = 0; i < width; i++) v |= (uint64_t)dvm_mem[off + i] << (i * 8);
+    return v;
+}
+
+static void mem_store(run_t *st, uint64_t off, uint32_t width, uint64_t val) {
+    for (uint32_t i = 0; i < width; i++) dvm_mem[off + i] = (uint8_t)(val >> (i * 8));
+    if (off + width > st->res->mem_hwm) st->res->mem_hwm = (uint32_t)(off + width);
+}
+
+/* ====================================================================== */
+/* syscalls                                                               */
+/* ====================================================================== */
+
+/* Build a NUL-terminated, kernel-owned path out of a scratch span, applying
+ * every rule in one place: bounds, length, printability, "no . or .." and the
+ * policy's fs_root. The backend never sees a byte that has not been through
+ * here. Returns DVM_OK, or a trap already reported. */
+static dvm_status_t sys_path(run_t *st, uint64_t off, uint64_t len,
+                             char *out, const char *what) {
+    dvm_status_t rc = mem_span(st, off, len, what);
+    if (rc != DVM_OK) return rc;
+    rc = mem_charge(st, len, what);
+    if (rc != DVM_OK) return rc;
+
+    if (len >= DVM_PATH_MAX)
+        return trap(st, DVM_TRAP_SYS_DENIED,
+                    "%s: the path is %lu bytes; the limit is %d",
+                    what, (unsigned long)len, DVM_PATH_MAX - 1);
+    for (uint64_t i = 0; i < len; i++) out[i] = (char)dvm_mem[off + i];
+    out[len] = '\0';
+
+    char why[DVM_MSG_MAX];
+    if (path_ok(out, (size_t)len, why, sizeof why) != 0) {
+        /* The path itself is model bytes, so it is NOT echoed raw into a trace
+         * line; path_ok has already refused anything unprintable, but the
+         * message is built from its verdict rather than from the path. */
+        return trap(st, DVM_TRAP_SYS_DENIED, "%s: %s", what, why);
+    }
+
+    const char *root = st->pol->fs_root;
+    size_t rl = 0;
+    while (rl < DVM_PATH_MAX && root[rl]) rl++;
+    /* dvm_policy_check() has already refused an fs syscall with no root, so rl
+     * is non-zero here; the test is kept because this function is one call away
+     * from the filesystem and a defence that costs a compare is worth its line. */
+    if (!rl)
+        return trap(st, DVM_TRAP_SYS_DENIED,
+                    "%s: no filesystem subtree has been granted to this program", what);
+    int under = 1;
+    for (size_t i = 0; i < rl; i++)
+        if (out[i] != root[i]) { under = 0; break; }
+    /* "/vm" must match "/vm/notes" but not "/vmother". A root of "/" matches
+     * everything, and is the one case where no separator follows it. */
+    if (under && rl > 1 && out[rl] != '/' && out[rl] != '\0') under = 0;
+    if (!under)
+        return trap(st, DVM_TRAP_SYS_DENIED,
+                    "%s: \"%s\" is outside \"%s\", the only subtree this program may "
+                    "name", what, out, root);
+    return DVM_OK;
+}
+
+/* Record a syscall's failure text once, where the caller can find it. */
+static void sys_fail(run_t *st, const char *name, int64_t code, const char *why) {
+    char line[DVM_MSG_MAX];
+    snprintf(line, sizeof line, "%s: %s", name, why && why[0] ? why : "failed");
+    copy_printable(st->res->sys_msg, sizeof st->res->sys_msg, line);
+    if (tracing(st, DVM_TRACE_IO))
+        tline(st, "sys %s failed rc=%ld: %s", name, (long)code, st->res->sys_msg);
+}
+
+/* One syscall. `args` holds arity() values in the order they were pushed.
+ * Everything a backend receives has been resolved and bounded here. */
+static dvm_status_t sys_call(run_t *st, dvm_sys_nr_t nr, const uint64_t *args,
+                             uint64_t *out, int *ok) {
+    const dvm_sys_t *sys = st->io->sys;
+    const char      *name = dvm_sys_name(nr);
+    char             err[DVM_MSG_MAX];
+    int64_t          rc = -1;
+    dvm_status_t     s;
+
+    err[0] = '\0';
+    *ok = 0;
+    *out = 0;
+
+    switch (nr) {
+    case DVM_SYS_CON_WRITE: {
+        uint64_t off = args[0], len = args[1];
+        if ((s = mem_span(st, off, len, "con.write")) != DVM_OK) return s;
+        if (len > DVM_SAY_MAX)
+            return trap(st, DVM_TRAP_SYS_DENIED,
+                        "con.write: %lu bytes is more than the %d a console line may "
+                        "carry; split it", (unsigned long)len, DVM_SAY_MAX);
+        if ((s = mem_charge(st, len, "con.write")) != DVM_OK) return s;
+        if (st->res->prints >= st->pol->max_prints)
+            return trap(st, DVM_TRAP_PRINT_BUDGET,
+                        "print budget of %lu lines reached at con.write",
+                        (unsigned long)st->pol->max_prints);
+        if (!sys->con_write)
+            return trap(st, DVM_TRAP_NOIO, "con.write: this VM has no console backend");
+        /* Sanitised HERE, before the kernel sees it. A program's bytes must not
+         * be able to put a '[' in column zero, and the only way to be sure is
+         * that the kernel is handed printable text and prints it through
+         * trace.c's own prefix. */
+        char text[DVM_SAY_MAX + 1];
+        size_t n = 0;
+        for (uint64_t i = 0; i < len; i++) {
+            unsigned char c = dvm_mem[off + i];
+            text[n++] = (c >= 0x20 && c < 0x7F) ? (char)c : '?';
+        }
+        text[n] = '\0';
+        st->res->prints++;
+        rc = sys->con_write(sys->ctx, text, n, err, sizeof err);
+        break;
+    }
+
+    case DVM_SYS_FS_READ: {
+        char path[DVM_PATH_MAX];
+        uint64_t dst = args[2], cap = args[3];
+        if ((s = sys_path(st, args[0], args[1], path, "fs.read")) != DVM_OK) return s;
+        if ((s = mem_span(st, dst, cap, "fs.read")) != DVM_OK) return s;
+        if ((s = mem_charge(st, cap, "fs.read")) != DVM_OK) return s;
+        if (!sys->fs_read)
+            return trap(st, DVM_TRAP_NOIO, "fs.read: this VM has no filesystem backend");
+        rc = sys->fs_read(sys->ctx, path, dvm_mem + dst, (size_t)cap, err, sizeof err);
+        if (rc > 0) {
+            /* A backend that reports more than it was given room for has
+             * already overrun the arena, so this cannot undo it — but it is a
+             * KERNEL bug, not a program error, and it stops the run loudly
+             * instead of handing the program a length it can trust. */
+            if ((uint64_t)rc > cap)
+                return trap(st, DVM_TRAP_NOIO,
+                            "fs.read: the filesystem returned %ld bytes into a %lu-byte "
+                            "buffer; that is a kernel bug, not a problem with this "
+                            "program", (long)rc, (unsigned long)cap);
+            if (dst + (uint64_t)rc > st->res->mem_hwm)
+                st->res->mem_hwm = (uint32_t)(dst + (uint64_t)rc);
+        }
+        break;
+    }
+
+    case DVM_SYS_FS_WRITE: {
+        char path[DVM_PATH_MAX];
+        uint64_t src = args[2], len = args[3];
+        if ((s = sys_path(st, args[0], args[1], path, "fs.write")) != DVM_OK) return s;
+        if ((s = mem_span(st, src, len, "fs.write")) != DVM_OK) return s;
+        if ((s = mem_charge(st, len, "fs.write")) != DVM_OK) return s;
+        if (!sys->fs_write)
+            return trap(st, DVM_TRAP_NOIO, "fs.write: this VM has no filesystem backend");
+        rc = sys->fs_write(sys->ctx, path, dvm_mem + src, (size_t)len, err, sizeof err);
+        break;
+    }
+
+    case DVM_SYS_FS_SIZE: {
+        char path[DVM_PATH_MAX];
+        if ((s = sys_path(st, args[0], args[1], path, "fs.size")) != DVM_OK) return s;
+        if (!sys->fs_size)
+            return trap(st, DVM_TRAP_NOIO, "fs.size: this VM has no filesystem backend");
+        rc = sys->fs_size(sys->ctx, path, err, sizeof err);
+        break;
+    }
+
+    case DVM_SYS_AUDIO_TONE: {
+        uint64_t hz = args[0], ms = args[1];
+        /* Ranges checked here rather than in audio.c so that a program gets the
+         * numbers back in its own terms, and so that the check exists on a host
+         * build where core/audio.c is not linked. */
+        if (hz < 20 || hz > 20000)
+            return trap(st, DVM_TRAP_SYS_DENIED,
+                        "audio.tone: %lu Hz is outside 20-20000", (unsigned long)hz);
+        if (ms < 1 || ms > 5000)
+            return trap(st, DVM_TRAP_SYS_DENIED,
+                        "audio.tone: %lu ms is outside 1-5000", (unsigned long)ms);
+        if (!sys->audio_tone)
+            return trap(st, DVM_TRAP_NOIO, "audio.tone: this VM has no audio backend");
+        rc = sys->audio_tone(sys->ctx, (uint32_t)hz, (uint32_t)ms, err, sizeof err);
+        break;
+    }
+
+    case DVM_SYS_TIME_MS:
+        if (!sys->time_ms)
+            return trap(st, DVM_TRAP_NOIO, "time.ms: this VM has no clock backend");
+        rc = sys->time_ms(sys->ctx, err, sizeof err);
+        break;
+
+    default:
+        return trap(st, DVM_TRAP_BADOP, "sys: syscall %d is not implemented", (int)nr);
+    }
+
+    if (rc < 0) {
+        sys_fail(st, name, rc, err);
+        /* The error code, not the result, and the zero flag says which. A
+         * negative return is a fact about the world (no such file), not a
+         * broken program, so it is the program's to branch on. */
+        uint64_t mag = (rc == (int64_t)0x8000000000000000ll)
+                           ? 0x8000000000000000ull : (uint64_t)(-rc);
+        *out = mag;
+        return DVM_OK;
+    }
+    *ok  = 1;
+    *out = (uint64_t)rc;
+    return DVM_OK;
+}
+
+/* Opcodes that write a register AND emit their own trace line, so the generic
+ * "op rN=value" line at the bottom of the loop would be a duplicate. */
+static int traced_itself(dvm_op_t op) {
+    switch (op) {
+        case DVM_IN8: case DVM_IN16: case DVM_IN32:
+        case DVM_LD8: case DVM_LD16: case DVM_LD32:
+        case DVM_MLD8: case DVM_MLD16: case DVM_MLD32: case DVM_MLD64:
+        case DVM_MATOI: case DVM_SYS: case DVM_PCICFG:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 /* ---- the loop ---- */
 
 static dvm_status_t execute(run_t *st) {
@@ -2118,6 +2695,293 @@ static dvm_status_t execute(run_t *st) {
             break;
         }
 
+        /* ---- scratch memory ---- */
+        case DVM_MLD8: case DVM_MLD16: case DVM_MLD32: case DVM_MLD64: {
+            uint32_t width = 1u << (in->op - DVM_MLD8);
+            const char *mn = dvm_op_name(in->op);
+            uint64_t off = a + b;
+            if (off < a)                       /* the operand sum wrapped */
+                return trap(st, DVM_TRAP_MEM,
+                            "%s: the address 0x%lx+0x%lx wraps past 2^64",
+                            mn, (unsigned long)a, (unsigned long)b);
+            dvm_status_t rc = mem_span(st, off, width, mn);
+            if (rc != DVM_OK) return rc;
+            rc = mem_charge(st, width, mn);
+            if (rc != DVM_OK) return rc;
+            v = mem_load(off, width);
+            res->n_mem_rd++;
+            is_alu = 1;
+            if (tracing(st, DVM_TRACE_ALL))
+                tline(st, "pc=%03lu ln=%lu %s m+0x%lx r%u=0x%lx",
+                      (unsigned long)st->pc, (unsigned long)st->line, mn,
+                      (unsigned long)off, in->dst, (unsigned long)v);
+            break;
+        }
+
+        case DVM_MST8: case DVM_MST16: case DVM_MST32: case DVM_MST64: {
+            uint32_t width = 1u << (in->op - DVM_MST8);
+            const char *mn = dvm_op_name(in->op);
+            uint64_t off = a + b;
+            if (off < a)
+                return trap(st, DVM_TRAP_MEM,
+                            "%s: the address 0x%lx+0x%lx wraps past 2^64",
+                            mn, (unsigned long)a, (unsigned long)b);
+            dvm_status_t rc = mem_span(st, off, width, mn);
+            if (rc != DVM_OK) return rc;
+            rc = mem_charge(st, width, mn);
+            if (rc != DVM_OK) return rc;
+            mem_store(st, off, width, c);
+            res->n_mem_wr++;
+            if (tracing(st, DVM_TRACE_ALL))
+                tline(st, "pc=%03lu ln=%lu %s m+0x%lx val=0x%lx",
+                      (unsigned long)st->pc, (unsigned long)st->line, mn,
+                      (unsigned long)off, (unsigned long)c);
+            break;
+        }
+
+        /* ---- strings ---- */
+        case DVM_MSTR: {
+            const char *text = str_at(p, in->val[0]);
+            uint64_t n = 0;
+            while (text[n]) n++;              /* the pool is NUL-terminated */
+            uint64_t dst = b;
+            dvm_status_t rc = mem_span(st, dst, n, "mstr");
+            if (rc != DVM_OK) return rc;
+            rc = mem_charge(st, n, "mstr");
+            if (rc != DVM_OK) return rc;
+            for (uint64_t i = 0; i < n; i++) dvm_mem[dst + i] = (uint8_t)text[i];
+            if (dst + n > res->mem_hwm) res->mem_hwm = (uint32_t)(dst + n);
+            res->n_mem_wr++;
+            v = dst + n;
+            is_alu = 1;
+            break;
+        }
+
+        case DVM_MCPY: {
+            uint64_t dst = a, src = b, n = c;
+            dvm_status_t rc = mem_span(st, dst, n, "mcpy");
+            if (rc != DVM_OK) return rc;
+            rc = mem_span(st, src, n, "mcpy");
+            if (rc != DVM_OK) return rc;
+            rc = mem_charge(st, n * 2, "mcpy");
+            if (rc != DVM_OK) return rc;
+            /* Overlap-safe, in both directions. Building a message in place is
+             * exactly the case that overlaps, and a copy that corrupts itself
+             * when two spans touch would be a trap for the one program shape
+             * this family exists to make easy. */
+            if (dst < src)
+                for (uint64_t i = 0; i < n; i++) dvm_mem[dst + i] = dvm_mem[src + i];
+            else
+                for (uint64_t i = n; i > 0; i--) dvm_mem[dst + i - 1] = dvm_mem[src + i - 1];
+            if (dst + n > res->mem_hwm) res->mem_hwm = (uint32_t)(dst + n);
+            res->n_mem_rd++;
+            res->n_mem_wr++;
+            v = dst + n;
+            is_alu = 1;
+            break;
+        }
+
+        case DVM_MSET: {
+            uint64_t dst = a, n = c;
+            dvm_status_t rc = mem_span(st, dst, n, "mset");
+            if (rc != DVM_OK) return rc;
+            rc = mem_charge(st, n, "mset");
+            if (rc != DVM_OK) return rc;
+            for (uint64_t i = 0; i < n; i++) dvm_mem[dst + i] = (uint8_t)b;
+            if (dst + n > res->mem_hwm) res->mem_hwm = (uint32_t)(dst + n);
+            res->n_mem_wr++;
+            v = dst + n;
+            is_alu = 1;
+            break;
+        }
+
+        case DVM_MCMP: {
+            uint64_t x = a, y = b, n = c;
+            dvm_status_t rc = mem_span(st, x, n, "mcmp");
+            if (rc != DVM_OK) return rc;
+            rc = mem_span(st, y, n, "mcmp");
+            if (rc != DVM_OK) return rc;
+            rc = mem_charge(st, n * 2, "mcmp");
+            if (rc != DVM_OK) return rc;
+            st->zero = 1; st->below = 0;
+            for (uint64_t i = 0; i < n; i++) {
+                uint8_t u = dvm_mem[x + i], w = dvm_mem[y + i];
+                if (u != w) { st->zero = 0; st->below = (u < w); break; }
+            }
+            res->n_mem_rd++;
+            if (tracing(st, DVM_TRACE_ALL))
+                tline(st, "pc=%03lu ln=%lu mcmp %lu bytes eq=%d below=%d",
+                      (unsigned long)st->pc, (unsigned long)st->line,
+                      (unsigned long)n, st->zero, st->below);
+            break;
+        }
+
+        case DVM_MFIND: {
+            const char *needle = str_at(p, in->val[0]);
+            uint64_t nl = 0;
+            while (needle[nl]) nl++;
+            uint64_t hay = b, n = c;
+            dvm_status_t rc = mem_span(st, hay, n, "mfind");
+            if (rc != DVM_OK) return rc;
+            uint64_t at = hay + n;             /* "not found" is the end offset */
+            st->zero = 0;
+            /* An empty needle matches at the start: that is what every other
+             * search on earth does, and a program that computed a zero length
+             * should get a defined answer rather than a special case. */
+            if (!nl) { at = hay; st->zero = 1; }
+            else if (nl <= n) {
+                for (uint64_t i = 0; i + nl <= n; i++) {
+                    rc = mem_charge(st, 1, "mfind");
+                    if (rc != DVM_OK) return rc;
+                    if (dvm_mem[hay + i] != (uint8_t)needle[0]) continue;
+                    uint64_t k = 1;
+                    while (k < nl && dvm_mem[hay + i + k] == (uint8_t)needle[k]) k++;
+                    rc = mem_charge(st, k - 1, "mfind");
+                    if (rc != DVM_OK) return rc;
+                    if (k == nl) { at = hay + i; st->zero = 1; break; }
+                }
+            }
+            res->n_mem_rd++;
+            v = at;
+            is_alu = 1;
+            break;
+        }
+
+        case DVM_MCHR: {
+            uint64_t hay = a, n = b;
+            dvm_status_t rc = mem_span(st, hay, n, "mchr");
+            if (rc != DVM_OK) return rc;
+            rc = mem_charge(st, n, "mchr");
+            if (rc != DVM_OK) return rc;
+            uint8_t want = (uint8_t)c;
+            uint64_t at = hay + n;
+            st->zero = 0;
+            for (uint64_t i = 0; i < n; i++)
+                if (dvm_mem[hay + i] == want) { at = hay + i; st->zero = 1; break; }
+            res->n_mem_rd++;
+            v = at;
+            is_alu = 1;
+            break;
+        }
+
+        case DVM_MATOI: {
+            uint64_t off = a, n = b, base = c;
+            if (base < 2 || base > 16)
+                return trap(st, DVM_TRAP_RANGE,
+                            "matoi: base %lu is outside 2-16", (unsigned long)base);
+            dvm_status_t rc = mem_span(st, off, n, "matoi");
+            if (rc != DVM_OK) return rc;
+            rc = mem_charge(st, n, "matoi");
+            if (rc != DVM_OK) return rc;
+            /* No sign, no whitespace skipping, no prefix. Digits are consumed
+             * until one is not a digit in this base, and the flag says whether
+             * there was at least one and whether it all fitted. A parser that
+             * quietly returns 0 for "abc" is how a status code becomes a lie. */
+            uint64_t acc = 0;
+            uint64_t digits = 0;
+            int overflow = 0;
+            for (uint64_t i = 0; i < n; i++) {
+                char ch = dlower((char)dvm_mem[off + i]);
+                unsigned d;
+                if (ch >= '0' && ch <= '9')      d = (unsigned)(ch - '0');
+                else if (ch >= 'a' && ch <= 'f') d = (unsigned)(ch - 'a' + 10);
+                else break;
+                if (d >= base) break;
+                if (acc > (0xFFFFFFFFFFFFFFFFull - d) / base) { overflow = 1; break; }
+                acc = acc * base + d;
+                digits++;
+            }
+            st->zero  = (digits > 0 && !overflow);
+            st->below = 0;
+            v = st->zero ? acc : 0;
+            is_alu = 1;
+            if (tracing(st, DVM_TRACE_ALL))
+                tline(st, "pc=%03lu ln=%lu matoi m+0x%lx digits=%lu ok=%d r%u=0x%lx",
+                      (unsigned long)st->pc, (unsigned long)st->line,
+                      (unsigned long)off, (unsigned long)digits, st->zero,
+                      in->dst, (unsigned long)v);
+            break;
+        }
+
+        case DVM_MITOA: {
+            uint64_t dst = a, val = b, base = c;
+            if (base < 2 || base > 16)
+                return trap(st, DVM_TRAP_RANGE,
+                            "mitoa: base %lu is outside 2-16", (unsigned long)base);
+            char tmp[64];
+            int  n = 0;
+            do {
+                unsigned d = (unsigned)(val % base);
+                tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
+                val /= base;
+            } while (val && n < (int)sizeof tmp);
+            dvm_status_t rc = mem_span(st, dst, (uint64_t)n, "mitoa");
+            if (rc != DVM_OK) return rc;
+            rc = mem_charge(st, (uint64_t)n, "mitoa");
+            if (rc != DVM_OK) return rc;
+            for (int i = 0; i < n; i++) dvm_mem[dst + i] = (uint8_t)tmp[n - 1 - i];
+            if (dst + (uint64_t)n > res->mem_hwm) res->mem_hwm = (uint32_t)(dst + n);
+            res->n_mem_wr++;
+            v = dst + (uint64_t)n;
+            is_alu = 1;
+            break;
+        }
+
+        /* ---- the kernel ---- */
+        case DVM_SYS: {
+            dvm_sys_nr_t nr = (dvm_sys_nr_t)in->val[0];
+            int arity = dvm_sys_arity(nr);
+            if (arity < 0)
+                return trap(st, DVM_TRAP_BADOP, "sys: %lu is not a syscall",
+                            (unsigned long)in->val[0]);
+            if (!(pol->sys_allow & ((uint32_t)1u << (unsigned)nr))) {
+                char g[128];
+                sb_t gs; sb_init(&gs, g, sizeof g);
+                int any = 0;
+                for (int i = 0; i < DVM_SYS__COUNT; i++)
+                    if (pol->sys_allow & ((uint32_t)1u << i))
+                        { sb_addf(&gs, "%s%s", any++ ? "," : "",
+                                  dvm_sys_name((dvm_sys_nr_t)i)); }
+                if (!any) sb_addf(&gs, "none");
+                return trap(st, DVM_TRAP_SYS_DENIED,
+                            "sys %s: this program was not granted that syscall (it has %s)",
+                            dvm_sys_name(nr), g);
+            }
+            if (res->n_sys >= pol->max_sys)
+                return trap(st, DVM_TRAP_SYS_BUDGET,
+                            "syscall budget of %lu reached at sys %s",
+                            (unsigned long)pol->max_sys, dvm_sys_name(nr));
+            if (!st->io->sys)
+                return trap(st, DVM_TRAP_NOIO,
+                            "sys %s: this VM has no kernel backend", dvm_sys_name(nr));
+            if (st->dsp < (uint32_t)arity)
+                return trap(st, DVM_TRAP_STACK,
+                            "sys %s takes %d argument(s) pushed onto the data stack, "
+                            "and only %lu are on it",
+                            dvm_sys_name(nr), arity, (unsigned long)st->dsp);
+            if (arity > DVM_SYS_MAXARGS)
+                return trap(st, DVM_TRAP_BADOP,
+                            "sys %s: its arity of %d is past this VM's %d-argument "
+                            "limit, which is a kernel bug",
+                            dvm_sys_name(nr), arity, DVM_SYS_MAXARGS);
+            uint64_t sargs[DVM_SYS_MAXARGS];
+            for (int i = 0; i < DVM_SYS_MAXARGS; i++) sargs[i] = 0;
+            for (int i = arity - 1; i >= 0; i--) sargs[i] = st->dstack[--st->dsp];
+            res->n_sys++;
+            int okflag = 0;
+            dvm_status_t rc = sys_call(st, nr, sargs, &v, &okflag);
+            if (rc != DVM_OK) return rc;
+            st->zero  = okflag;
+            st->below = 0;
+            is_alu = 1;
+            if (tracing(st, DVM_TRACE_IO))
+                tline(st, "pc=%03lu ln=%lu sys %s %s r%u=0x%lx",
+                      (unsigned long)st->pc, (unsigned long)st->line,
+                      dvm_sys_name(nr), okflag ? "ok" : "FAILED",
+                      in->dst, (unsigned long)v);
+            break;
+        }
+
         /* ---- delay ---- */
         case DVM_DELAY: {
             if (a > pol->max_single_delay_us)
@@ -2167,10 +3031,10 @@ static dvm_status_t execute(run_t *st) {
                 return trap(st, DVM_TRAP_RANGE, "%s: destination register r%u does not exist",
                             dvm_op_name(in->op), in->dst);
             st->reg[in->dst] = v;
-            /* I/O reads already traced above, with their access details. */
-            if (tracing(st, DVM_TRACE_ALL) && in->op != DVM_IN8 && in->op != DVM_IN16 &&
-                in->op != DVM_IN32 && in->op != DVM_LD8 && in->op != DVM_LD16 &&
-                in->op != DVM_LD32 && in->op != DVM_PCICFG)
+            /* Anything that already printed its own line above — every I/O
+             * read, and the memory ops whose interesting part is the offset or
+             * the flag rather than the value — is skipped here. */
+            if (tracing(st, DVM_TRACE_ALL) && !traced_itself((dvm_op_t)in->op))
                 tline(st, "pc=%03lu ln=%lu %s r%u=0x%lx",
                       (unsigned long)st->pc, (unsigned long)st->line,
                       dvm_op_name(in->op), in->dst, (unsigned long)v);
@@ -2185,6 +3049,69 @@ dvm_status_t dvm_run(const dvm_program_t *p, const dvm_policy_t *pol,
                      dvm_result_t *res) {
     if (!res) return DVM_TRAP_POLICY;
     dz(res, sizeof *res);
+
+    /* ONE PROGRAM AT A TIME, ENFORCED — not merely intended.
+     *
+     * Two pieces of per-machine state are owned by "the run in progress" and
+     * there is exactly one copy of each: the scratch arena `dvm_mem`, and the
+     * DMA guard bands. Both are (re)initialised a few dozen lines below, at
+     * entry, before the first instruction executes. So a SECOND dvm_run()
+     * starting while a first is still on the stack does not merely share them —
+     * it destroys the first one's, silently, mid-execution:
+     *
+     *   - dz(dvm_mem, ...) erases the outer program's working store. Every
+     *     later mld/mcmp/mfind reads zeros, and nothing traps. include/dvm.h
+     *     promises the model the exact opposite ("the only ways bytes get in
+     *     are the program's own instructions and a syscall's output"); a
+     *     syscall was silently taking every byte OUT. put_scratch() in
+     *     tools/dvm_tools.c sizes its dump from mem_hwm, which still records
+     *     the outer program's pre-syscall stores, so the tool result reported
+     *     the program's answer as that many NUL bytes — the kernel lying to the
+     *     model about what its own program computed.
+     *   - dma_guard_arm() re-poisons both guard bands. Any overrun the outer
+     *     program's device had ALREADY committed was wiped before the caller's
+     *     dvm_dma_check() ran. That is worse than losing a diagnostic:
+     *     tools/dvm_tools.c computes `converged = (st == DVM_OK) && did_work &&
+     *     !dma_overrun` precisely so that a program corrupting memory spends an
+     *     attempt instead of clearing its budget. With the evidence erased,
+     *     dma_overrun was always 0, so the one program that must not get
+     *     unlimited retries got them, and neither the model nor the
+     *     [driver_run.dma ...] trace line ever mentioned the overrun.
+     *
+     * This was reachable, not theoretical, and by the project's intended path:
+     * driver_run grants DVM_SYS_AUDIO_TONE to every program it runs, and once
+     * the model has installed its own audio driver, `sys audio.tone` goes
+     * k_audio_tone -> audio_tone() -> play_buffer() -> run_vm() -> dvm_run().
+     * driver_install strips sys_allow from the resident play program, so nesting
+     * could only ever be one deep — but one deep is all it took.
+     *
+     * The fix is to make the documented invariant true rather than to make the
+     * shared state re-entrant. Saving and restoring 64 KiB of scratch plus two
+     * 64 KiB guard bands per nesting level would cost more .bss than the arena
+     * itself, and it would still leave the deeper problem: the inner program's
+     * device may be mastering into the same arena the outer program just handed
+     * to its own device, and no bookkeeping fixes that. There is one machine and
+     * one set of hardware; one program at a time is the honest contract.
+     *
+     * Refused BEFORE any side effect, so the outer run is untouched: no zeroing,
+     * no re-arming, no trace line, and the caller gets a sentence that says what
+     * to do instead. A native (C) audio sink is unaffected — it never re-enters
+     * the VM — so this only ever refuses the VM-sink case, where it must. */
+    static int in_run;
+    if (in_run) {
+        res->status = DVM_TRAP_REENTRY;
+        /* This text has a HARD length budget. It comes back to the program
+         * through sys_fail(), which prefixes the syscall name ("audio.tone: ")
+         * and then truncates the whole thing to DVM_MSG_MAX. A sentence that
+         * only just fits on its own loses its most useful clause — the one
+         * saying what to do instead — the moment it is prefixed. Keep it inside
+         * DVM_MSG_MAX minus room for the longest syscall name. */
+        copy_printable(res->msg, sizeof res->msg,
+                       "one driver program at a time: a second run would reset the "
+                       "scratch memory and DMA guard bands under the first. Ask for "
+                       "this after the run finishes, not inside it");
+        return DVM_TRAP_REENTRY;
+    }
 
     run_t st;
     dz(&st, sizeof st);
@@ -2262,6 +3189,22 @@ dvm_status_t dvm_run(const dvm_program_t *p, const dvm_policy_t *pol,
         else
             trace_ok("dvm.grant", "dma none");
 
+        /* Scratch memory is stated too, and stated as unconditional: it is not
+         * a grant, it is a property of the machine, and a model reading the
+         * trace should not have to wonder whether this run had memory. */
+        sb_init(&s, g, sizeof g);
+        {
+            int any = 0;
+            for (int i = 0; i < DVM_SYS__COUNT; i++)
+                if (pol->sys_allow & ((uint32_t)1u << i))
+                    sb_addf(&s, "%s%s", any++ ? "," : "", dvm_sys_name((dvm_sys_nr_t)i));
+            if (!any) sb_addf(&s, "none");
+        }
+        res->trace_lines++;
+        trace_ok("dvm.grant", "mem %u bytes scratch (zeroed); sys %s%s%s",
+                 (unsigned)DVM_MEM_SIZE, g,
+                 pol->fs_root[0] ? " under " : "", pol->fs_root);
+
         res->trace_lines++;
         trace_ok("dvm.run", "insns=%lu args=%d steps<=%lu io<=%lu delay<=%lu us trace=%d",
                  (unsigned long)p->ninsn, nargs, (unsigned long)pol->max_steps,
@@ -2274,9 +3217,27 @@ dvm_status_t dvm_run(const dvm_program_t *p, const dvm_policy_t *pol,
      * mastering after the run returns can still dirty the guard between the check
      * and the next run's arming, in which case the next run is blamed — that is
      * the honest limit of attribution without an IOMMU. */
+    /* From here to the end of execute() this machine has a program running, and
+     * the two blocks below are the state that makes that exclusive. Set after
+     * every validation failure has already returned, so a rejected call does not
+     * lock anything out. */
+    in_run = 1;
+
     if (pol->dma_size) dma_guard_arm();
 
+    /* Zero the scratch arena. Unconditional, and here rather than at the end of
+     * the previous run: a program must not be able to read what another left,
+     * and "the last run cleaned up after itself" is a property that fails
+     * exactly when the last run trapped. The kernel's chance to read a
+     * program's output is the window between dvm_run() returning and the next
+     * one starting — see dvm_mem_peek(). */
+    dz(dvm_mem, sizeof dvm_mem);
+
     dvm_status_t s = execute(&st);
+
+    /* Released the instant execution stops, however it stopped. execute() has no
+     * path that longjmps or panics out, so this is the single exit. */
+    in_run = 0;
 
     for (int i = 0; i < DVM_NREGS; i++) res->reg[i] = st.reg[i];
     res->status = s;
@@ -2288,7 +3249,7 @@ dvm_status_t dvm_run(const dvm_program_t *p, const dvm_policy_t *pol,
         if (s == DVM_OK)
             trace_ok("dvm.halt", "pc=%03lu ln=%lu steps=%lu io=%lu (pr=%lu pw=%lu mr=%lu "
                                  "mw=%lu pci=%lu) dma=%lu (rd=%lu wr=%lu) delay=%lu us "
-                                 "prints=%lu",
+                                 "prints=%lu mem=%lu B sys=%lu",
                      (unsigned long)res->pc, (unsigned long)res->line,
                      (unsigned long)res->steps, (unsigned long)res->io_ops,
                      (unsigned long)res->n_port_rd, (unsigned long)res->n_port_wr,
@@ -2296,7 +3257,8 @@ dvm_status_t dvm_run(const dvm_program_t *p, const dvm_policy_t *pol,
                      (unsigned long)res->n_pci_rd,
                      (unsigned long)res->n_dma_rd + res->n_dma_wr,
                      (unsigned long)res->n_dma_rd, (unsigned long)res->n_dma_wr,
-                     (unsigned long)res->delay_us, (unsigned long)res->prints);
+                     (unsigned long)res->delay_us, (unsigned long)res->prints,
+                     (unsigned long)res->mem_bytes, (unsigned long)res->n_sys);
         else
             trace_err(DVM_TRACE_ERR, "dvm.stop", "%s steps=%lu io=%lu delay=%lu us",
                       dvm_status_name(s), (unsigned long)res->steps,
@@ -2392,6 +3354,121 @@ static void hw_delay_us(void *ctx, uint32_t us) {
     while (rdtsc() < end) { }
 }
 
+/* ---- the kernel-call backend ----
+ *
+ * Six functions, each one a hole this file has already argued for. What they
+ * are NOT is a place to put policy: by the time one of these runs, the VM has
+ * bounded every span, built and confined every path, and range-checked every
+ * scalar. These translate, and nothing else — a check that appears here and not
+ * in the portable half is a check no host test can prove.
+ *
+ * They return >= 0 or a negative code with a sentence in `err`. The sentence is
+ * what the model reads next turn, so it says what the kernel refused, not that
+ * something went wrong. */
+
+#include "vfs.h"
+#include "audio.h"
+
+static int64_t k_con_write(void *ctx, const char *text, size_t len,
+                           char *err, size_t errcap) {
+    (void)ctx; (void)err; (void)errcap;
+    /* Through trace.c, so the '[' in column zero stays the kernel's. The text
+     * is already printable-only: the VM sanitised it before this was called. */
+    trace_ok("dvm.say", "%s", text);
+    return (int64_t)len;
+}
+
+/* One sentence per VFS code, because "-2" is not something a model can act on
+ * and "no such file" is. */
+static const char *vfs_why(int64_t rc) {
+    switch (rc) {
+        case VFS_ENOENT:  return "no such file or directory";
+        case VFS_EEXIST:  return "it already exists";
+        case VFS_ENOTDIR: return "a component of the path is not a directory";
+        case VFS_ENOSPC:  return "the filesystem is full";
+        case VFS_EINVAL:  return "the filesystem refused the path or the access mode";
+        default:          return "the filesystem refused the operation";
+    }
+}
+
+static int64_t k_fs_read(void *ctx, const char *path, void *dst, size_t cap,
+                         char *err, size_t errcap) {
+    (void)ctx;
+    file_t *f = vfs_open(path, O_RDONLY);
+    if (!f) {
+        snprintf(err, errcap, "cannot open %s: %s", path, vfs_why(VFS_ENOENT));
+        return VFS_ENOENT;
+    }
+    int64_t n = vfs_read(f, dst, (uint64_t)cap);
+    vfs_close(f);
+    if (n < 0) {
+        snprintf(err, errcap, "reading %s: %s", path, vfs_why(n));
+        return n;
+    }
+    return n;
+}
+
+static int64_t k_fs_write(void *ctx, const char *path, const void *src, size_t len,
+                          char *err, size_t errcap) {
+    (void)ctx;
+    file_t *f = vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (!f) {
+        snprintf(err, errcap, "cannot create %s: %s", path, vfs_why(VFS_EINVAL));
+        return VFS_EINVAL;
+    }
+    int64_t n = len ? vfs_write(f, src, (uint64_t)len) : 0;
+    vfs_close(f);
+    if (n < 0) {
+        snprintf(err, errcap, "writing %s: %s", path, vfs_why(n));
+        return n;
+    }
+    return n;
+}
+
+static int64_t k_fs_size(void *ctx, const char *path, char *err, size_t errcap) {
+    (void)ctx;
+    vfs_stat_t stt;
+    int rc = vfs_stat(path, &stt);
+    if (rc != VFS_OK) {
+        snprintf(err, errcap, "%s: %s", path, vfs_why(rc));
+        return rc;
+    }
+    return (int64_t)stt.size;
+}
+
+static int64_t k_audio_tone(void *ctx, uint32_t hz, uint32_t ms,
+                            char *err, size_t errcap) {
+    (void)ctx;
+    if (!audio_available()) {
+        snprintf(err, errcap, "this machine has no audio sink installed; "
+                              "driver_install puts one there");
+        return -1;
+    }
+    int rc = audio_tone(hz, ms);
+    if (rc != AUDIO_OK) {
+        snprintf(err, errcap, "the audio service refused: %s", audio_last_error());
+        return -1;
+    }
+    return 0;
+}
+
+static int64_t k_time_ms(void *ctx, char *err, size_t errcap) {
+    (void)ctx; (void)err; (void)errcap;
+    return (int64_t)millis();
+}
+
+static const dvm_sys_t hw_sys = {
+    .ctx        = 0,
+    .con_write  = k_con_write,
+    .fs_read    = k_fs_read,
+    .fs_write   = k_fs_write,
+    .fs_size    = k_fs_size,
+    .audio_tone = k_audio_tone,
+    .time_ms    = k_time_ms,
+};
+
+const dvm_sys_t *dvm_sys_kernel(void) { return &hw_sys; }
+
 static const dvm_io_t hw_io = {
     .ctx        = 0,
     .port_write = hw_port_write,
@@ -2400,12 +3477,14 @@ static const dvm_io_t hw_io = {
     .mmio_read  = hw_mmio_read,
     .pci_read32 = hw_pci_read32,
     .delay_us   = hw_delay_us,
+    .sys        = &hw_sys,
 };
 
 const dvm_io_t *dvm_io_hardware(void) { return &hw_io; }
 
-#else   /* host build: there is no hardware to reach */
+#else   /* host build: there is no hardware and no kernel to reach */
 
-const dvm_io_t *dvm_io_hardware(void) { return 0; }
+const dvm_io_t  *dvm_io_hardware(void) { return 0; }
+const dvm_sys_t *dvm_sys_kernel(void)  { return 0; }
 
 #endif

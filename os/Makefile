@@ -111,6 +111,7 @@ FLAGS_CHANGED := $(if $(DRY_RUN),,$(shell \
   if [ "$$(cat $(BUILD_STAMP) 2>/dev/null)" != '$(BUILD_FLAGS)' ]; then \
      if [ -f $(BUILD_STAMP) ]; then echo changed; fi; \
      find . \( -name '*.o' -o -name '*.d' \) -not -path './tests/*' -delete; \
+     rm -f tests/qemu/fixtures/*.o tests/qemu/fixtures/*.d; \
      rm -f kernel.elf kernel.bin; \
      printf '%s' '$(BUILD_FLAGS)' > $(BUILD_STAMP); \
   fi))
@@ -118,6 +119,17 @@ ifeq ($(FLAGS_CHANGED),changed)
 $(info make: EXTRA_CFLAGS changed to "$(EXTRA_CFLAGS)"; discarded every kernel \
 object so nothing is built with the previous flag set)
 endif
+# The `-not -path './tests/*'` above protects tests/build, which has its own flag
+# stamp. tests/qemu/fixtures is the exception and is purged explicitly, because a
+# fixture object is only in $(KERNEL_OBJS) when its flag is set — so after
+# `make EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE` the AC'97 fixture's .o and .d
+# survived the flip back. The .o was harmless (nothing linked it), but the .d was
+# not: it names vm/programs/ac97_bringup.h as a prerequisite, and the audits that
+# check THIS KERNEL KNOWS NOTHING ABOUT AUDIO read the -MMD depfiles to find out
+# what a default build compiled (tests/qemu/lint_printf.py does exactly that). A
+# stale depfile therefore made a source audit report a full AC'97 register map
+# inside the default build. The claim being audited is the whole point of this
+# project, so the audit must not be able to see a previous build's ghosts.
 LDFLAGS := -n -T linker.ld
 # libgcc supplies compiler runtime helpers (e.g. __udivti3 for 128-bit division
 # used by mbedTLS bignum) that aren't otherwise available freestanding.
@@ -132,9 +144,13 @@ TOOL_SRCS := $(wildcard tools/*.c)
 
 KERNEL_SRCS := kernel/main.c kernel/drivers.c $(TOOL_SRCS) \
                arch/x86_64/idt.c arch/x86_64/fault.c \
-               core/kobject.c core/tool.c core/audio.c mm/heap.c device/device.c \
+               core/kobject.c core/tool.c core/audio.c core/fiber.c \
+               core/capability.c core/agenda.c \
+               mm/heap.c device/device.c \
                fs/vfs/vfs.c fs/native/ramfs.c fs/fs.c \
-               lib/base.c lib/libc_shim.c lib/trace.c \
+               fs/fat/fat_vol.c fs/fat/fat_dir.c fs/fat/fat.c \
+               drivers/block/block.c drivers/block/ata.c \
+               lib/base.c lib/libc_shim.c lib/kfmt.c lib/trace.c \
                lib/fb.c lib/font.c lib/font_spleen8x16.c \
                gui/wm.c gui/widgets.c gui/gui_demo.c \
                apps/runtime.c apps/expr.c apps/cap.c apps/app_selftest.c \
@@ -148,7 +164,7 @@ KERNEL_SRCS := kernel/main.c kernel/drivers.c $(TOOL_SRCS) \
                drivers/input/mouse.c \
                drivers/net/e1000.c drivers/rtc/rtc.c \
                net/json.c net/model.c net/chat.c net/sse.c net/net.c \
-               net/faultchat.c net/tls_ca.c
+               net/fetch.c net/faultchat.c net/tls_ca.c
 
 # The exception self-test, in DIAGNOSTIC BUILDS ONLY. fault_inject.c exports
 # fault_inject(), which deliberately divides by zero and dereferences an
@@ -200,7 +216,9 @@ LWIP_OBJS := $(LWIP_SRCS:.c=.o)
 MBEDTLS_SRCS := $(wildcard mbedtls/library/*.c)
 MBEDTLS_OBJS := $(MBEDTLS_SRCS:.c=.o)
 
-ARCH_ASM_OBJS := arch/x86_64/isr.o
+# isr.asm: the 256 exception stubs. switch.asm: the fiber context switch — the
+# only two places in this tree where C cannot express what has to happen.
+ARCH_ASM_OBJS := arch/x86_64/isr.o arch/x86_64/switch.o
 
 OBJS    := boot/boot.o $(ARCH_ASM_OBJS) $(KERNEL_OBJS) $(LWIP_OBJS) $(MBEDTLS_OBJS)
 
@@ -386,12 +404,74 @@ RESIZE_WINDOW = ( W=$$((720 * $(ZOOM))); H=$$((400 * $(ZOOM) + 28)); \
 # down with it.
 QEMU_EXTRA ?=
 
-run: kernel.bin
-	@$(RESIZE_WINDOW)
-	@$(KEY_ARGS) qemu-system-x86_64 -kernel kernel.bin $(NETFLAGS) $(QEMU_EXTRA) -display $(QEMU_DISPLAY) -serial stdio "$$@"
+# ===========================================================================
+# THE DISK — the only thing on this machine that survives a reboot
+#
+#   make run                     attaches disk.img, creating it if it is absent
+#   make disk                    just create it
+#   make disk DISK_MB=512        a bigger one (default 128 MiB)
+#   make run DISK_IMG=           boot with NO disk at all (the old behaviour)
+#   make disk-mount              attach the image on this Mac and READ IT
+#   make disk-unmount            eject it again
+#   make disk-erase              throw the machine's memory away and start over
+#
+# WHY dd AND NOT newfs_msdos. The image this target makes is 128 MiB of zeros
+# and nothing else. The KERNEL formats it, on its first boot, with its own
+# mkfs (fs/fat/fat_vol.c) — which means `make disk-mount` on this Mac is a test
+# of the filesystem this kernel actually writes, not of Apple's. A blank image
+# is also the only thing fs/fat/fat.c will format without being asked: anything
+# it does not recognise is left untouched, because a disk holding something
+# unreadable is far more likely to be data somebody wants than a mistake.
+#
+# NOTHING SECRET GOES IN HERE. The API key travels host -> guest over fw_cfg
+# into RAM (see KEY_ARGS above) and is never written to a file the guest can
+# see. The image is gitignored for size and churn, not for secrecy.
+#
+# `clean` deliberately does NOT delete it: it is the machine's accumulated
+# work, and a build system that erases the disk is a build system nobody can
+# trust. `make disk-erase` is the deliberate way.
+# ===========================================================================
+DISK_IMG ?= disk.img
+DISK_MB  ?= 128
 
-run-nox: kernel.bin
-	@$(KEY_ARGS) qemu-system-x86_64 -kernel kernel.bin $(NETFLAGS) $(QEMU_EXTRA) -display none -serial stdio "$$@"
+# A literal comma cannot appear inside $(if ...) arguments: make splits on it.
+comma := ,
+# Empty when DISK_IMG is empty, which is how a no-disk boot is asked for.
+DISKFLAGS = $(if $(DISK_IMG),-drive file=$(DISK_IMG)$(comma)format=raw$(comma)if=ide$(comma)index=0$(comma)media=disk,)
+
+$(DISK_IMG):
+	@dd if=/dev/zero of=$@ bs=1m count=$(DISK_MB) >/dev/null 2>&1 || \
+	   { echo "disk: could not create $@"; exit 1; }
+	@echo "disk: created $@, $(DISK_MB) MiB of zeros. The kernel formats it as"
+	@echo "      FAT32 on the next boot and mounts it at /disk."
+
+disk: $(DISK_IMG)
+
+disk-erase:
+	rm -f $(DISK_IMG)
+	@$(MAKE) --no-print-directory $(DISK_IMG)
+
+# Read the machine's disk from macOS. This is the strongest possible check on
+# the filesystem: a FAT32 volume written entirely by this kernel, mounted by an
+# operating system that has never heard of it.
+disk-mount: $(DISK_IMG)
+	@hdiutil attach -imagekey diskimage-class=CRawDiskImage $(DISK_IMG) || \
+	   { echo "disk: hdiutil refused the image (is it already attached?)"; exit 1; }
+	@echo ""
+	@ls -la /Volumes/TALKOS 2>/dev/null || true
+	@echo ""
+	@echo "eject it with 'make disk-unmount' before booting the machine again."
+
+disk-unmount:
+	@diskutil eject /Volumes/TALKOS 2>/dev/null || \
+	   echo "disk: nothing mounted at /Volumes/TALKOS"
+
+run: kernel.bin $(DISK_IMG)
+	@$(RESIZE_WINDOW)
+	@$(KEY_ARGS) qemu-system-x86_64 -kernel kernel.bin $(NETFLAGS) $(DISKFLAGS) $(QEMU_EXTRA) -display $(QEMU_DISPLAY) -serial stdio "$$@"
+
+run-nox: kernel.bin $(DISK_IMG)
+	@$(KEY_ARGS) qemu-system-x86_64 -kernel kernel.bin $(NETFLAGS) $(DISKFLAGS) $(QEMU_EXTRA) -display none -serial stdio "$$@"
 
 # ===========================================================================
 # Bootable media — GRUB, an ISO, and a USB stick
@@ -538,6 +618,12 @@ HOST_STAMP       := tests/build/.host-flags
 
 # Kernel sources under test, per test binary. Add a line when adding a test.
 TESTSRC_test_heap := mm/heap.c
+# test_fiber links the REAL heap, because a fiber stack is a kmalloc'd block and
+# "the poison band caught the overrun instead of the allocator finding it later"
+# is only a claim worth making against the allocator that would have found it.
+# It supplies its OWN fiber_arch_switch/fiber_arch_stack_init: the kernel's live
+# in arch/x86_64/switch.asm and this host is arm64. See the head of the suite.
+TESTSRC_test_fiber := core/fiber.c mm/heap.c
 TESTSRC_test_json := net/json.c
 TESTSRC_test_model_mock := net/json.c net/model.c net/model_mock.c
 TESTSRC_test_input := drivers/input/input.c drivers/input/script.c
@@ -549,6 +635,14 @@ TESTSRC_test_mem_tools := tools/mem_tools.c core/tool.c mm/heap.c lib/trace.c ne
 TESTSRC_test_screen_tools := tools/screen_tools.c core/tool.c lib/trace.c net/json.c
 TESTSRC_test_vfs_tools := tools/vfs_tools.c core/tool.c core/kobject.c mm/heap.c fs/vfs/vfs.c fs/native/ramfs.c lib/trace.c net/json.c
 TESTSRC_test_tool := core/tool.c lib/trace.c net/json.c
+# The persistence stack, whole: FAT32 on the block layer on a synthetic disk,
+# plus the real ATA driver against a synthetic drive (test_fs_disk.c #includes
+# drivers/block/ata.c, hence the prerequisite further down). device/device.c is
+# there because the ATA driver publishes each disk into the device model, and
+# drivers/rtc/rtc.c because FAT timestamps come from the wall clock.
+TESTSRC_test_fs_disk := fs/fat/fat.c fs/fat/fat_dir.c fs/fat/fat_vol.c \
+                        fs/vfs/vfs.c drivers/block/block.c \
+                        core/kobject.c device/device.c mm/heap.c drivers/rtc/rtc.c
 TESTSRC_test_rtc := drivers/rtc/rtc.c tools/time_tools.c core/tool.c lib/trace.c net/json.c
 TESTSRC_test_acpi := drivers/acpi/acpi.c drivers/acpi/power.c tools/power_tools.c \
                      core/tool.c lib/trace.c net/json.c
@@ -606,15 +700,30 @@ apps/runtime.o tests/build/test_app_format: apps/examples/examples_json.h
 # beeper.json is the worked example for a capability call; it reaches the kernel
 # through the same generated header, and the audio self-test embeds it.
 apps/app_audio_selftest.o tests/build/test_app_audio: apps/examples/examples_json.h
+# lib/kfmt.c is the kernel's OWN vsnprintf. Under TALKOS_HOSTTEST it renames
+# itself to kfmt_vsnprintf/kfmt_snprintf so it can be linked ALONGSIDE the host
+# libc, which is the entire point: the suite prints one format string through
+# both formatters and diffs them. Host suites otherwise only ever exercise the
+# host libc, and that is how a star-width defect lived in every model-facing
+# assembler error in vm/dvm.c without a single test going red.
+TESTSRC_test_kfmt := lib/kfmt.c
 TESTSRC_test_trace := lib/trace.c
+# tools/capability_tools.c is #included by the suite, not compiled beside it
+# (REGISTER_TOOL again — see the prerequisite block below), so it is deliberately
+# absent from this list and present there instead.
+TESTSRC_test_capability := core/capability.c core/tool.c core/kobject.c \
+                           mm/heap.c fs/vfs/vfs.c fs/native/ramfs.c \
+                           vm/dvm.c lib/trace.c net/json.c
 TESTSRC_test_dvm := vm/dvm.c lib/trace.c
+TESTSRC_test_dvm_mem := vm/dvm.c lib/trace.c
 TESTSRC_test_dvm_ac97 := vm/dvm.c lib/trace.c
 # core/audio.c is here because driver_install calls audio_register_vm(): the tool
 # family that writes a driver is also the one that installs it as the audio sink,
 # so the suite that tests those tools has to link the service they install into.
 TESTSRC_test_dvm_tools := vm/dvm.c lib/trace.c core/tool.c core/kobject.c \
                           device/device.c mm/heap.c net/json.c net/model.c \
-                          net/model_mock.c net/chat.c core/audio.c
+                          net/model_mock.c net/chat.c core/audio.c \
+                          fs/vfs/vfs.c fs/native/ramfs.c
 # test_audio links the REAL driver VM, so the play path a model-authored driver
 # takes is exercised end to end against a synthetic device on the host: the suite
 # assembles a play program, registers it as the sink, plays a tone, and then reads
@@ -631,10 +740,12 @@ TESTSRC_test_audio := core/audio.c vm/dvm.c core/tool.c core/kobject.c \
 #   $ grep -n '#include "\.\./\.\./.*\.c"' tests/host/*.c
 tests/build/test_dev_tools: tools/dev_tools.c
 tests/build/test_e1000: drivers/net/e1000.c
+tests/build/test_fs_disk: drivers/block/ata.c fs/fat/fat.h
 tests/build/test_audio: tools/audio_tools.c
 # test_dvm_tools.c #includes the tool source and the recorded session, so it
 # must follow both.
 tests/build/test_dvm_tools: tools/dvm_tools.c vm/transcripts/dvm_bringup.h
+tests/build/test_capability: tools/capability_tools.c
 # ac97_bringup.h holds the reference driver program as a C string literal,
 # derived from vm/programs/ac97_bringup.dvm by vm/programs/gen_header.py. There
 # is deliberately NO rule to run that generator: the header is checked in, the
@@ -649,6 +760,18 @@ TESTSRC_test_fault := arch/x86_64/fault.c tools/fault_tools.c core/tool.c \
 TESTSRC_test_fault_diagnose := net/faultchat.c arch/x86_64/fault.c \
                       tools/fault_tools.c core/tool.c lib/trace.c net/json.c \
                       net/model.c net/model_mock.c
+# test_repair drives the whole self-repair loop: a fault, an escape to a guard,
+# a diagnosis against the mock transport, a validated code patch, a rollback, and
+# an agenda item that survives all of it. It therefore links the fault module,
+# net/faultchat.c, core/agenda.c and BOTH tool families — the point of the suite
+# is that these pieces work together, so stubbing any of them out would test
+# something other than the loop. The VFS is here because the agenda store is a
+# real file in a real ramfs.
+TESTSRC_test_repair := arch/x86_64/fault.c net/faultchat.c core/agenda.c \
+                      tools/fault_tools.c tools/agenda_tools.c \
+                      core/tool.c core/kobject.c lib/trace.c net/json.c \
+                      net/model.c net/model_mock.c mm/heap.c \
+                      fs/vfs/vfs.c fs/native/ramfs.c
 TESTSRC_test_chat := net/json.c net/model.c net/model_mock.c net/chat.c \
                      core/tool.c lib/trace.c
 # test_agency drives whole multi-step jobs through the real loop against the real
@@ -658,6 +781,12 @@ TESTSRC_test_agency := net/json.c net/model.c net/model_mock.c net/chat.c \
                      fs/vfs/vfs.c fs/native/ramfs.c \
                      tools/vfs_tools.c tools/agent_tools.c
 TESTSRC_test_sse := net/json.c net/model.c net/sse.c
+# net/fetch.c is the whole network path minus the sockets: the suite supplies its
+# own fetch_backend_t, so no lwIP and no mbedTLS are linked. The VFS is here
+# because net_fetch's save_path writes a real file into a real ramfs.
+TESTSRC_test_net_tools := tools/net_tools.c net/fetch.c core/tool.c lib/trace.c \
+                     net/json.c core/kobject.c mm/heap.c \
+                     fs/vfs/vfs.c fs/native/ramfs.c
 
 HOST_TESTS := $(patsubst tests/host/%.c,%,$(wildcard tests/host/test_*.c))
 HOST_BINS  := $(addprefix tests/build/,$(HOST_TESTS))
@@ -715,15 +844,36 @@ test-host: $(HOST_BINS)
 # from here, so the two suites that link them switch global instrumentation off.
 # Heap, stack, use-after-free/scope and every UBSan check stay on for all of
 # them. The real fix is one attribute in those two files.
+#
+# THE SECOND EXCEPTION, for the same reason one level down. test_fiber runs real
+# code on stacks carved out of mm/heap.c's arena, which is a global. ASan's STACK
+# instrumentation writes frame redzones into the shadow of whatever memory a
+# frame occupies, so a fiber's frames poison the shadow of the arena — and it is
+# never unpoisoned, because a suspended fiber's frames never return. The next
+# kfree() of that block then trips a "stack-buffer-underflow ... inside global
+# variable default_arena" inside the allocator's own poisoning memset. That is
+# ASan describing this design back to itself, not a defect: a green run with
+# -asan-stack=0 is the honest one. Heap, globals, use-after-free and every UBSan
+# check stay on, and the poison bands in core/fiber.c are the stack-overflow
+# detector here anyway — tests/host/test_fiber.c proves they fire.
 ASAN_HOST_CFLAGS := -fsanitize=address,undefined -fno-omit-frame-pointer
 ASAN_NO_GLOBALS  := -mllvm -asan-globals=0
+ASAN_NO_STACK    := -mllvm -asan-stack=0
 test-host-asan:
 	@$(MAKE) --no-print-directory test-host \
 	   HOST_CFLAGS="$(HOST_CFLAGS) $(ASAN_HOST_CFLAGS)" \
 	   HOSTCFLAGS_test_vfs_tools="$(HOSTCFLAGS_test_vfs_tools) $(ASAN_NO_GLOBALS)" \
-	   HOSTCFLAGS_test_agency="$(HOSTCFLAGS_test_agency) $(ASAN_NO_GLOBALS)"
+	   HOSTCFLAGS_test_agency="$(HOSTCFLAGS_test_agency) $(ASAN_NO_GLOBALS)" \
+	   HOSTCFLAGS_test_fiber="$(HOSTCFLAGS_test_fiber) $(ASAN_NO_STACK)"
 
+# The printf lint runs FIRST and gates the boots. It reads source, so it costs
+# nothing, and it catches the one class of defect no test in this tree can:
+# host suites link the real libc, so a format string the kernel's own formatter
+# (lib/kfmt.c) cannot render works perfectly everywhere except in the binary
+# that boots. It was clean when it was wired in; it is a lint, not a boot, so a
+# failure here means someone typed a conversion kfmt does not implement.
 test-qemu: kernel.bin
+	@python3 tests/qemu/lint_printf.py
 	@if [ -x tests/qemu/run.sh ]; then tests/qemu/run.sh; \
 	 else echo "test-qemu: tests/qemu/run.sh not built yet"; exit 1; fi
 
@@ -741,4 +891,5 @@ toolchain:
 	brew install nasm x86_64-elf-gcc qemu
 
 .PHONY: all run run-nox clean toolchain test test-host test-host-asan test-qemu \
-        iso run-iso run-iso-nox usb iso-toolchain clean-iso
+        iso run-iso run-iso-nox usb iso-toolchain clean-iso \
+        disk disk-erase disk-mount disk-unmount
