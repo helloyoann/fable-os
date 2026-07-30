@@ -31,11 +31,20 @@ enum { FIBER_FREE = 0, FIBER_READY = 1, FIBER_DEAD = 2 };
 
 struct fiber {
     void     *sp;             /* saved stack pointer while not running       */
-    uint8_t  *block;          /* the kmalloc'd stack block; NULL for root    */
-    uint8_t  *lo, *hi;        /* usable region, [lo, hi); NULL for root      */
+    uint8_t  *block;          /* base of the guarded region (low band first) */
+    uint8_t  *lo, *hi;        /* usable region, [lo, hi); NULL if unguarded  */
     size_t    usable;         /* hi - lo                                     */
     int       state;
     int       guard_reported; /* one panic per damaged fiber, not one a switch*/
+    /* 1 when `block` came from kmalloc and must be given back. The root's block
+     * is boot/boot.asm's .bss and freeing it would hand the identity-map page
+     * tables' neighbour to the heap. */
+    int       owns_block;
+    /* The word an UNTOUCHED stack word holds, which is how stack_used() finds
+     * the high-water mark. FILL_WORD for a created fiber, whose middle this
+     * module paints; 0 for the root, whose middle is .bss that boot/boot.asm
+     * zeroed and which cannot be painted because we are standing on it. */
+    uint64_t  fill;
     uint64_t  resumes;        /* times this fiber was switched TO            */
     uint64_t  ran_ms;         /* millis() when it was last given the CPU     */
     char      name[FIBER_NAME_MAX + 1];
@@ -74,10 +83,22 @@ static uint64_t      switches;
 static int           hog_lines;
 
 /* Where the root fiber's stack pointer was when fiber_init() ran, and the
- * deepest it has been seen since. The root runs on boot/boot.asm's 64 KiB,
- * whose bounds C cannot see, so this is a measurement and not a bound. */
+ * deepest it has been seen AT A YIELD POINT since. Kept even when the root's
+ * real bounds are known, because the two numbers answer different questions and
+ * the difference between them is itself informative: this one is what the
+ * scheduler saw, stack_used() is what actually happened. */
 static uint8_t *root_mark;
 static size_t   root_depth;
+
+/* The real bounds of boot/boot.asm's stack, if anyone told us (kernel/main.c
+ * does, from the exported stack_bottom/stack_top). Zero on a host test, which
+ * links no boot.asm and stands on a stack it did not allocate. */
+static uint8_t *root_lo_hint, *root_hi_hint;
+
+void fiber_root_stack_set(void *lo, void *hi) {
+    root_lo_hint = (uint8_t *)lo;
+    root_hi_hint = (uint8_t *)hi;
+}
 
 /* ---- small helpers ----------------------------------------------------- */
 
@@ -120,7 +141,7 @@ static size_t stack_used(const struct fiber *f) {
     const uint64_t *w = (const uint64_t *)f->lo;
     size_t n = f->usable / 8;
     for (size_t i = 0; i < n; i++)
-        if (w[i] != FILL_WORD) return f->usable - i * 8;
+        if (w[i] != f->fill) return f->usable - i * 8;
     return 0;
 }
 
@@ -167,7 +188,11 @@ int fiber_check_stacks(void) {
         if (f->state == FIBER_FREE || !f->block) continue;
 
         size_t lo_bad = band_damage(f->block, GUARD_WORDS);
-        size_t hi_bad = band_damage(f->hi, GUARD_WORDS);
+        /* The root has NO high band: stack_top is the end of the region
+         * boot/boot.asm reserved, and painting past it would scribble on
+         * whatever .bss put next (today, multiboot_info_phys). Underflow is
+         * also the direction that cannot happen by recursion. */
+        size_t hi_bad = f->owns_block ? band_damage(f->hi, GUARD_WORDS) : 0;
 
         /* The stack pointer itself. For the fiber that is running, `here` is
          * the truth; for the others, the value the switcher saved. Either way
@@ -314,13 +339,42 @@ int fiber_init(void) {
     struct fiber *root = &fibers[0];
     root->state  = FIBER_READY;
     root->sp     = (void *)0;            /* filled in by the first switch */
-    root->block  = (uint8_t *)0;         /* boot/boot.asm's stack; unguarded */
+    root->block  = (uint8_t *)0;
     root->lo     = root->hi = (uint8_t *)0;
     root->usable = 0;
+    root->owns_block = 0;
+    root->fill   = 0;
     root->resumes = 1;                   /* it is running right now */
     root->ran_ms = millis();
     root->guard_reported = 0;
     name_copy(root->name, "main");
+
+    /* GUARD THE ROOT, if its bounds were handed to us.
+     *
+     * This is the line include/fiber.h used to defer, and the argument for
+     * deferring it ("the root runs mbedTLS and the deepest user should keep the
+     * biggest stack") was overtaken by compiler/: a single cc_compile() descends
+     * several times deeper than the whole TLS path, on untrusted input, with the
+     * identity-map page tables 0 bytes below. Unguarded, that is a triple fault
+     * with no #PF, no fault record and nothing on the serial line.
+     *
+     * Two differences from a created fiber, both forced by the root already
+     * running on this memory:
+     *   - the middle is NOT painted, because we are standing in it. The
+     *     high-water scan therefore looks for the lowest non-ZERO word, which is
+     *     sound only because boot/boot.asm rep-stosb-zeroes the whole of .bss
+     *     before anything else runs. fill = 0 records that.
+     *   - the low band IS painted, because nothing has ever been that deep. It
+     *     costs FIBER_GUARD_BYTES of usable stack and buys the one thing worth
+     *     having: an overflow becomes a named panic instead of a dead machine. */
+    if (root_lo_hint && root_hi_hint &&
+        (size_t)(root_hi_hint - root_lo_hint) > FIBER_GUARD_BYTES * 4) {
+        root->block  = root_lo_hint;
+        root->lo     = root_lo_hint + FIBER_GUARD_BYTES;
+        root->hi     = root_hi_hint;
+        root->usable = (size_t)(root->hi - root->lo);
+        fill_words(root->block, GUARD_WORD, GUARD_WORDS);
+    }
 
     current      = root;
     pending_block = (uint8_t *)0;
@@ -368,10 +422,12 @@ fiber_t *fiber_create(const char *name, fiber_fn_t fn, void *arg,
         return (fiber_t *)0;
     }
 
-    f->block  = block;
-    f->lo     = block + FIBER_GUARD_BYTES;
-    f->hi     = f->lo + stack_bytes;
-    f->usable = stack_bytes;
+    f->block      = block;
+    f->lo         = block + FIBER_GUARD_BYTES;
+    f->hi         = f->lo + stack_bytes;
+    f->usable     = stack_bytes;
+    f->owns_block = 1;
+    f->fill       = FILL_WORD;
 
     fill_words(block,  GUARD_WORD, GUARD_WORDS);          /* low band  */
     fill_words(f->hi,  GUARD_WORD, GUARD_WORDS);          /* high band */
@@ -461,9 +517,24 @@ void fiber_exit(void) {
      * later fiber_join() and fiber_create() on this slot harmless: there is
      * nothing left in it to be freed twice or to be mistaken for live. */
     pending_block = me->block;
-    me->block     = (uint8_t *)0;
+    me->block      = (uint8_t *)0;
+    me->owns_block = 0;
     me->lo = me->hi = (uint8_t *)0;
     me->usable      = 0;
+
+    /* THE SAME CHECK switch_to() MAKES, for the same reason, because this is the
+     * same five lines written twice. `mov rsp, 0` does not fault on this machine;
+     * it is a silent wild jump through the real-mode IVT. Unreachable today —
+     * only the root can hold sp == NULL and the root cannot exit — but a guarded
+     * copy and an unguarded copy of one switch sitting in one file is exactly how
+     * the bug the other comment exists to prevent comes back. */
+    if (!nxt->sp) {
+        kprintf("fiber: fiber \"%s\" is %s but has no saved stack pointer; its "
+                "stack was released while it was still scheduled\n",
+                nxt->name, nxt->state == FIBER_READY ? "runnable" : "not free");
+        panic("fiber_exit: switch to a fiber with no stack");
+        return;
+    }
 
     switches++;
     nxt->resumes++;
@@ -494,10 +565,12 @@ int fiber_join(fiber_t *h) {
      * reap() free the next occupant's live stack. Belt and braces: if a block is
      * somehow still here, it is unreferenced the moment the slot is freed, so
      * release it rather than leak it. */
-    if (f->block) {
+    if (f->block && f->owns_block) {
         kfree(f->block);
         f->block = (uint8_t *)0;
     }
+    f->block          = (uint8_t *)0;
+    f->owns_block     = 0;
     f->lo = f->hi     = (uint8_t *)0;
     f->usable         = 0;
     f->sp             = (void *)0;
@@ -518,8 +591,12 @@ void fiber_reset(void) {
     pending_block = (uint8_t *)0;
 
     for (int i = 0; i < FIBER_MAX; i++) {
-        if (fibers[i].block) kfree(fibers[i].block);
+        /* owns_block, not block: the root's block is boot/boot.asm's .bss and
+         * handing it to the heap would give away the page tables' neighbour. */
+        if (fibers[i].block && fibers[i].owns_block) kfree(fibers[i].block);
         fibers[i].block  = (uint8_t *)0;
+        fibers[i].owns_block = 0;
+        fibers[i].fill   = 0;
         fibers[i].lo     = fibers[i].hi = (uint8_t *)0;
         fibers[i].usable = 0;
         fibers[i].sp     = (void *)0;
@@ -568,7 +645,10 @@ size_t fiber_stack_size(const fiber_t *h) {
 size_t fiber_stack_used(const fiber_t *h) {
     const struct fiber *f = (const struct fiber *)h;
     if (!valid(f)) return 0;
-    if (f == &fibers[0]) return root_depth;
+    /* The root has a real high-water mark once its bounds are known (the .bss
+     * zero-scan); root_depth is only the yield-point sample, which is blind to
+     * the deepest frames and is the wrong answer whenever a better one exists. */
+    if (f == &fibers[0] && !f->lo) return root_depth;
     return stack_used(f);
 }
 
@@ -596,7 +676,7 @@ void fiber_report(void) {
          * anything else prints two characters while consuming no argument —
          * which shifts every later one. tests/host/kshim.c enforces exactly
          * that grammar, so this is checked and not merely believed. */
-        if (!f->block) {
+        if (!f->lo) {
             /* The root. Its size is boot/boot.asm's and not visible here, so
              * report the depth measured rather than invent a denominator.
              *
@@ -620,6 +700,20 @@ void fiber_report(void) {
                     f->name, st, (unsigned)used, (unsigned)f->usable,
                     (unsigned)(f->usable ? used * 100u / f->usable : 0u),
                     (unsigned)f->resumes);
+            /* THE ROOT PRINTS BOTH NUMBERS, and the gap between them is the
+             * point. The first is the real high-water mark; the second is all
+             * the scheduler could ever see, because the root's deepest frames
+             * (mbedTLS inside net_poll_rx(), the compiler inside a tool call)
+             * never reach a yield point. They differed by 8x on a plain boot and
+             * by 100x during a compile; printing only the second is what let
+             * include/fiber.h call a live hazard a diagnostic gap. */
+            if (i == 0)
+                kprintf("fiber:     of which %u bytes is all the scheduler ever "
+                        "sampled: the deepest frames on this stack never yield. "
+                        "The %u byte figure above is the .bss high-water mark and "
+                        "is the one to trust. Low poison band: %u bytes.\n",
+                        (unsigned)root_depth, (unsigned)used,
+                        (unsigned)FIBER_GUARD_BYTES);
         }
     }
 }

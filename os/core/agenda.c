@@ -23,6 +23,11 @@
 
 #include "agenda.h"
 
+/* For CHAT_EREENTER: the say sink is chat_ask() on this machine, and telling a
+ * "turn already running" apart from a real failure is what stops the agenda
+ * reporting a transport condition as disk corruption. */
+#include "chat.h"
+
 #include "fault.h"
 #include "fs.h"
 #include "json.h"
@@ -194,6 +199,9 @@ const char *agenda_strerror(int rc) {
                                      "build";
         case AGENDA_ENOSAY:   return "nothing is bound to say a sentence to, so "
                                      "a \"say\" item cannot run";
+        case AGENDA_ESAY:     return "the sentence was started but the turn did "
+                                     "not complete; this is the model transport, "
+                                     "not the store";
         case AGENDA_EFAULT:   return "the action took a fatal CPU exception and "
                                      "its call chain was abandoned";
         case AGENDA_ERETIRED: return "the item is disabled or has used up its "
@@ -493,9 +501,11 @@ static size_t render(char *dst, size_t cap) {
         put_json_str(dst, cap, &off, agenda_when_name(it->when));
         ap(dst, cap, &off, ",\"do\":");
         put_json_str(dst, cap, &off, agenda_act_name(it->act));
-        ap(dst, cap, &off, ",\"period_ms\":%u,\"max_runs\":%u,\"enabled\":%s",
+        ap(dst, cap, &off,
+           ",\"period_ms\":%u,\"max_runs\":%u,\"enabled\":%s,\"attempting\":%s",
            (unsigned)it->period_ms, (unsigned)it->max_runs,
-           it->enabled ? "true" : "false");
+           it->enabled ? "true" : "false",
+           it->attempting ? "true" : "false");
         if (it->act == AGENDA_DO_TOOL) {
             ap(dst, cap, &off, ",\"tool\":");
             put_json_str(dst, cap, &off, it->tool);
@@ -590,6 +600,7 @@ static int get_str(const json_value_t *o, const char *key, char *dst,
 
 int agenda_load(void) {
     size_t len = 0;
+    int    store_dirty = 0;   /* something was retired on the way in */
     int    rc  = file_read(agenda_store(), g_file, sizeof g_file, &len);
 
     zero(g_item, sizeof g_item);
@@ -717,6 +728,28 @@ int agenda_load(void) {
             if (json_bool(&v, &b) == JSON_OK && !b) it.enabled = 0;
         }
 
+        /* THE MARKER THE PREVIOUS BOOT LEFT BEHIND. Set on disk immediately
+         * before a when=boot action is attempted and cleared once it resolves,
+         * so finding it still set means the last boot never came back out of
+         * this item. Disable it, DURABLY, and say what happened — otherwise the
+         * item re-arms (a when=boot item must, by design) and this boot dies in
+         * exactly the same place, for ever, with no interface left to stop it.
+         * See agenda_item_t.attempting in include/agenda.h. */
+        if (json_get(&e, "attempting", &v) == JSON_OK && v.type == JSON_BOOL) {
+            int b = 0;
+            if (json_bool(&v, &b) == JSON_OK && b) {
+                it.enabled = 0;
+                it.attempting = 0;
+                store_dirty = 1;
+                kprintf("agenda: \"%s\" was still marked as RUNNING in the "
+                        "store, which means the previous boot did not survive "
+                        "it. It has been DISABLED so this boot can reach a "
+                        "prompt. Re-enable it with agenda_control if you know "
+                        "why it crashed.\n",
+                        it.name[0] ? it.name : "(unnamed)");
+            }
+        }
+
         /* A STORED ITEM IS REVALIDATED FROM SCRATCH, exactly as if it had just
          * been dictated. The disk may have been written by a different build,
          * with a different tool table or different bounds, and "it was in the
@@ -753,6 +786,16 @@ int agenda_load(void) {
         it.used = 1;
         g_item[g_n++] = it;
     }
+
+    /* Rewrite the store if anything was retired on the way in, so the marker is
+     * cleared and the disable is durable even if this boot never touches the
+     * agenda again. A failed write is not fatal — the item is already disabled
+     * in memory, which is the half that stops this boot dying — but it must be
+     * said, because it means the next boot will have to do the same thing. */
+    if (store_dirty && agenda_flush() != AGENDA_OK)
+        kprintf("agenda: could not rewrite %s, so an item retired above will "
+                "have to be retired again at the next boot\n", agenda_store());
+
     return g_n;
 }
 
@@ -863,7 +906,23 @@ static void run_body(void *arg) {
     if (it->act == AGENDA_DO_SAY) {
         if (!g_say) { c->rc = AGENDA_ENOSAY; return; }
         int rc = g_say(it->arg);
-        c->rc  = (rc == 0) ? AGENDA_OK : AGENDA_EIO;
+        /* DO NOT FLATTEN THIS INTO AGENDA_EIO. It used to, and AGENDA_EIO reads
+         * "the agenda store could not be read or written" — so a failure in the
+         * MODEL TRANSPORT was reported to the model as disk corruption. Observed
+         * live: a nested chat_ask() returned non-zero, the model was told the
+         * FAT32 store was broken, and it spent six rounds and two paid API calls
+         * investigating a disk that was perfect before delivering a degraded
+         * workaround and repeating the kernel's false claim to the operator.
+         *
+         * On a machine whose entire interface is a model reading error text, an
+         * error code that is a lie is worse than a crash. Two outcomes are
+         * distinguishable here and both are named:
+         *   - the sink refused because a turn is already running, which is a
+         *     fact about WHEN, not about whether the item works;
+         *   - anything else, which is a failure of the sentence itself. */
+        if (rc == 0)                   c->rc = AGENDA_OK;
+        else if (rc == CHAT_EREENTER)  c->rc = AGENDA_EBUSY;
+        else                           c->rc = AGENDA_ESAY;
         return;
     }
 
@@ -929,12 +988,53 @@ static int run_item(agenda_item_t *it, uint64_t now_ms) {
              agenda_when_name(it->when), agenda_act_name(it->act),
              (unsigned)it->runs);
 
+    /* DURABLE "I AM ABOUT TO TRY THIS", for boot items only.
+     *
+     * The trace line above is a console line, and a console line does not
+     * survive a power cycle. Everything below that could retire a broken item —
+     * it->failures, the durable disable, agenda_flush() — is on the far side of
+     * the guard call, and an action that hangs or triple-faults never gets
+     * there, so the store still said "enabled": true and a when=boot item
+     * re-armed into the same crash at the next boot, for ever. This is the one
+     * write that happens BEFORE the attempt, and agenda_load() is what reads it.
+     * See agenda_item_t.attempting in include/agenda.h.
+     *
+     * Cost: two extra store writes per boot item per boot, and only for boot
+     * items, because they are the ones that run before any interface exists. */
+    int marked = (it->when == AGENDA_WHEN_BOOT);
+    if (marked) {
+        it->attempting = 1;
+        if (agenda_flush() != AGENDA_OK) {
+            /* Not fatal, and not silent: without the marker this boot is back to
+             * the old behaviour, and the operator should know which item is
+             * running unprotected. */
+            it->attempting = 0;
+            marked         = 0;
+            kprintf("agenda: could not record that \"%s\" was starting, so if "
+                    "this action kills the machine the next boot will try it "
+                    "again\n", it->name);
+        }
+    }
+
     /* THE GUARD. A fatal CPU exception inside the action returns here instead of
      * halting the machine — see include/fault.h. This is what makes an
      * autonomous action safe to take with nobody watching, and it is also what
      * gives net/faultchat.c a fault to diagnose: the machine is still running,
      * in normal kernel context, on the far side of the handler. */
     int grc = fault_guard_run(it->name, run_body, &c);
+
+    /* IT CAME BACK, SO CLEAR THE MARKER ON DISK, NOT ONLY IN MEMORY. Clearing it
+     * only in memory would leave "attempting": true on the disk for the rest of
+     * the boot, and any LATER crash — one this item had nothing to do with —
+     * would retire it at the next boot. A safeguard that retires innocent items
+     * teaches the operator to ignore it. */
+    if (marked) {
+        it->attempting = 0;
+        if (agenda_flush() != AGENDA_OK)
+            kprintf("agenda: \"%s\" finished, but the store still records it as "
+                    "running; if this boot ends badly it will be disabled at the "
+                    "next one\n", it->name);
+    }
 
     g_running = 0;
 

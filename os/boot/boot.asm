@@ -229,6 +229,16 @@ p3_table:
     resb 4096
 p2_tables:
     resb 4096 * 4               ; four P2 tables = 2048 entries = 4 GiB
+
+; The root (boot) stack. Its bounds are EXPORTED so C can see them, because what
+; sits immediately below stack_bottom is p2_tables — the identity map itself. An
+; overflow of even a few bytes rewrites the page tables covering the top of the
+; 4 GiB window (where MMIO lives) and the CPU triple-faults with no #PF, no fault
+; record and nothing on the serial line. Exporting these two symbols lets
+; core/fiber.c lay a poison band at the bottom and measure the true high-water
+; mark, which turns that silent triple fault into a panic that names the culprit.
+global stack_bottom
+global stack_top
 stack_bottom:
     resb 4096 * 16              ; 64 KiB stack
 stack_top:

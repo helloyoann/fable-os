@@ -1171,6 +1171,128 @@ static void test_a_diagnosis_with_no_proposal_changes_nothing(void) {
     CHECK_CONTAINS(kcap_text(), "neither a fix nor a code patch");
 }
 
+/* ---- what the console says about an unattended decision ---- */
+
+/* A REAL MODEL ANSWERED THIS WAY, WHICH IS WHY THIS TEST EXISTS.
+ *
+ * Asked twice about a live divide-by-zero it had diagnosed exactly — it named
+ * `idiv ecx`, the zero divisor and the re-fault — a production model proposed
+ * {"action":"refuse"} and no patch. `refuse` is a legal, armed decision meaning
+ * "let it halt, deliberately" (fault.h says so), so the tool accepted it and the
+ * pump reported success; and the one sentence the pump then printed claimed the
+ * next exception would be "handled by it instead of halting the machine", which
+ * is the precise opposite of what had just been armed.
+ *
+ * On this machine that sentence is the ONLY record of a decision nobody was
+ * present for, so it lying is worse than the wrong plan being armed. */
+static void test_an_armed_refusal_is_not_reported_as_a_recovery(void) {
+    setup();
+    inject_divide_fault();
+    model_mock_queue(200, reply_body(
+        "{\"diagnosis\":\"A genuine divide by zero, not a transient fault.\","
+        "\"fix\":{\"action\":\"refuse\"}}"));
+
+    CHECK_EQ(faultchat_pump(), FAULTCHAT_OK);
+
+    /* The plan really is armed, and really is a refusal. */
+    const fault_plan_t *p = fault_plan_get();
+    CHECK(p != NULL);
+    if (p) CHECK_EQ(p->action, FAULT_ACT_REFUSE);
+
+    const char *out = kcap_text();
+    CHECK_CONTAINS(out, "DELIBERATE REFUSAL");
+    CHECK_CONTAINS(out, "will fault again");
+    /* THE REGRESSION: the recovery sentence must be absent. */
+    CHECK(strstr(out, "instead of halting the machine") == NULL);
+
+    /* And nothing was repaired, which is the substance of the claim. */
+    CHECK_EQ(faultchat_patches_applied(), 0);
+    CHECK_EQ(memcmp(text_area + CODE_OFF, INSN_DIV, 3), 0);
+}
+
+/* The other action that arms something which is not a recovery. */
+static void test_an_armed_no_op_is_not_reported_as_a_recovery(void) {
+    setup();
+    inject_divide_fault();
+    model_mock_queue(200, reply_body(
+        "{\"diagnosis\":\"I can see the divisor is zero.\","
+        "\"fix\":{\"action\":\"none\"}}"));
+
+    CHECK_EQ(faultchat_pump(), FAULTCHAT_OK);
+    const char *out = kcap_text();
+    CHECK_CONTAINS(out, "arms no action");
+    CHECK(strstr(out, "instead of halting the machine") == NULL);
+    CHECK_EQ(memcmp(text_area + CODE_OFF, INSN_DIV, 3), 0);
+}
+
+/* A fault the machine survived by ESCAPING rather than by an in-place fix, which
+ * is the shape EVERY faulting autonomous action produces. No plan is armed, so
+ * there is nothing to apply; a guard is, so the disposition recorded is
+ * FAULT_FIX_ESCAPED. The control transfer itself is the handler's IRETQ and is
+ * proved by its own tests further up; what this needs is the RECORD, because the
+ * record is what the prompt is built out of. */
+static void escaping_fault_body(void *ctx) {
+    (void)ctx;
+    fault_guard_t *g = fault_guard_innermost();
+    CHECK(g != NULL);
+    if (!g) return;
+    /* Forge the saved context into the synthetic window, exactly as
+     * test_fault_escape_writes_exactly_the_guards_saved_context does and for the
+     * same reason: the real guard points at this PROCESS's stack, which is not
+     * inside W, so the bounds checks would refuse it on a host. */
+    CHECK_EQ(fault_guard_forge(g, W.code_lo + 0x40, W.stack_lo + 8 * 40), 0);
+
+    memcpy(text_area + CODE_OFF, INSN_DIV, sizeof INSN_DIV);
+    fault_frame_t f;
+    frame_init(&f, 0, 0);
+    fault_note(&f, &W, 7);
+    /* Both halves, in idt.c's order: no plan is armed, so fault_recover() has
+     * nothing to apply and fault_escape() is what records FAULT_FIX_ESCAPED. */
+    if (fault_recover(&f, &W) != FAULT_FIX_OK) fault_escape(&f, &W);
+}
+
+static void inject_escaped_divide_fault(void) {
+    fault_plan_clear();
+    fault_guard_run("an autonomous action", escaping_fault_body, NULL);
+}
+
+/* THE PROMPT MUST STATE THE COST OF DOING NOTHING.
+ *
+ * Same live evidence as above. The model had everything a patch needs — RIP
+ * inside .text, the bytes, a ready-made "expect" string — and declined anyway,
+ * because every sentence in the contract warned it off proposing something and
+ * NOTHING said what declining costs. An escaped fault means the code was
+ * abandoned, not repaired: it will run again, fault again, and the per-address
+ * limit means this question is not asked a third time. That is a fact only the
+ * kernel holds, so the kernel has to say it. */
+static void test_the_prompt_states_the_cost_of_changing_nothing(void) {
+    setup();
+    inject_escaped_divide_fault();
+
+    const fault_record_t *rec = fault_last();
+    CHECK(rec != NULL);
+    if (rec) CHECK_EQ((int)rec->fix, (int)FAULT_FIX_ESCAPED);
+
+    char   prompt[FAULTCHAT_PROMPT_MAX];
+    size_t n = faultchat_build_prompt(fault_last(), &W, prompt, sizeof prompt);
+    CHECK(n > 0 && n < sizeof prompt);
+    CHECK_CONTAINS(prompt, "IF NOTHING IS CHANGED");
+    CHECK_CONTAINS(prompt, "abandoned, not repaired");
+    CHECK_CONTAINS(prompt, "fault again in the same place");
+    /* The two things it must be told it MAY do, and that it is reversible. */
+    CHECK_CONTAINS(prompt, "\"refuse\" is NOT a useful answer");
+    CHECK_CONTAINS(prompt, "reversible");
+    CHECK_CONTAINS(prompt, "filling its whole span");
+
+    /* AND IT MUST NOT SAY IT WHEN IT IS NOT TRUE. A fault fixed in place was not
+     * abandoned, nothing is going to re-run it, and claiming otherwise would be
+     * the same class of defect in the other direction. */
+    setup();
+    inject_divide_fault();          /* survived by a SKIP plan, not an escape */
+    faultchat_build_prompt(fault_last(), &W, prompt, sizeof prompt);
+    CHECK(strstr(prompt, "IF NOTHING IS CHANGED") == NULL);
+}
+
 /* ---- malformed proposals ---- */
 
 static void reject_patch(const char *label, const char *json_text,
@@ -2527,6 +2649,9 @@ int main(void) {
 
     /* the loop */
     RUN(test_fault_to_diagnosis_to_patch_to_resume);
+    RUN(test_an_armed_refusal_is_not_reported_as_a_recovery);
+    RUN(test_an_armed_no_op_is_not_reported_as_a_recovery);
+    RUN(test_the_prompt_states_the_cost_of_changing_nothing);
     RUN(test_a_recovery_fix_and_a_patch_can_arrive_together);
     RUN(test_a_diagnosis_with_no_proposal_changes_nothing);
     RUN(test_a_malformed_proposal_is_rejected);

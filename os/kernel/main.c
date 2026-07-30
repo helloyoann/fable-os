@@ -35,10 +35,16 @@
 #include "gui.h"
 #include "app.h"
 #include "capability.h"
+#include "cc.h"
 #include "fiber.h"
 #include "agenda.h"
 #include "fault.h"
 #include "faultchat.h"
+
+/* The root stack, reserved and exported by boot/boot.asm. Declared as arrays
+ * because these are addresses, not objects: `extern uint8_t stack_top;` would
+ * make &stack_top the only legal use and invite someone to read it. */
+extern uint8_t stack_bottom[], stack_top[];
 
 /* Exercise the VFS end-to-end: mount, mkdir, create/write/seek/read a file,
  * stat it, and list a directory. Proves the whole path without a disk. */
@@ -332,6 +338,23 @@ static int agenda_say(const char *sentence) {
  * reached by typing, and the loop it sits in runs whether or not anybody ever
  * touches the keyboard. */
 static void idle_work(void) {
+    /* PROVABLY OUTSIDE A TURN, WHICH IS WHY THIS BELONGS HERE.
+     *
+     * chat_ask()'s re-entrancy guard is a flag set on the way in and cleared on
+     * the way out, and a fault guard escaping out of a turn does not return
+     * through "the way out": core/agenda.c runs a say item inside
+     * fault_guard_run(), so a fatal CPU exception under chat_ask() would leave
+     * the flag set and every later sentence would be refused for the rest of the
+     * boot — a machine that survived the fault exactly as designed and can then
+     * never be spoken to again, which is strictly worse than the bug the guard
+     * exists to fix.
+     *
+     * This loop is the one place that is structurally outside every turn: it is
+     * what CALLS chat_ask(). Saying so here rather than inside core/agenda.c also
+     * keeps that module free of a link dependency on net/chat.c, which
+     * include/agenda.h names as a deliberate property. A no-op in the normal
+     * case. */
+    chat_turn_ended();
     faultchat_pump();
     agenda_tick(millis());
 }
@@ -412,6 +435,12 @@ void kernel_main(void) {
     console_init();
     idt_init();               /* before anything can fault: see include/idt.h */
     time_init();              /* fiber_init() timestamps against millis() */
+    /* Hand the scheduler the root stack's real bounds BEFORE it adopts this
+     * context, so the root gets a poison band like every other fiber. What sits
+     * directly below stack_bottom is p2_tables — the identity map — so an
+     * unguarded overflow here is a triple fault with no report at all. See
+     * "THE ROOT FIBER IS GUARDED NOW" in include/fiber.h. */
+    fiber_root_stack_set(stack_bottom, stack_top);
     fiber_init();             /* adopt this context as fiber 0, "main" */
     fault_set_stack_id(current_stack_id);   /* after fiber_init: it must answer */
     drivers_init();           /* serial, pci, nic, keyboard, mouse */
@@ -445,6 +474,23 @@ void kernel_main(void) {
      * under DISCOVERABILITY. One call: it binds the live list into the
      * capability_call description and then loads the store. */
     capability_bringup();
+
+    /* The C compiler's store, for exactly the same two reasons and in exactly the
+     * same shape: after the filesystem because the store is a directory in it,
+     * before the first schema because the list of saved programs is advertised
+     * inside cc_call's description. See include/cc.h under NAMED, SAVED, REUSED.
+     *
+     * Tell the compiler where the stack it will recurse on ends, FIRST, so
+     * cc_bringup()'s report can check its budget against a real number. Asked of
+     * the scheduler rather than read off stack_bottom directly, so that moving a
+     * compile to another fiber changes the answer instead of silently keeping
+     * the root's. */
+    {
+        void *stack_lo = (void *)0;
+        if (fiber_stack_bounds(fiber_self(), &stack_lo, (void **)0) == 0)
+            cc_stack_limit_set(stack_lo);
+    }
+    cc_bringup();
 
     concurrency_demo();
 

@@ -11,6 +11,20 @@ static int disk_mounted;
 
 int fs_disk_mounted(void) { return disk_mounted; }
 
+/* Remove an empty directory. The VFS publishes no vfs_rmdir(), so reach the
+ * filesystem's unlink the same sanctioned way tools/vfs_tools.c does: open the
+ * parent to obtain its vnode and go through the public ops table. */
+static int remove_empty_dir(const char *parent, const char *leaf) {
+    file_t *d = vfs_open(parent, O_RDONLY);
+    if (!d) return VFS_ENOENT;
+    int rc = VFS_EINVAL;
+    if (d->node && d->node->type == VNODE_DIR && d->node->ops &&
+        d->node->ops->unlink)
+        rc = d->node->ops->unlink(d->node, leaf);
+    vfs_close(d);
+    return rc;
+}
+
 int fs_mount_disk(void) {
     block_device_t *bd = block_get(0);
     if (!bd) {
@@ -26,9 +40,37 @@ int fs_mount_disk(void) {
 
     int rc = fat32_mount_disk(FS_DISK_MOUNT, bd, 1);
     if (rc != VFS_OK) {
+        /* TAKE THE EMPTY DIRECTORY BACK, and take it back BEFORE saying the
+         * mount failed, because everything downstream decides "does this machine
+         * have durable storage?" by asking whether FS_DISK_MOUNT exists and is a
+         * directory — core/capability.c, core/agenda.c and compiler/cc_store.c
+         * all do, deliberately, so that they link without fs/ and can be host
+         * tested against a synthetic one.
+         *
+         * Left in place, this ramfs leftover made a machine with an ATTACHED BUT
+         * UNMOUNTABLE disk announce "survives a reboot" for all three stores,
+         * two lines after saying it had no persistent storage. Worse, the claim
+         * reached the MODEL: core/capability.c's panel writes "store /disk/cap
+         * (survives reboot)" into capability_call's description, which ships in
+         * every request, and net/chat.c's prompt tells the model that if a tool
+         * says the store survives a reboot then it survives being switched off.
+         * So the machine would teach itself capabilities and lose them, with no
+         * error anywhere. Three documented, ordinary configurations reach it: a
+         * non-FAT32 volume, a corrupt one, and a non-512-byte sector geometry.
+         *
+         * unlink through the parent's ops table because the VFS has no
+         * vfs_rmdir(); tools/vfs_tools.c reaches deletion the same sanctioned
+         * way. Best effort: if it cannot be removed the log says so rather than
+         * leaving a silent lie. */
+        int gone = remove_empty_dir("/", FS_DISK_MOUNT + 1);
         kprintf("fs: %s could not be mounted at %s (%d) - this boot has no "
                 "persistent storage. The disks this machine can see:\n",
                 bd->name, FS_DISK_MOUNT, rc);
+        if (gone != VFS_OK)
+            kprintf("fs: WARNING - the empty %s directory could not be removed "
+                    "(%d), so anything that probes for it may still believe this "
+                    "machine has durable storage. It does not.\n",
+                    FS_DISK_MOUNT, gone);
         block_report();
         return rc;
     }

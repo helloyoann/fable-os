@@ -161,10 +161,17 @@
 #define AGENDA_ENOSPC    -28    /* the table is full                         */
 #define AGENDA_EEXIST    -17    /* refused rather than silently replaced      */
 #define AGENDA_EIO        -5    /* the store could not be read or written     */
-#define AGENDA_EBUSY     -16    /* an action is already running               */
+#define AGENDA_EBUSY     -16    /* an action, or a model turn, is already running */
 #define AGENDA_EOFF      -1     /* the whole agenda is switched off           */
 #define AGENDA_ENOTOOL   -70    /* the named tool is not registered           */
 #define AGENDA_ENOSAY    -71    /* a sentence item, and nothing to say it to   */
+/* A "say" item's turn was started and did not complete. Distinct from
+ * AGENDA_EIO on purpose: this failure is in the MODEL TRANSPORT and has nothing
+ * to do with the store. Folding the two together told a live model the disk was
+ * broken when it was not, and it reasoned correctly from that false fact for six
+ * rounds and two paid API calls before delivering a degraded workaround. An
+ * error code a model reads is part of the interface. */
+#define AGENDA_ESAY      -73
 #define AGENDA_EFAULT   -104    /* the action took a fatal CPU exception       */
 #define AGENDA_ERETIRED  -11    /* the item is disabled or out of runs         */
 #define AGENDA_EDENIED   -13    /* the tool's success would end the boot       */
@@ -222,7 +229,41 @@
 /* One rendered document must fit a static buffer. Eight items at roughly 500
  * bytes each, with room for the envelope and for a document written by a future
  * version that carries fields this one ignores. */
-#define AGENDA_FILE_MAX      8192
+#define AGENDA_FILE_MAX     12288
+
+/* AND THE TWO NUMBERS ARE NOW CHECKED AGAINST EACH OTHER, because the one above
+ * is a hand-computed mirror of the field widths below it, and a constant that
+ * mirrors a computed value going stale is the defect class that has turned this
+ * tree red twice. It had already gone stale: this read 8192, described as
+ * "eight items at roughly 500 bytes each", and the real worst case is 1058 —
+ * so a full agenda of large items would have exceeded it.
+ *
+ * WHAT THAT FAILURE LOOKS LIKE, which is why it is worth a compile-time check
+ * rather than a comment: agenda_flush() correctly REFUSES to write a document
+ * that does not fit, because a clipped store is a corrupt store. So the symptom
+ * is not a truncated file. It is agenda_save() reporting success and the
+ * schedule silently not surviving the next power cycle — the same shape as the
+ * `used` bug the loader below still carries a comment about.
+ *
+ * Worst case per item. The escape factor is 2, not 6, and that is sound rather
+ * than optimistic: copy_text() and copy_payload() replace every byte below 0x20
+ * and 0x7F with a space BEFORE it is ever stored, so no field can contain a
+ * character that put_json_str() renders as \uXXXX. Only '"' and '\' expand, and
+ * both expand to exactly two bytes. If either sanitiser is ever relaxed, this
+ * factor has to move with it.
+ *
+ *     fixed skeleton: keys, punctuation, two bools and two 10-digit numbers ~160
+ *     name, tool, arg, note                                    (sum) * 2 = 898 */
+#define AGENDA_ITEM_RENDER_MAX                                                \
+    (160u + (AGENDA_NAME_MAX + AGENDA_TOOL_MAX + AGENDA_ARG_MAX +             \
+             AGENDA_NOTE_MAX) * 2u)
+
+_Static_assert(AGENDA_FILE_MAX >=
+                   32u + AGENDA_MAX_ITEMS * AGENDA_ITEM_RENDER_MAX,
+               "AGENDA_FILE_MAX is smaller than the largest document "
+               "AGENDA_MAX_ITEMS items can render to, so a full agenda of "
+               "worst-case items would refuse to save and the schedule would "
+               "silently stop persisting");
 
 /* ---- when ---- */
 typedef enum agenda_when {
@@ -275,6 +316,27 @@ typedef struct agenda_item {
     uint8_t  when;            /* agenda_when_t                               */
     uint8_t  act;             /* agenda_act_t                                */
     uint8_t  enabled;
+    /* IN FLIGHT, AND DURABLE. Written to the store BEFORE a when=boot action is
+     * attempted and cleared after it resolves, so that a boot which dies inside
+     * the action leaves the marker set and the NEXT boot can see it.
+     *
+     * Without it a crashing boot item bricked the machine permanently, and the
+     * mechanism is worth stating because every other safeguard sits on the wrong
+     * side of it: the failure counter, the durable disable and agenda_flush()
+     * all run AFTER fault_guard_run() returns, and an action that triple-faults
+     * never returns. So the on-disk record still said "enabled": true, when=boot
+     * items re-arm by design, and the next boot died in the same place — with no
+     * shell, no recovery console and no prompt, i.e. nothing left inside the
+     * machine to remove the item with. Reproduced end to end on a stock kernel
+     * with a 136-byte cc_compile argument, twice, from the same disk image.
+     *
+     * The existing deny_tab covers a tool that ends the boot by SUCCEEDING; it
+     * cannot cover one that crashes, and its own comment says so.
+     *
+     * Only when=boot items are marked, and that is a cost decision: they are the
+     * ones that run before any interface exists, and marking every tick of an
+     * every-item would write the store twice a period for ever. */
+    uint8_t  attempting;
     uint32_t period_ms;       /* AGENDA_WHEN_EVERY only                       */
     uint32_t max_runs;
     char     tool[AGENDA_TOOL_MAX];   /* AGENDA_DO_TOOL only                  */

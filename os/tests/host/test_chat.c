@@ -93,6 +93,59 @@ static const tool_t big_tool = {
 };
 REGISTER_TOOL(big_tool);
 
+/* ---- the two tools that pin chat_ask()'s re-entrancy guard ----
+ *
+ * kernel/main.c binds agenda_say() to chat_ask(), and the model can reach
+ * agenda_control {"action":"run_now"} on a do=say item from inside a tool call.
+ * That is a nested chat_ask() on a loop driven entirely by file-scope statics.
+ * These two stand in for that pair: one re-enters, the other is the sibling
+ * tool_use block in the SAME reply, which used to vanish without a trace line.  */
+static int reenter_calls, reenter_rc;
+static int witness_calls;
+static char witness_input[128];
+
+static int reenter_invoke(const tool_call_t *c, tool_result_t *r) {
+    (void)c;
+    reenter_calls++;
+    reenter_rc = chat_ask("a sentence nobody typed");
+    tool_result_printf(r, "nested chat_ask returned %d", reenter_rc);
+    return TOOL_OK;
+}
+static const tool_t reenter_tool = {
+    "reenter_tool", "Starts another turn from inside this one.",
+    "{\"type\":\"object\",\"properties\":{}}", 0, reenter_invoke,
+};
+REGISTER_TOOL(reenter_tool);
+
+static int witness_invoke(const tool_call_t *c, tool_result_t *r) {
+    witness_calls++;
+    size_t n = c->input_len < sizeof witness_input - 1
+             ? c->input_len : sizeof witness_input - 1;
+    if (c->input && n) memcpy(witness_input, c->input, n);
+    witness_input[n] = '\0';
+    tool_result_printf(r, "witnessed");
+    return TOOL_OK;
+}
+/* A MUTABLE description, which is the whole point: capability_call and cc_call
+ * both keep a fixed-width, space-padded panel at the tail of theirs and rewrite
+ * it in place. Same width before and after, always. */
+static const tool_t witness_tool = {
+    "witness_tool", "Records the input span it was handed.",
+    "{\"type\":\"object\",\"properties\":{}}", 0, witness_invoke,
+};
+REGISTER_TOOL(witness_tool);
+
+/* A MUTABLE description, which is the whole point: capability_call and cc_call
+ * both keep a fixed-width, space-padded panel at the tail of theirs and rewrite
+ * it in place whenever their store changes. Same width before and after,
+ * always — that invariant is what makes rebuilding the schema per turn safe. */
+static char g_panel[] = "PANEL-BEFORE (a fixed-width live list lives here)";
+static const tool_t panel_tool = {
+    "panel_tool", g_panel, "{\"type\":\"object\",\"properties\":{}}", 0,
+    witness_invoke,
+};
+REGISTER_TOOL(panel_tool);
+
 /* Traces itself, like a well-behaved real tool. */
 static int quiet_invoke(const tool_call_t *c, tool_result_t *r) {
     (void)c;
@@ -136,6 +189,9 @@ static void reset_all(void) {
     trace_reset();
     kcap_reset();
     echo_calls = fail_calls = big_calls = quiet_calls = 0;
+    reenter_calls = witness_calls = 0;
+    reenter_rc = 999;
+    witness_input[0] = '\0';
     echo_input[0] = '\0';
     chat_init(model_mock_transport());
 }
@@ -854,6 +910,65 @@ static void test_eviction_keeps_tool_pairs_together(void) {
     CHECK_EQ(uses, results);
 }
 
+static void test_a_nested_turn_is_refused_and_the_outer_turn_survives(void) {
+    reset_all();
+    /* One reply asking for two things, in this order: re-enter, then a sibling
+     * tool the loop must still reach. */
+    model_mock_queue(200,
+        MSG(USE("toolu_a", "reenter_tool", "{}") ","
+            USE("toolu_b", "witness_tool", "{\"keep\":\"OUTER-ARGUMENT\"}"),
+            "tool_use"));
+    model_mock_queue(200, ANSWER);
+
+    CHECK_EQ(chat_ask("do both of these"), CHAT_OK);
+
+    /* The nested call was refused, by name, without touching anything. */
+    CHECK_EQ(reenter_calls, 1);
+    CHECK_EQ(reenter_rc, CHAT_EREENTER);
+    CHECK_CONTAINS(kcap_text(), "a turn is already in progress");
+
+    /* THE PART THAT MATTERS MOST. The sibling tool_use is a cursor into the same
+     * response buffer the nested turn would have overwritten. Before the guard
+     * it was silently dropped: the model asked for two actions, one happened,
+     * one did not, and no trace line said so. */
+    CHECK_EQ(witness_calls, 1);
+    CHECK_CONTAINS(witness_input, "OUTER-ARGUMENT");
+
+    /* And the outer conversation is still well formed: every tool_use in it has
+     * its tool_result, which is the thing the real API rejects with a 400. */
+    for (int i = 0; i < model_mock_request_count(); i++)
+        check_request_shape(model_mock_request(i));
+}
+
+static void test_the_tool_schema_is_rebuilt_every_turn(void) {
+    /* A tool description that changes mid-session, which is exactly the shape of
+     * capability_call's and cc_call's fixed-width panels: the same bytes are
+     * rewritten in place whenever their store changes. tools_load() used to
+     * snapshot the schema once at chat_init(), so nothing saved during a session
+     * was ever visible to the model again — and with an empty store at boot the
+     * panel says "NONE SAVED YET", which then stayed in the model's own
+     * instructions for the rest of the boot. */
+    reset_all();
+    model_mock_queue(200, ANSWER);
+    model_mock_queue(200, ANSWER);
+
+    CHECK_EQ(chat_ask("first"), CHAT_OK);
+    CHECK(strstr(model_mock_request(0), "PANEL-BEFORE") != NULL);
+    CHECK(strstr(model_mock_request(0), "PANEL-AFTER") == NULL);
+
+    /* Same length, so the assembled schema is the same size — the invariant the
+     * fixed-width panel exists to provide, and the reason rebuilding is safe. */
+    size_t before = chat_tools_bytes();
+    memcpy(g_panel, "PANEL-AFTER ", 12);
+    CHECK_EQ(chat_ask("second"), CHAT_OK);
+    CHECK_EQ(chat_tools_bytes(), before);
+
+    CHECK(strstr(model_mock_request(1), "PANEL-AFTER") != NULL);
+    CHECK(strstr(model_mock_request(1), "PANEL-BEFORE") == NULL);
+
+    memcpy(g_panel, "PANEL-BEFORE", 12);
+}
+
 static void test_reset_forgets_everything(void) {
     reset_all();
     model_mock_queue(200, ANSWER);
@@ -1000,6 +1115,8 @@ int main(void) {
     RUN(test_turn_too_big_for_history);
     RUN(test_history_evicts_whole_exchanges);
     RUN(test_eviction_keeps_tool_pairs_together);
+    RUN(test_a_nested_turn_is_refused_and_the_outer_turn_survives);
+    RUN(test_the_tool_schema_is_rebuilt_every_turn);
     RUN(test_reset_forgets_everything);
 
     RUN(test_sentence_cannot_inject);

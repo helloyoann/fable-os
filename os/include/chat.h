@@ -134,6 +134,7 @@
 #define CHAT_EHTTP     -100    /* the API answered, but not with 200           */
 #define CHAT_ELIMIT    -101    /* CHAT_MAX_ROUNDS tool rounds without an answer*/
 #define CHAT_EHISTORY  -102    /* one turn does not fit the history at all     */
+#define CHAT_EREENTER  -103    /* chat_ask() called from inside a chat_ask()   */
 
 /* ---- bounds. Every one of these is a hard, static limit. ---- */
 
@@ -284,7 +285,20 @@
  * description gained the 200-byte paragraph saying that a program developed
  * under driver_run's /vm root is DENIED under a capability's data root, which
  * cost a live turn six wasted tool rounds hunting for where /vm mapped. */
-#define CHAT_REGISTRY_BYTES    53021
+/* 2026-07-30, later the same day: 56309 at 64 tools, read off the banner. The
+ * +3288 is the C compiler family (cc_compile, cc_call, cc_source; see
+ * include/cc.h), of which 384 bytes are the fixed-width panel that advertises
+ * the saved programs and 1709 are cc_compile's description, which is the C
+ * SUBSET MANUAL and is the reason that family is three tools and not five.
+ *
+ * READ THIS BEFORE ADDING ANYTHING: 57344 - 56309 leaves 1035 BYTES. Not 8 KiB,
+ * not "a bit". The next description that grows by more than a kilobyte has to
+ * either take it out of an existing one or make the case for the structural fix
+ * this file has now asked for twice (send the schema once, or page it). The
+ * compiler family was trimmed by 557 bytes on the way in - a verbose
+ * per-property input_schema, which said what its description already said - to
+ * leave that 1035 rather than 478. */
+#define CHAT_REGISTRY_BYTES    56309
 
 /* The user turn that carries a round's tool_result blocks plus the kernel's
  * budget note.
@@ -343,8 +357,49 @@ void chat_reset(void);
 /* Run one operator turn to completion: send, print, dispatch, repeat.
  * Returns CHAT_OK when the model finished with a normal answer, or one of the
  * negative codes above. Every failure path is also printed for the operator as
- * a [bracketed] line, because there is no other interface to report it on. */
+ * a [bracketed] line, because there is no other interface to report it on.
+ *
+ * NOT RE-ENTRANT, AND IT SAYS SO RATHER THAN MISBEHAVING. The turn loop drives
+ * the whole exchange out of file-scope statics — the request buffer, the
+ * response buffer, the block cursor, the round counter and the history epoch —
+ * and it hands each tool handler a span pointing INTO the response buffer while
+ * continuing to iterate a cursor into that same buffer afterwards. A nested call
+ * overwrites all of it.
+ *
+ * That is reachable, not theoretical: kernel/main.c binds agenda_say() to
+ * chat_ask(), and the model can call agenda_control {"action":"run_now"} on a
+ * do=say item from inside a tool call. Before the guard, the observed damage was
+ *   - the outer turn's REMAINING tool_use blocks were silently dropped: a model
+ *     asked for two actions, one happened, one did not, and no trace line said
+ *     so;
+ *   - the nested request carried the outer assistant message with dangling
+ *     tool_use blocks and no tool_result, which the Messages API rejects with a
+ *     hard HTTP 400 (observed live, twice, in one turn);
+ *   - stat_rounds was zeroed, so the only bound on paid rounds per turn reset;
+ *   - hist_epoch was bumped and never restored, so the outer turn's rollback
+ *     matched none of its own entries.
+ *
+ * A nested call now returns CHAT_EREENTER immediately, changes nothing, and
+ * prints why. The caller gets a fact it can act on: a say item cannot run inside
+ * a turn, but it will run when the machine is next idle or at boot. */
 int chat_ask(const char *sentence);
+
+/* Declare that no turn is running, whatever chat_ask() may believe.
+ *
+ * chat_ask()'s re-entrancy guard is a flag it sets on the way in and clears on
+ * the way out — and a fault guard escaping out of a turn does not return through
+ * "the way out". core/agenda.c runs a say item inside fault_guard_run(), so a
+ * fatal CPU exception anywhere under chat_ask() would leave the flag set and
+ * every later turn would be refused for the rest of the boot: a machine that
+ * boots, survives the fault exactly as designed, and can then never be spoken to
+ * again. Strictly worse than the bug the guard exists to fix.
+ *
+ * So: call this from anywhere that is PROVABLY outside a turn. kernel/main.c's
+ * idle_work() is exactly that — it is the loop chat_ask() is called FROM — and it
+ * calls this on every pass. Deliberately NOT called from core/agenda.c, which
+ * would give that module a link dependency on net/chat.c that include/agenda.h
+ * names as something it does not have. A no-op in the normal case. */
+void chat_turn_ended(void);
 
 /* ---- the action journal: what this machine actually ran ---- */
 

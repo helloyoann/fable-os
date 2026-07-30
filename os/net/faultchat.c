@@ -117,8 +117,11 @@ static const char SYSTEM_PROMPT[] =
     "OMIT \"fix\" ENTIRELY when you are not sure. A wrong fix is worse than no "
     "fix: it changes what the CPU executes next, it is applied without anyone "
     "confirming it, and this machine has no shell to recover from. A diagnosis "
-    "with no fix is a useful, complete answer. So is "
-    "{\"action\":\"refuse\"}, which means 'let it halt, deliberately'.\n"
+    "with no fix is a useful, complete answer.\n"
+    "{\"action\":\"refuse\"} is NOT the cautious answer and is not a way of "
+    "declining: it ARMS a deliberate halt, so the next matching fatal exception "
+    "stops this machine instead of surviving it. Use it only when halting is "
+    "genuinely what should happen. To decline, omit \"fix\" entirely.\n"
     "You may ALSO include an optional \"patch\" object, which rewrites the "
     "faulting instructions in this running kernel's .text so the bug is gone "
     "rather than survived. Every page here is RWX, so this works with no "
@@ -336,6 +339,44 @@ size_t faultchat_build_prompt(const fault_record_t *rec,
                "  budget            : %u code patch(es) left this boot\n",
                (unsigned)(FAULTCHAT_MAX_PATCHES -
                           faultchat_patches_applied()));
+    }
+
+    /* ---- WHAT HAPPENS IF THE ANSWER IS "NOTHING" ----
+     *
+     * Added because a real model, asked twice about a live divide-by-zero it had
+     * diagnosed perfectly — it named the opcode, the register and the reason —
+     * proposed no patch and then {"action":"refuse"}. Everything it needed was
+     * already above: RIP inside .text, the bytes, a ready-made expect string.
+     * What was missing was the CONSEQUENCE. Every sentence in the contract warned
+     * it off ("a wrong fix is worse than no fix", "omit them unless..."), and
+     * nothing anywhere said what declining costs — so declining read as the
+     * cautious choice when it was the choice that left the bug in the kernel.
+     *
+     * This is the one fact the kernel holds and the model cannot infer: an
+     * ESCAPED fault means the code was ABANDONED, not fixed. Whatever called it
+     * will call it again, fault again, and be shut down by its own failure
+     * counter, and the per-address diagnosis limit means this question will not
+     * be asked a third time. Doing nothing is not neutral here, and saying so is
+     * not pressure to guess — the paragraph below states the alternative and the
+     * reversibility in the same breath. */
+    if (rec->fix_set && rec->fix == FAULT_FIX_ESCAPED) {
+        ap(dst, cap, &off,
+           "\nIF NOTHING IS CHANGED\n"
+           "  This fault was ESCAPED: the call chain was abandoned, not "
+           "repaired. The faulting instruction is still in .text exactly as "
+           "shown above, so whatever called it will call it again and fault "
+           "again in the same place. This kernel asks about any one address at "
+           "most %u time(s) per boot, so \"no change\" here is a decision to "
+           "leave the bug in place, not a decision to postpone it.\n"
+           "  \"refuse\" is NOT a useful answer to a fault the machine has "
+           "already survived: it arms a deliberate HALT for next time, which is "
+           "strictly worse than the escape that just worked.\n"
+           "  A \"patch\" is reversible - the original bytes are kept and can be "
+           "restored - and it is budgeted, so a wrong one is bounded. If the "
+           "faulting instruction should simply not run, filling its whole span "
+           "with 0x90 (nop) deletes it; the destination register then keeps "
+           "whatever it already held, which the register dump above shows.\n",
+           (unsigned)FAULTCHAT_MAX_PER_RIP);
     }
 
     /* ---- what an answer looks like, restated with this machine's numbers ---- */
@@ -1039,9 +1080,41 @@ int faultchat_pump(void) {
                     why);
         } else {
             g_fixes++;
-            kputs("[fault-diagnose] the fix is armed. The next matching "
-                  "exception will be handled by it instead of halting the "
-                  "machine.\n");
+            /* SAY WHICH PLAN WAS ARMED, NOT WHAT A PLAN USUALLY DOES.
+             *
+             * Two of the five actions the fault_recover grammar accepts are not
+             * recoveries at all, and a real model picks one of them: asked twice
+             * about a live divide-by-zero, it answered {"action":"refuse"} —
+             * "let it halt, deliberately", which fault.h defines as the exact
+             * OPPOSITE of resuming. The single sentence that used to be printed
+             * here said "the next matching exception will be handled by it
+             * instead of halting the machine", so the console recorded a
+             * recovery at the precise moment the machine had been armed to die,
+             * and it recorded it for an action nobody was present to see.
+             *
+             * A wrong sentence is worse here than anywhere else in the module,
+             * because this is the only record of an unattended decision. So the
+             * plan is READ BACK from fault_plan_get() — the live plan, not the
+             * model's JSON — and described in its own terms. */
+            const fault_plan_t *armed = fault_plan_get();
+            unsigned act = armed ? (unsigned)armed->action
+                                 : (unsigned)FAULT_ACT_NONE;
+            if (act == FAULT_ACT_REFUSE)
+                kputs("[fault-diagnose] the model armed a DELIBERATE REFUSAL, "
+                      "which is not a repair: the next matching fatal exception "
+                      "is to be allowed to HALT this machine unless some caller "
+                      "has armed a fault guard for it to escape into. The "
+                      "faulting instruction is untouched and will fault "
+                      "again.\n");
+            else if (act == FAULT_ACT_NONE)
+                kputs("[fault-diagnose] the model's fix arms no action, so "
+                      "nothing about the machine has changed: the next fault "
+                      "takes its normal course and the faulting instruction is "
+                      "still there.\n");
+            else
+                kputs("[fault-diagnose] the fix is armed. The next matching "
+                      "exception will be handled by it instead of halting the "
+                      "machine.\n");
         }
     }
 

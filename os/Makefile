@@ -156,6 +156,8 @@ KERNEL_SRCS := kernel/main.c kernel/drivers.c $(TOOL_SRCS) \
                apps/runtime.c apps/expr.c apps/cap.c apps/app_selftest.c \
                apps/app_format_selftest.c apps/app_audio_selftest.c \
                vm/dvm.c \
+               compiler/cc.c compiler/cc_lex.c compiler/cc_parse.c \
+               compiler/cc_x64.c compiler/cc_sym.c compiler/cc_store.c \
                drivers/serial/serial.c drivers/fwcfg/fwcfg.c drivers/pci/pci.c \
                drivers/acpi/acpi.c drivers/acpi/power.c \
                drivers/acpi/power_selftest.c \
@@ -592,6 +594,20 @@ HOSTCC     ?= cc
 HOST_CFLAGS := -std=gnu11 -g -O1 -Wall -Wextra -Iinclude -Itests/host \
                -DTALKOS_HOSTTEST
 HOST_SHIM  := tests/host/harness.c tests/host/kshim.c
+
+# tests/host/test_cc.c does something no other suite does: it EXECUTES the x86-64
+# machine code its subject emits, in-process, so that the code generator is tested
+# against reality and not against an expected byte string. That requires the test
+# binary itself to be an x86-64 process. On an Apple-silicon Mac that is one flag
+# and Rosetta; on an x86-64 host it is already true and this is empty; on any
+# other host it is also empty and the suite still compiles, still checks every
+# diagnostic, and skips only the tests that run code (cc_run returns CC_ENOEXEC
+# and the suite says so out loud rather than reporting a green it did not earn).
+ifeq ($(shell uname -s)-$(shell uname -m),Darwin-arm64)
+CC_HOST_ARCH := -arch x86_64
+else
+CC_HOST_ARCH :=
+endif
 # Each test compiles its sources in one command, so there are no stale objects to
 # worry about here — but the BINARY was previously newer than any header it was
 # built from, so editing a header left the suite testing the old contract. The
@@ -714,6 +730,24 @@ TESTSRC_test_trace := lib/trace.c
 TESTSRC_test_capability := core/capability.c core/tool.c core/kobject.c \
                            mm/heap.c fs/vfs/vfs.c fs/native/ramfs.c \
                            vm/dvm.c lib/trace.c net/json.c
+# The C compiler. tools/cc_tools.c is #included by the suite (REGISTER_TOOL), so
+# it is deliberately absent here and present in the prerequisite block below.
+# fs/ and core/kobject.c are here because the program store is real files in the
+# real VFS: a host test that saves a program, "reboots" and calls it is testing
+# the same code the kernel runs, not a stand-in.
+TESTSRC_test_cc := compiler/cc.c compiler/cc_lex.c compiler/cc_parse.c \
+                   compiler/cc_x64.c compiler/cc_sym.c compiler/cc_store.c \
+                   core/tool.c core/kobject.c mm/heap.c \
+                   fs/vfs/vfs.c fs/native/ramfs.c lib/trace.c net/json.c
+# -fno-sanitize=function, for `make test-host-asan`. UBSan's `function` check
+# reads a magic word and a type hash from the EIGHT BYTES BEFORE any indirect
+# call's target, to verify the prototype. This suite's whole point is to call
+# bytes the code generator just emitted, and byte 0 of that buffer is the
+# generated entry trampoline, so there is nothing in front of it to read: the
+# check faults with SIGBUS before the program runs. Excluding it here rather
+# than in ASAN_HOST_CFLAGS keeps the check on for every other suite. Everything
+# else about the sanitizers is unchanged, and the emitted code is still executed.
+HOSTCFLAGS_test_cc := -Icompiler $(CC_HOST_ARCH) -fno-sanitize=function
 TESTSRC_test_dvm := vm/dvm.c lib/trace.c
 TESTSRC_test_dvm_mem := vm/dvm.c lib/trace.c
 TESTSRC_test_dvm_ac97 := vm/dvm.c lib/trace.c
@@ -746,6 +780,12 @@ tests/build/test_audio: tools/audio_tools.c
 # must follow both.
 tests/build/test_dvm_tools: tools/dvm_tools.c vm/transcripts/dvm_bringup.h
 tests/build/test_capability: tools/capability_tools.c
+# The suite reads all four shipped examples off the disk and compiles them
+# verbatim, so all four are prerequisites: an example edited without the suite
+# being rebuilt is an example nothing checks.
+tests/build/test_cc: tools/cc_tools.c compiler/cc_int.h \
+                     compiler/examples/square.c compiler/examples/histogram.c \
+                     compiler/examples/notes.c compiler/examples/broken.c
 # ac97_bringup.h holds the reference driver program as a C string literal,
 # derived from vm/programs/ac97_bringup.dvm by vm/programs/gen_header.py. There
 # is deliberately NO rule to run that generator: the header is checked in, the

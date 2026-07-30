@@ -67,42 +67,62 @@
  *   instruction. It turns "something corrupted the heap" into "fiber ui blew
  *   its stack", which is the whole of the win.
  *
- * THE ROOT FIBER IS NOT GUARDED
+ * THE ROOT FIBER IS GUARDED NOW, AND THE ARGUMENT FOR LEAVING IT UNGUARDED WAS
+ * WRONG
  *   fiber_init() adopts the already-running kernel context as fiber 0 so that
  *   there is always something to switch back to. Its stack is the 64 KiB
- *   reserved in boot/boot.asm, whose bounds are not visible to C, so it gets no
- *   poison band. That is deliberate rather than unfortunate: the root fiber is
- *   the one that runs mbedTLS, and the deepest user of the stack should keep
- *   the biggest stack.
+ *   reserved in boot/boot.asm. This header used to argue that leaving it
+ *   unguarded was "deliberate rather than unfortunate: the root fiber is the one
+ *   that runs mbedTLS, and the deepest user of the stack should keep the biggest
+ *   stack", and closed with a measurement (5128 of 65536 bytes, 7.8%) concluding
+ *   that the missing band was "a gap in the DIAGNOSTICS and not a live hazard".
  *
- *   AND THE NUMBER OFFERED IN ITS PLACE IS NOT A BOUND. fiber_report() prints how
- *   far the root has descended since fiber_init(), and that figure is STRUCTURALLY
- *   BLIND, not merely approximate. It is updated only inside
- *   fiber_check_stacks(), only when the root is the fiber running, i.e. only at
- *   the yield points the root passes through — and those are shallow polling
- *   loops. net_service()'s yield is its LAST statement, after net_poll_rx() has
- *   returned, and the mbedTLS handshake runs INSIDE net_poll_rx() via lwIP's
- *   callbacks. So the deepest frames on the root can never be sampled, by
- *   construction, and the printed figure is identical on a boot that completed a
- *   TLS handshake and an HTTPS round trip and on one that did nothing: 656 bytes,
- *   every time. The true high-water mark, read out of RAM after a 25 s boot (the
- *   untouched part of .bss is provably zero, so the lowest non-zero byte below
- *   stack_top is the real depth), was 5128 bytes — about eight times the number
- *   this prints.
+ *   BOTH HALVES WERE OVERTAKEN BY compiler/, WHICH LANDED ON THE SAME BRANCH.
+ *   mbedTLS is no longer the deepest user, or close to it. Measured on the real
+ *   machine, root stack bytes used:
  *
- *   What is on the other side matters more than the ratio. boot/boot.asm lays out
- *   .bss as P4, P3 and four P2 tables and then stack_bottom, so the 24 KiB
- *   directly below the unguarded root stack ARE the page tables providing the
- *   identity map. A root overflow destroys the identity map and triple-faults with
- *   no report at all — the one failure this whole subsystem exists to prevent.
- *   Measured headroom is comfortable (5128 of 65536 bytes, 7.8%), so this is a
- *   gap in the DIAGNOSTICS and not a live hazard.
+ *       boot + TLS handshake + a full HTTPS round trip ......  5,128
+ *       one cc_compile of `int main(void){return 1;}` ....... 20,040
+ *       cc_compile of 31 nested blocks (the parser's own
+ *         documented maximum, accepted, rc = 0) ............. 51,928
+ *       cc_compile of `return 1+1+...+1` with 1000 terms .... 65,536  (dead)
  *
- *   The fix is one line in boot/boot.asm: `global stack_bottom` and
- *   `global stack_top` would let C see the bounds and guard the root like every
- *   other fiber. Until then, read the printed figure as "the deepest the root has
- *   been seen at a yield point", which is what the console string says, and not as
- *   a depth bound — because it is not one.
+ *   The last one is a triple fault: boot/boot.asm lays .bss out as P4, P3 and
+ *   four P2 tables and THEN stack_bottom, so the 24 KiB directly below the root
+ *   stack ARE the page tables providing the identity map. Overflow destroys the
+ *   identity map, and a triple fault has no handler — no #PF, no fault record,
+ *   no faultchat diagnosis, nothing on the serial line, and no self-repair
+ *   possible. The input that does it is ~2 KB of legal, in-subset C: an ordinary
+ *   model message, one eighth of the size cc_compile advertises.
+ *
+ *   So: boot/boot.asm now exports stack_bottom and stack_top, kernel/main.c
+ *   hands them to fiber_root_stack_set() before fiber_init(), and the root gets
+ *   a low poison band like every other fiber. Two differences, both forced by
+ *   the root already running on this memory:
+ *     - NO HIGH BAND. stack_top is the end of what boot.asm reserved; painting
+ *       past it would scribble on whatever .bss placed next. Underflow is also
+ *       the direction recursion cannot produce.
+ *     - THE MIDDLE IS NOT PAINTED, because we are standing in it. The high-water
+ *       scan therefore looks for the lowest non-ZERO word, which is exact only
+ *       because boot/boot.asm rep-stosb-zeroes the whole of .bss first.
+ *
+ *   fiber_report() now prints BOTH numbers for the root: the .bss high-water
+ *   mark (real) and root_depth (what the scheduler sampled). Keep printing both.
+ *   root_depth is STRUCTURALLY BLIND — updated only inside fiber_check_stacks(),
+ *   only when the root is running, i.e. only at the yield points the root passes
+ *   through, and those are shallow polling loops. net_service()'s yield is its
+ *   LAST statement, after net_poll_rx() has returned, and the mbedTLS handshake
+ *   runs INSIDE net_poll_rx() via lwIP's callbacks. It read 656 bytes on a boot
+ *   whose true high-water was 5,128 and 656 bytes on a boot whose true
+ *   high-water was 65,536. Believing it is what produced the paragraph this one
+ *   replaces.
+ *
+ *   THE BAND IS NOT THE WHOLE FIX and must not be mistaken for one. It converts
+ *   a silent triple fault into a named panic, which is a large improvement and
+ *   still a dead machine. What keeps the compiler off the band in the first
+ *   place is a stack floor checked inside compiler/ itself — see CC_STACK_BUDGET
+ *   in include/cc.h — and that is the mechanism that turns a runaway compile
+ *   into a diagnostic the model can act on.
  *
  * PUBLIC API
  *   fiber_init                  adopt the current context as fiber 0
@@ -204,6 +224,17 @@ typedef struct fiber fiber_t;
  * or an error until it has been. Returns 0. */
 int fiber_init(void);
 
+/* Tell the scheduler where the root's stack really is, so fiber_init() can lay a
+ * poison band at the bottom of it and measure its true high-water mark. Call it
+ * BEFORE fiber_init(); afterwards it has no effect on the already-adopted root.
+ *
+ * A setter rather than a weak reference to boot/boot.asm's symbols because a
+ * host test links no boot.asm and stands on a stack it did not allocate: leaving
+ * the hint unset is the honest description of that situation, and lets the same
+ * code be tested against a synthetic region. `hi` is one past the last usable
+ * byte; the low FIBER_GUARD_BYTES of [lo, hi) become the band. */
+void fiber_root_stack_set(void *lo, void *hi);
+
 /* Create a runnable fiber with `stack_bytes` of usable stack (clamped into
  * [FIBER_STACK_MIN, FIBER_STACK_MAX]; 0 means FIBER_STACK_DEFAULT) plus a
  * poison band at each end. It does not run until something yields to it.
@@ -270,10 +301,11 @@ int         fiber_runnable(void);              /* of those, how many can run */
  * has already been freed, in which case the outputs are untouched. */
 int    fiber_stack_bounds(const fiber_t *f, void **lo, void **hi);
 size_t fiber_stack_size(const fiber_t *f);     /* usable bytes; 0 if unknown */
-/* High-water mark. For a created fiber this is a real measurement, taken from how
- * much of the FILL_WORD-stamped stack is no longer stamped. FOR THE ROOT IT IS
- * NOT: it returns the depth sampled at yield points, which cannot see the root's
- * deepest frames at all. See "THE ROOT FIBER IS NOT GUARDED" above. */
+/* High-water mark, and a real measurement for every fiber whose bounds are
+ * known: how much of the stack no longer holds the pattern an untouched word
+ * holds (FILL_WORD for a created fiber, zero for the root's .bss). Falls back to
+ * the yield-point sample ONLY for a root whose bounds nobody supplied, i.e. in a
+ * host test; that number cannot see the root's deepest frames at all. */
 size_t fiber_stack_used(const fiber_t *f);
 
 uint64_t fiber_switches(void);                 /* context switches since boot */

@@ -959,6 +959,90 @@ static void test_ten_thousand_switches_change_nothing(void) {
     fiber_init();
 }
 
+/* ======================================================================
+ * THE ROOT FIBER'S STACK
+ *
+ * The root is the context fiber_init() ADOPTS, so it is the one stack this
+ * module did not allocate and, until this branch, the one with no poison band.
+ * On the kernel what sits immediately below it is boot/boot.asm's page tables —
+ * the identity map — so an overflow there is a triple fault with no #PF, no
+ * fault record and nothing on the serial line. include/fiber.h used to argue
+ * that leaving it unguarded was fine because mbedTLS was the deepest user; a
+ * single cc_compile() goes four times deeper than the whole TLS path.
+ *
+ * A host test links no boot.asm and stands on a stack it did not allocate, which
+ * is exactly why the bounds arrive through a SETTER rather than a weak reference
+ * to boot.asm's symbols: the same code can then be driven against a synthetic
+ * region. This is that test.
+ * ====================================================================== */
+static void test_the_root_stack_can_be_declared_and_is_then_guarded(void) {
+    /* WITHOUT the hint the root stays exactly as it always was: no bounds to
+     * report, so nothing else in this suite changes behaviour. */
+    fiber_root_stack_set(NULL, NULL);
+    setup();
+    CHECK(fiber_stack_size(fiber_self()) == 0);
+    CHECK(fiber_stack_bounds(fiber_self(), NULL, NULL) == -1);
+
+    /* WITH it, the root is guarded like any other fiber. The declared region has
+     * to be the stack we are ACTUALLY standing on, because fiber_check_stacks()
+     * also verifies that the running fiber's stack pointer is inside its own
+     * stack — which is a real check on the kernel, where the root's sp genuinely
+     * is inside boot/boot.asm's reservation, and cannot be satisfied by a
+     * detached synthetic array.
+     *
+     * 64 KiB below this frame rather than a few hundred bytes, and the size is
+     * load-bearing: tests/host/kshim.c's kprintf renders into a char[8192], so
+     * report_violation() itself descends ~16 KiB under ASan. A tight region
+     * would have the reporter smash the band it is reporting on. The kernel's
+     * kprintf streams a character at a time and has no such frame. */
+    char anchor;
+    uint8_t *hi = (uint8_t *)&anchor + 64;        /* just above this frame */
+    uint8_t *lo = hi - 65536;                     /* untouched host stack   */
+
+    fiber_root_stack_set(lo, hi);
+    setup();
+
+    void *glo = NULL, *ghi = NULL;
+    CHECK(fiber_stack_bounds(fiber_self(), &glo, &ghi) == 0);
+    CHECK(glo == lo + FIBER_GUARD_BYTES);
+    CHECK(ghi == hi);
+    CHECK(fiber_stack_size(fiber_self()) == 65536u - FIBER_GUARD_BYTES);
+
+    /* An intact band, with the stack pointer inside the region, is quiet. */
+    CHECK(fiber_check_stacks() == 0);
+    CHECK(kpanic_hit == 0);
+
+    /* Painting the band is what fiber_init() must have done: on the kernel the
+     * bytes below this point are p2_tables, the identity map. */
+    int painted = 0;
+    for (size_t k = 0; k < FIBER_GUARD_BYTES; k++) if (lo[k]) painted++;
+    CHECK(painted == (int)FIBER_GUARD_BYTES);
+
+    /* And walking into it is a NAMED PANIC rather than silent page-table
+     * corruption, which is the entire point of exporting the bounds. */
+    lo[0] ^= 0xFF;
+    kcap_reset();
+    CHECK(fiber_check_stacks() == 1);
+    CHECK(kpanic_hit == 1);
+    CHECK_CONTAINS(kcap_text(), "STACK GUARD VIOLATED");
+    CHECK_CONTAINS(kcap_text(), "main");
+    CHECK_CONTAINS(kcap_text(), "low (overflow)");
+
+    /* THE ROOT'S BLOCK IS NOT THE HEAP'S. fiber_reset() frees every fiber stack;
+     * handing it boot/boot.asm's .bss — the page tables' neighbour — would be
+     * catastrophic and completely silent. owns_block is what prevents it. */
+    heap_stats_t before, after;
+    heap_stats(&before);
+    fiber_reset();
+    heap_stats(&after);
+    CHECK(heap_check() == 0);
+    CHECK(after.used_blocks <= before.used_blocks);
+
+    /* Leave the global hint as the rest of the suite expects to find it. */
+    fiber_root_stack_set(NULL, NULL);
+    setup();
+}
+
 int main(void) {
     console_init();
     heap_stats_t h;
@@ -993,6 +1077,7 @@ int main(void) {
     RUN(test_exiting_into_a_never_run_fiber_frees_the_right_stack);
     RUN(test_two_exits_before_a_reap_leak_nothing);
     RUN(test_a_dead_fiber_owns_no_stack);
+    RUN(test_the_root_stack_can_be_declared_and_is_then_guarded);
     RUN(test_ten_thousand_switches_change_nothing);
 
     fiber_reset();

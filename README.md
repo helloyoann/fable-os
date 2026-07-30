@@ -6,11 +6,12 @@ input path. You type what you want done and the kernel acts on the machine.
 
 The kernel does its own DNS and its own TLS, in ring 0, with mbedTLS and lwIP
 compiled into `kernel.bin` and no host proxy of any kind, and it gives the model
-**61 real syscalls** into itself: a VFS, a FAT32 disk, the device tree, PCI config
+**64 real syscalls** into itself: a VFS, a FAT32 disk, the device tree, PCI config
 space, physical memory, the framebuffer console, a window manager, an app runtime,
-the CMOS clock, a bounded driver VM, HTTP(S) fetch, ACPI power control, a registry
-of capabilities it has taught itself, a schedule of things it does unprompted, and
-the ability to rewrite its own running machine code.
+the CMOS clock, a bounded driver VM, **a C compiler that emits native x86-64 at run
+time**, HTTP(S) fetch, ACPI power control, a registry of capabilities it has taught
+itself, a schedule of things it does unprompted, and the ability to rewrite its own
+running machine code.
 
 It is also **awake**. It keeps what it builds across a power cycle, paints the
 screen while it is thinking, acts at boot with nobody at the keyboard, and — when
@@ -89,16 +90,20 @@ Two things it is important to be straight about up front:
   "The trust model" in `os/README.md`.
 * **A live model has driven tools, but almost nothing is *proven* that way.** The
   transcripts here are a handful of turns. What holds the tools up is millions of
-  host assertions (`make test-host` — 38 suites, also green under ASan + UBSan)
-  against a scripted transport (`os/net/model_mock.c`) and six QEMU boot tests —
-  not a live model's judgement, which nobody has characterised here at any scale.
-  Assume the failure modes of the 61-tool surface under an adversarial or confused
-  model are unexplored, because they are.
-* **There is no C compiler, and nothing can load compiled code.** When this
-  machine "writes code", it writes programs in a small bounded VM's own
-  instruction set, which the kernel assembles and interprets — not C, not machine
-  code, no ELF loader, no linker. Asked to compile a C function it says so and
-  does the job in the VM instead.
+  host assertions (`make test-host` — 39 suites, 9.6M assertions, also green under
+  ASan + UBSan) against a scripted transport (`os/net/model_mock.c`) and six QEMU
+  boot tests — not a live model's judgement, which nobody has characterised here at
+  any scale. Assume the failure modes of the 64-tool surface under an adversarial
+  or confused model are unexplored, because they are.
+* **There IS a C compiler now, and it is the sharpest thing here.** `os/compiler/`
+  turns C out of a model message into native x86-64 and calls it, which works only
+  because every page on this machine is executable. Compiled code is bounded three
+  ways — unforgeable fuel at every loop back-edge and call, an `rsp` check on its
+  own private stack, and a subset with no function pointers so every call target is
+  a compile-time constant. The boundary is a **twelve-entry symbol table of
+  forwarders**, and nothing bounds a *pointer*: a wild store from compiled code
+  halts the machine. There is still no ELF loader and no way to run code built
+  somewhere else, deliberately.
 
 Built and run on macOS via QEMU. Never booted on physical hardware.
 
@@ -185,12 +190,15 @@ read-write-EXECUTE (the `LOAD segment with RWX permissions` link warning is expe
 and intentional — it is also what makes generated code callable). A null dereference
 does not even fault, because the low 4 GiB is mapped writable and page 0 shares its
 huge page with the video framebuffer. The model is handed `mem_read`, `mem_write`, a
-driver VM that can touch I/O ports and program DMA, a writable disk, a schedule that
-runs unprompted, and a tool that edits the running kernel's `.text`. **There is no
-compiled-code symbol table acting as a boundary, because there is no compiled
-code**: the boundaries are the VM's policy, the argument validation in `apps/cap.c`,
-and five gates on a code patch — bounds checks and allowlists inside each tool, not
-hardware. A model that is wrong in the right place can corrupt the machine.
+driver VM that can touch I/O ports and program DMA, a C compiler whose output runs
+as kernel code, a writable disk, a schedule that runs unprompted, and a tool that
+edits the running kernel's `.text`. The boundaries are the VM's policy, the argument
+validation in `apps/cap.c`, five gates on a code patch, and — for compiled code —
+**a twelve-entry symbol table of purpose-written forwarders**, reachable only
+because the subset admits no function pointers so the call graph is fixed before
+the first instruction. All of that is bounds checks and allowlists inside each
+tool, not hardware. A model that is wrong in the right place can corrupt the
+machine.
 
 Two specific consequences, both of which were real defects found by reviewing this
 branch rather than hypotheticals:
@@ -199,7 +207,17 @@ branch rather than hypotheticals:
   capability store, the schedule and the boot log are files the model itself can
   write. A scheduled `power_off` at boot made the machine permanently unbootable
   with no interface left to countermand it; that specific case is now refused both
-  when dictated and when read off a disk, but the class remains.
+  when dictated and when read off a disk. So did a scheduled action that *crashed*,
+  which the name denylist could never cover — a boot item now writes an
+  "attempting" marker to the store before it runs and any boot that finds the
+  marker still set disables that item and says why. The class remains.
+* **A compile could kill the machine outright, and did.** About 2 KB of legal C in
+  a model message walked the compiler's own recursion off the 64 KiB boot stack
+  into the identity-map page tables: triple fault, no fault record, nothing on the
+  serial line, and nothing the self-repair loop can reach. It is now bounded by a
+  measured stack floor and the root stack has a poison band, but the lesson
+  generalises — a depth counter is a proxy for stack use, and the constant relating
+  the two had gone stale twice.
 * **The key is readable from RAM and cannot be made otherwise here.** The outbound
   request scanner refuses to send anything key-shaped, which stops it leaving in one
   piece and stops nothing else — no content filter stops a covert channel.

@@ -103,9 +103,22 @@
  *     paints during a model turn and core/agenda.c runs scheduled work with
  *     nobody typing, so "nothing happens in the background" is no longer true
  *     and the prompt says what does.
- *   - still true, and the model must not pretend otherwise: no package manager,
- *     no C compiler, no loader. New code is authored in the driver VM's ISA
- *     (vm/dvm.c) and nowhere else.
+ *   - still true, and the model must not pretend otherwise: no package manager
+ *     and no loader, so nothing built off this machine can be brought in.
+ *
+ *     THIS ONE WENT STALE TOO, AND IT IS THE SAME DEFECT AS THE PARAGRAPH ABOVE.
+ *     It used to end "no C compiler ... new code is authored in the driver VM's
+ *     ISA and nowhere else", which stopped being true the moment compiler/ and
+ *     tools/cc_tools.c landed: cc_compile builds real C into native x86-64 in
+ *     this kernel and runs it. Asked live "can you compile real C, or only the
+ *     little VM instruction set?", the model happened to trust the tool list
+ *     over the prompt and proved it by compiling something (2/2 observed) - but
+ *     that is luck, not design, and it is exactly the shape of the failure that
+ *     denied GUI apps to the operator for a branch. The prompt now names both
+ *     authoring paths and says which is for what: the VM reaches hardware and
+ *     is bounded to a few hundred instructions (DVM_MAX_INSNS), the compiler is
+ *     for arithmetic, strings, arrays and loops. Both clauses are conditional
+ *     on the tool being offered, so this stays true in a build without one.
  *   - the tool list is the whole syscall surface: tools[] in this request IS
  *     tool.h's registry, assembled from it (core/tool.c), so "I do not have a
  *     tool for that" is a checkable statement and inventing a name is not.
@@ -136,10 +149,14 @@ static const char SYSTEM_PROMPT[] =
     "and the GUI apps painted, so an app's periodic \"tick\" handler keeps "
     "running between turns and even during your own API call, and the kernel's "
     "agenda runs scheduled work with nobody typing. Memory is one heap in a "
-    "fixed arena. There is no package manager, no C compiler and no way to load "
-    "a program built somewhere else: new code is authored in the driver VM's own "
-    "instruction set through the tools that assemble and run it, and that is the "
-    "only way this machine gains an ability it was not built with.\n"
+    "fixed arena. There is no package manager and no loader, so you cannot bring "
+    "in a program built somewhere else - but you can WRITE code here and run it, "
+    "and that is how this machine gains an ability it was not built with. Two "
+    "ways: the driver VM's own instruction set, which is what reaches hardware "
+    "(ports, MMIO, DMA) and is bounded to a few hundred instructions; and, if a "
+    "compile tool is offered, real C compiled inside this kernel to native "
+    "x86-64 and executed here, which is the one to reach for when the job is "
+    "arithmetic, strings, arrays or loops rather than a device.\n"
 
     "\nWHERE THINGS LIVE, AND WHAT SURVIVES A POWER CYCLE. There are two "
     "filesystems and the difference is the difference between work you keep and "
@@ -182,7 +199,10 @@ static const char SYSTEM_PROMPT[] =
     "lists it in full, so call what is there instead of writing it again. "
     "Rebuilding something this machine already knows is the failure the operator "
     "will notice first. And when you have just solved something they are likely "
-    "to ask for twice, save it, say that you did, and say what it is called.\n"
+    "to ask for twice, save it, say that you did, and say what it is called. A "
+    "compiled C program keeps the same way, in its own store with its own list, "
+    "so a routine worth calling twice should be given a name rather than typed "
+    "out again.\n"
 
     "\nYOU CAN ACT WITHOUT BEING ASKED, AND REPAIR YOURSELF. If an agenda tool "
     "is offered you can schedule a tool call or a whole sentence to run at boot, "
@@ -347,7 +367,15 @@ static void journal_record(const char *name, const char *detail, int failed) {
 /* history                                                                 */
 /* ====================================================================== */
 
+/* IN A TURN. See the re-entrancy paragraph on chat_ask() in include/chat.h for
+ * what a nested call used to do; this is the whole of the defence. A flag and
+ * not a counter, because there is no sane meaning for "two levels of turn": the
+ * buffers are singletons. Cleared on every exit path, including the early ones,
+ * which is why chat_ask() is a thin wrapper around chat_ask_body(). */
+static int in_turn;
+
 void chat_reset(void) {
+    in_turn    = 0;
     hist_n     = 0;
     hist_used  = 0;
     hist_epoch = 0;
@@ -525,9 +553,50 @@ static void hist_rollback_epoch(void) {
 /* request assembly                                                        */
 /* ====================================================================== */
 
+/* Reassemble the tool schema. Called at the start of every turn, not once.
+ *
+ * IT USED TO BE `if (tools_ready) return;` AND THAT MADE THE LIVE PANELS DEAD.
+ * Two tools carry a mutable fixed-width panel at the tail of their description —
+ * capability_call's list of taught capabilities (tools/capability_tools.c) and
+ * cc_call's list of kept programs (tools/cc_tools.c) — and both are faithfully
+ * re-rendered into their description buffers whenever their registry changes.
+ * tools_build_schema() COPIES those descriptions into tools_buf, so a one-shot
+ * snapshot froze them at boot. Nothing saved during a session was ever visible
+ * to the model again.
+ *
+ * The consequence was worse than a stale list: with an empty store at boot the
+ * panel reads "NONE SAVED YET - this machine has not been taught anything
+ * beyond its built-in tools", and that sentence stayed in the model's own
+ * instructions for the whole session, immediately after it had saved something.
+ * An actively false statement in the tool schema, contradicted by the
+ * tool_result still sitting in the history. Only a power cycle fixed it, which
+ * is exactly why a boot-2 observation made the mechanism look like it worked.
+ *
+ * REBUILDING IS SAFE AND CHEAP, and both halves are load-bearing. Safe because
+ * the panels are FIXED WIDTH by construction — space-padded, no quote, no
+ * backslash, no control byte — so the serialised schema is byte-for-byte the
+ * same size with 0, 1 or 16 entries saved, which
+ * tests/host/test_capability.c and tests/host/test_cc.c both assert. Cheap
+ * because this runs once per operator sentence, not once per round, against a
+ * network round trip that costs three orders of magnitude more.
+ *
+ * AND A FAILED REBUILD KEEPS THE LAST GOOD SCHEMA. Zeroing tools_len offers the
+ * model NO TOOLS AT ALL — a machine that boots, talks, and can do nothing —
+ * and turning a mid-session panel change into that is a far worse outcome than
+ * a stale list. Only a build that has never succeeded is allowed to end up
+ * empty. */
 static void tools_load(void) {
-    if (tools_ready) return;
-    tools_ready = 1;
+    /* Measure before writing. tools_build_schema(NULL, 0) returns the length it
+     * WOULD need and touches nothing, which is what makes "keep the last good
+     * schema" implementable without a second 56 KiB buffer: a rebuild that
+     * cannot fit is never started, so the bytes already in tools_buf survive. */
+    if (tools_ready && tools_build_schema((char *)0, 0) >= sizeof tools_buf) {
+        kprintf("[chat: the tool schema has grown past %u bytes since boot - "
+                "the model keeps the schema from the start of this boot, so any "
+                "tool added or renamed since is invisible to it]\n",
+                (unsigned)sizeof tools_buf);
+        return;
+    }
 
     size_t need = tools_build_schema(tools_buf, sizeof tools_buf);
 
@@ -540,12 +609,21 @@ static void tools_load(void) {
     json_value_t v;
     if (need >= sizeof tools_buf || json_parse(tools_buf, need, &v) != JSON_OK) {
         kprintf("[chat: the tool schema does not fit %u bytes - the model will "
-                "be offered no tools at all]\n", (unsigned)sizeof tools_buf);
+                "be offered %s]\n", (unsigned)sizeof tools_buf,
+                tools_ready ? "no tools at all (the schema became invalid "
+                              "during this boot)"
+                            : "no tools at all");
+        /* Getting here after a successful boot build means the schema FITS but
+         * does not PARSE, i.e. some description or input_schema became invalid
+         * during the session. There is nothing good left in the buffer to keep,
+         * so this is the one case that really does end with no tools — and it
+         * says which of the two situations it is. */
         tools_buf[0] = '\0';
         tools_len    = 0;
         return;
     }
-    tools_len = need;
+    tools_len   = need;
+    tools_ready = 1;
 }
 
 /* On the final permitted round the request is sent with tool calling turned OFF.
@@ -1007,9 +1085,32 @@ static int send_retryable(int rc) {
     return rc == MODEL_ETRANSPORT || rc == MODEL_ETIMEOUT || rc == MODEL_EPROTO;
 }
 
+static int chat_ask_body(const char *sentence);
+
 int chat_ask(const char *sentence) {
     if (!sentence) return CHAT_EINVAL;
 
+    if (in_turn) {
+        /* Say it in the kernel's own voice, because the caller is usually a tool
+         * handler whose result the model reads, and "the store could not be read
+         * or written" — which is what core/agenda.c used to flatten this into —
+         * sent a live model hunting a disk fault that did not exist for six
+         * rounds and two paid API calls. */
+        kputs("[chat: a turn is already in progress, so this one was not "
+              "started. A sentence cannot be asked from inside a tool call; it "
+              "will run when the machine is next idle, or at boot]\n");
+        return CHAT_EREENTER;
+    }
+
+    in_turn = 1;
+    int rc = chat_ask_body(sentence);
+    in_turn = 0;
+    return rc;
+}
+
+void chat_turn_ended(void) { in_turn = 0; }
+
+static int chat_ask_body(const char *sentence) {
     stat_rounds     = 0;
     stat_tool_calls = 0;
     stat_retries    = 0;

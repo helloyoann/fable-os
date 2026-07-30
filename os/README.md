@@ -3,7 +3,7 @@
 A from-scratch x86_64 kernel, built and run on macOS via QEMU. It boots into a
 prompt with no shell and no commands: you type a sentence, the kernel sends it to
 the Anthropic Claude API **directly over HTTPS** from ring 0, and the model drives
-the machine through 61 registered tools. It has a framebuffer console, a window
+the machine through 64 registered tools. It has a framebuffer console, a window
 manager, clickable apps described as JSON documents, a PS/2 mouse, ACPI power
 control, and a sandboxed driver VM in which the model can **write a driver for a
 sound card this kernel has never heard of and then play a tone through it** —
@@ -39,7 +39,7 @@ which it has done, live, from one typed sentence.
 | A model-authored driver can *become* the audio output (`driver_install`) | ✅ done, proven live |
 | An AC'97 driver in the kernel tree | ⬜ **deliberately none** — test fixture only, `-DTALKOS_AC97_REFERENCE` |
 | Apps can call kernel capabilities (`{"call":"audio.tone"}`) | ✅ done |
-| The turn loop — 61 tools, 16 rounds, budget notes, retries, a journal | ✅ done |
+| The turn loop — 64 tools, 16 rounds, budget notes, retries, a journal | ✅ done |
 | Disk-backed filesystem (FAT32 read/write, VFAT long names, own mkfs) | ✅ done |
 | ATA PIO driver + block layer (LBA28, no DMA, no IRQs) | ✅ done |
 | Cooperative fibers — the screen stays alive during a model turn | ✅ done |
@@ -48,7 +48,9 @@ which it has done, live, from one typed sentence.
 | Fault guard + live `.text` patching — the machine repairs itself | ✅ done, flag-gated demo |
 | General HTTP(S) fetch, DNS and connect probes as tools | ✅ done |
 | Driver-VM scratch memory, strings and six syscalls | ✅ done |
-| A C compiler, or any way to load compiled code | ⬜ **none** — see below |
+| A C compiler: real C → native x86-64, at run time, in the kernel | ✅ done, proven live |
+| Compiled programs saved by name and recompiled on demand across a reboot | ✅ done, proven live |
+| An ELF loader, or any way to load code built somewhere else | ⬜ **none**, deliberately |
 | Certificate verification (pinned roots + hostname + expiry) | ✅ done, **off by default** — `-DTALKOS_VERIFY_CERTS` |
 | CSPRNG entropy | ⬜ future (see caveat) |
 | Userspace, processes, memory protection, a scheduler | ⬜ none, by design so far |
@@ -60,8 +62,8 @@ Everything below is reproducible from a clean checkout on macOS + QEMU.
 | Check | Command | Result |
 |---|---|---|
 | Build | `make clean && make -j8` | clean; the only warning is the intentional RWX one |
-| Host unit tests | `make test-host` | **37 suites, 9,568,493 assertions, all pass** |
-| The same under ASan + UBSan | `make test-host-asan` | 37 suites pass |
+| Host unit tests | `make test-host` | **39 suites, 9,598,786 assertions, all pass** |
+| The same under ASan + UBSan | `make test-host-asan` | 39 suites pass |
 | Boot tests | `make test-qemu` | **6 / 6** |
 | Headless boot + screenshot | `./capture.sh 20` | reaches `> `, 0 panics |
 | The kernel knows nothing about sound cards | `make test-qemu` (`audio-unclaimed`) | two cards attached, both `driver=-`, nothing played |
@@ -70,6 +72,9 @@ Everything below is reproducible from a clean checkout on macOS + QEMU.
 | No format string outside what it implements | `make test-qemu` (runs the lint first) | `lint_printf.py`: clean |
 | Real audio out of the driver VM | `vm/programs/capture_audio.sh` | 440 Hz then 660 Hz, measured from the captured WAV — needs `-DTALKOS_AC97_REFERENCE` |
 | The hardening build | `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS` | links, boots, verifies a live certificate |
+| The C compiler executes the machine code it emits | `make test-host` (`cc`) | 29,484 assertions; the host binary is built `-arch x86_64` so the emitted bytes are *called*, not inspected |
+| The root stack is guarded and its true depth is printed | any boot | `fiber: main [running] stack 5144/65280 bytes used (7%)` — a `.bss` high-water mark, not a sample |
+| The compiler's stack budget is checked against the real stack | any boot | `cc: compile-time stack budget 24576 bytes (+6144 reserve) against 64896 bytes below this frame - ok` |
 
 **The headline experiment, live.** A default (audio-ignorant) kernel was booted
 with a sound card QEMU recorded to a WAV, and the operator typed one sentence:
@@ -139,10 +144,15 @@ unchanged.
 
 This kernel has **no isolation of any kind**: ring 0, no userspace, no memory
 protection, no privilege separation, no IOMMU, every page mapped
-read-write-execute, and a language model holding `mem_write`, a driver VM, a
-writable disk, an agenda that acts unprompted, and the ability to rewrite the
-running kernel's `.text`. See "Known weaknesses and things nobody has tested" at
-the end of this file for the whole list. The network-facing half is here.
+read-write-execute, and a language model holding `mem_write`, a driver VM, a C
+compiler that emits **native code into an executable `.bss` buffer**, a writable
+disk, an agenda that acts unprompted, and the ability to rewrite the running
+kernel's `.text`. The only boundary around compiled code is a twelve-entry symbol
+table of forwarders and the fact that the subset admits no function pointers, so
+every call target is a compile-time constant; there is nothing bounding a
+*pointer*, and a wild store from compiled code halts the machine. See "Known
+weaknesses and things nobody has tested" at the end of this file for the whole
+list. The network-facing half is here.
 
 **The default build does not authenticate the server.** TLS runs with
 `MBEDTLS_SSL_VERIFY_NONE` (`ALTCP_MBEDTLS_AUTHMODE 0` in `port/lwipopts.h`): the
@@ -290,7 +300,16 @@ apps/        runtime.c + expr.c — an app is a JSON document, not code;
 vm/          dvm.c — the bounded driver VM, and the one DMA arena on the machine
              (the AC'97 bring-up that used to live here is now a test fixture:
               tests/qemu/fixtures/ac97_boot.c, built only under a flag)
-core/        audio.c — the audio service: PCM synthesis and the one sink
+core/        audio.c (the audio service: PCM synthesis and the one sink),
+             fiber.c (cooperative scheduler), capability.c (the registry the
+             model saves what it builds into), agenda.c (what runs unprompted)
+compiler/    a C compiler: cc_lex.c (lexer + preprocessor), cc_parse.c (parser,
+             types, AND the subset definition), cc_x64.c (native x86-64 code
+             generator), cc_sym.c (the twelve curated kernel entry points that
+             ARE the security boundary), cc_store.c (programs kept by name),
+             examples/ (compiled verbatim by the test suite so they cannot drift)
+drivers/block/ ata.c (ATA PIO, LBA28) + block.c (bounds every LBA)
+fs/fat/      FAT32 read/write with VFAT long names and its own mkfs
 tools/       the model's syscall table, one family per file (wildcarded into the
              build: a new tool needs no Makefile edit)
 drivers/
@@ -311,7 +330,7 @@ mbedtls/     vendored mbedTLS 2.28.9 (library + headers)
 include/     shared headers, each with an architecture comment (kobject/heap/
              device/driver/vfs/fs/tool/trace/json/dvm/gui/widgets/app/chat/
              mouse/acpi/fb/font + mbedtls_config)
-tests/       host/ (28 native suites + the shims), qemu/ (boot cases + harness)
+tests/       host/ (39 native suites + the shims), qemu/ (boot cases + harness)
 linker.ld    1 MiB load, driver_table and tool_table sections
 ```
 
@@ -390,7 +409,7 @@ read the brackets.
 
 ## The tool surface
 
-61 tools, assembled by the linker. A tool self-registers with `REGISTER_TOOL`
+64 tools, assembled by the linker. A tool self-registers with `REGISTER_TOOL`
 (`include/tool.h`) and `tools/*.c` is wildcarded into the build, so **adding a
 syscall to the model's surface means dropping in a `.c` file and editing nothing
 else at all** — no Makefile line, no central table.
@@ -413,7 +432,13 @@ network       net_fetch net_resolve net_probe net_status
 capabilities  capability_save capability_call capability_list capability_revert
 agenda        agenda_save agenda_list agenda_control
 repair        fault_status fault_history fault_decode fault_recover fault_patch
+C compiler    cc_compile cc_call cc_source
 ```
+
+Three verbs and not five for the compiler family, and that is an arithmetic
+decision rather than a taste one: the C SUBSET MANUAL has to live inside
+`cc_compile`'s description and come out of the same schema budget as everything
+else. See below.
 
 Model input is untrusted and is read only through `net/json.c` (a hardened,
 fuzzed, ASan-clean reader *and* writer — never write new parsing here). Input
@@ -429,8 +454,10 @@ second is the one that bites:
 
 * `CHAT_TOOLS_BYTES` (57344) — if the array does not fit, `net/chat.c` offers the
   model **no tools at all**: the machine keeps booting and silently stops being
-  able to act. At 61 tools the schema is 53,021 bytes, so 4,323 bytes spare —
-  under two average tools. Read that number off the boot banner; never compute it.
+  able to act. At 64 tools the schema is 56,309 bytes, so **1,035 bytes spare** —
+  not two average tools; not one. Read that number off the boot banner and put it
+  in `CHAT_REGISTRY_BYTES`; never compute it. `make test-qemu` fails on a
+  mismatch, by design, and prints the number to use.
 * `CHAT_REQ_BYTES` (86016) — one request must hold that schema *plus* a full
   history *plus* the system prompt. Past it the turn loop starts evicting the
   oldest exchange on every send, which is the machine forgetting mid-job rather
@@ -443,7 +470,7 @@ three QEMU cases failed, and the machine booted and talked and could do nothing
 whatever. Eighty-six bytes is the entire distance between a working agent and an
 inert one. The buffers were grown — for the **second** time — and `include/chat.h`
 now says plainly that a third time would be an admission that nobody intends to do
-the structural work. 61 tools averaging 869 bytes is roughly 14k tokens on every
+the structural work. 64 tools averaging 879 bytes is roughly 14k tokens on every
 single request, on a machine whose whole point is a conversation. The real fix is
 to send the schema once per conversation rather than once per round, or to page it.
 
@@ -760,9 +787,11 @@ caveat" section above is not boilerplate.
 
 ## Autonomy: what this machine does that nobody asked for
 
-Four mechanisms landed on this branch, and every one of them exists because the
+Five mechanisms landed on this branch, and every one of them exists because the
 machine was previously a very capable statue: it acted only when spoken to, forgot
-everything on reboot, and could extend itself in exactly one direction.
+everything on reboot, and could extend itself in exactly one direction. Four are
+below; the fifth, the C compiler, has its own section after them because it is
+also the most dangerous thing in the tree.
 
 ### Concurrency, so the screen is not dead while it thinks
 
@@ -779,17 +808,38 @@ Every created stack carries a 256-byte poison band at both ends, re-verified on
 named panic (`fiber "blowup" wrote into its low (overflow) poison band`) rather
 than silent heap corruption.
 
-Two honest limits:
+The root fiber is guarded too, now. It used not to be, and this file used to
+argue that leaving it that way was deliberate — *"the root fiber is the one that
+runs mbedTLS, and the deepest user of the stack should keep the biggest stack"* —
+closing with a measurement (5,128 of 65,536 bytes) and the conclusion that the
+missing band was a diagnostics gap and not a live hazard. **Both halves were
+false by the time they were written**, because `compiler/` landed on the same
+branch and a single `cc_compile` goes several times deeper than the whole TLS
+path. See the compiler section below for what that cost. `boot/boot.asm` now
+exports `stack_bottom`/`stack_top`, `kernel/main.c` hands them to
+`fiber_root_stack_set()`, and the root gets a low poison band and a real `.bss`
+high-water mark. Two differences from a created fiber, both forced by the root
+already running on this memory: **no high band** (`stack_top` is the end of what
+`boot.asm` reserved) and **the middle is not painted** (we are standing in it), so
+the scan looks for the lowest non-zero word — exact only because `boot.asm`
+zeroes all of `.bss` first.
 
-* **The root fiber has no band.** `boot/boot.asm` does not export its
-  `stack_bottom`/`stack_top`, so C cannot see the bounds of the 64 KiB boot stack.
-  Worse, the depth `fiber_report()` prints for it is **not a high-water mark**: it
-  is sampled only at yield points, and the root's deepest frames (the mbedTLS
-  handshake, inside `net_poll_rx()`) never yield. The printed figure is 656 bytes
-  on every boot; the true depth, read out of zeroed `.bss` after a real boot, is
-  5128. Directly below that stack are the 24 KiB of page tables providing the
-  identity map. Headroom is 8x, so this is a diagnostics gap and not a live
-  hazard — and the fix is one `global` line in `boot/boot.asm`.
+`fiber_report()` now prints **both** numbers for the root, and the gap between
+them is the point:
+
+```
+fiber:   main [running] stack 5144/65280 bytes used (7%), resumed 209222 times
+fiber:     of which 656 bytes is all the scheduler ever sampled: the deepest
+           frames on this stack never yield.
+```
+
+That 656 is not a high-water mark and never was: it is updated only inside
+`fiber_check_stacks()`, only when the root is running, i.e. only at yield points
+— and `net_service()` yields as its *last* statement, after `net_poll_rx()` has
+returned, with the mbedTLS handshake happening inside it. It read 656 on a boot
+whose true depth was 5,128 and 656 on a boot whose true depth was 65,536.
+
+One honest limit remains:
 * **The keyboard is still unserviced during a turn.** Only `input_poll()` drains
   the 8042 and it is called from the fiber that is sitting in the network wait.
   Characters typed mid-turn queue and appear when the turn ends. Draining it from
@@ -819,6 +869,23 @@ sector inside a directory is detected and skipped rather than repaired, and
 unlinking an open file is refused (ramfs allows it; here the allocator would hand
 those clusters to the next file).
 
+**A disk that fails to mount is now reported as failing to mount.** `fs.c` creates
+a ramfs `/disk` directory as the mountpoint *before* attempting the FAT32 mount,
+and it used to leave that empty directory behind on failure. Everything downstream
+decides "does this machine have durable storage?" by asking whether `/disk` exists
+and is a directory — the capability store, the compiler store and the agenda all
+do, deliberately, so they link without `fs/` and can be host-tested against a
+synthetic one. So a machine with an **attached but unmountable** disk announced
+`survives a reboot` for all three, two lines after saying it had no persistent
+storage, and the claim reached the model: the capability panel that ships in every
+request said `store /disk/cap (survives reboot)`, and the system prompt tells the
+model that if a tool says the store survives a reboot then it survives being
+switched off. The machine would teach itself capabilities and lose them, silently.
+Three ordinary configurations reach it — a non-FAT32 volume, a corrupt one, and a
+non-512-byte sector geometry. `fs.c` now takes the directory back before it prints
+the failure. Verified with a 16 MiB image of random bytes: `ls /` shows `tmp etc`,
+and all three stores say `RAM only`.
+
 ### A capability registry, so it does not rebuild what it already knows
 
 `include/capability.h` + `core/capability.c`. A capability is a named, documented
@@ -843,6 +910,22 @@ assembled schema size does not change when a capability is saved — which is wh
 lets `CHAT_REGISTRY_BYTES` stay a compile-time constant while its contents come off
 a disk. A `_Static_assert` pins the pad literal and `capability_panel_check()`
 re-checks the rendered width at run time and prints both numbers.
+
+That half always worked. The half that did not, until this pass, was that
+`net/chat.c` built the tool schema **once**, at `chat_init()`, and sent that
+snapshot for the rest of the boot — so the panel the model saw was frozen at the
+state of the store before the first sentence. With an empty store that panel reads
+`NONE SAVED YET - this machine has not been taught anything beyond its built-in
+tools`, and that sentence stayed in the model's own instructions for the whole
+session, immediately after it had saved something. Not a stale list: an actively
+false statement in the tool schema, contradicted by the `tool_result` still in the
+history. Only a power cycle fixed it, which is exactly why a second-boot
+observation made the mechanism look like it worked. The schema is now reassembled
+at the start of every turn — safe precisely *because* the panel is fixed width,
+and cheap because it is once per sentence against a network round trip. Verified
+live in one boot: `Save a capability called double...` then, in the next sentence,
+*"without calling capability_list, tell me from your own tool descriptions what
+capabilities this machine has"* → *"the only saved capability is double(n) v1"*.
 
 A cycle cannot hang the machine because a cycle can be paid for in four
 currencies, and all four decrease within one top-level call: depth 8 (kernel
@@ -877,6 +960,44 @@ Which retirements survive a power cycle is a decision and not an accident:
 consecutive-failure and `once` are written to the store; `max_runs` and `boot` are
 deliberately per-boot, because a `when=boot` item must re-arm or it would run on
 exactly one boot in the machine's life.
+
+**And an action that CRASHES is now survivable too, which the seventh bound could
+not cover.** The name denylist stops a tool that ends the boot by *succeeding*. It
+cannot stop one that dies mid-body — and every retirement mechanism above
+(`failures++`, the durable disable, `agenda_flush()`) sits *after*
+`fault_guard_run()` returns. An action that hangs or triple-faults never gets
+there, so the on-disk record still said `"enabled": true`, a `when=boot` item
+re-armed by design, and the next boot died in the same place, for ever, with no
+shell and no prompt left to remove it with. Reproduced end to end on a stock
+kernel with a 136-byte `cc_compile` argument, twice, from the same image. A
+`when=boot` item now writes `"attempting": true` to the store **before** the
+attempt and clears it after; a boot that finds the marker still set disables that
+item, durably, and says why. Boot items only, because they are the ones that run
+before any interface exists and marking every tick of an `every` item would write
+the store twice a period for ever.
+
+**A failing `say` item no longer reports itself as disk corruption.** `run_body()`
+folded every non-zero return from the say sink into `AGENDA_EIO`, whose text is
+*"the agenda store could not be read or written"* — so a failure in the **model
+transport** was reported to the model as a broken filesystem. Observed live: the
+model spent six rounds and two paid API calls investigating a disk that was
+perfect, then repeated the kernel's false claim to the operator. There is now
+`AGENDA_ESAY` for a turn that did not complete and `AGENDA_EBUSY` for a turn that
+could not start. On a machine whose entire interface is a model reading error
+text, an error code that is a lie is worse than a crash.
+
+The reason a `say` item could fail at all was `chat_ask()`, which drives the whole
+turn out of file-scope statics and had no re-entrancy guard, while `kernel/main.c`
+binds `agenda_say()` straight to it and the model can reach
+`agenda_control {"action":"run_now"}` on a `do=say` item **from inside a tool
+call**. The nested turn overwrote the outer turn's response buffer, so the outer
+turn's remaining `tool_use` blocks were silently dropped — a model asked for two
+actions, one happened, one did not, and no trace line said so — the nested request
+went out carrying dangling `tool_use` blocks and got a hard HTTP 400, the round
+counter reset, and the history epoch was left bumped so rollback matched nothing.
+A nested call now returns `CHAT_EREENTER` immediately and says a sentence cannot be
+asked from inside a tool call but will run when the machine is next idle, or at
+boot.
 
 ### Repairing itself
 
@@ -919,28 +1040,125 @@ per fiber. And the loop is one shot — it cannot read memory itself, ask a
 follow-up, or see whether its own patch worked; the next fault, or its absence, is
 the only feedback.
 
-## There is no C compiler on this machine
+## A C compiler, in the kernel, at run time
 
-Worth its own heading because it is the most likely thing for a reader to assume.
-**Nothing on this branch compiles C, and nothing can load compiled code.** There is
-no `cc_tools.c`, no assembler for machine code beyond the driver VM's own
-instruction set, no ELF loader and no relocation. Asked to write and compile a C
-function, the machine says so and then does the job in the VM instead — which is
-the honest answer, and it is the one it gave live.
+This heading used to read *"There is no C compiler on this machine"*, and it was
+true until this branch. It is now the opposite, and the honest version of the
+claim needs its limits stated in the same breath.
 
-So "the model writes code that runs" means exactly one thing here: it authors
-programs in the driver VM's ISA (`include/dvm.h`), which the kernel assembles and
-interprets under a policy that bounds cycles, delay, I/O and DMA and traces every
-access. Those programs got general memory this branch — a 64 KiB scratch arena in
-its **own address space** (`mld`/`mst` take an offset, and no instruction turns an
-offset into a machine address), string ops over (offset, length) spans that are
-never NUL-terminated, and six deny-by-default syscalls. That is what makes a
-capability able to be something other than a device driver.
+`compiler/` is ~5,700 lines: a lexer with a real preprocessor, a parser that is
+also the subset definition, a symbol table of exactly twelve curated kernel entry
+points, a syntax-directed x86-64 code generator, and a program store. `cc_compile`
+takes C source out of a model message, compiles it to **native x86-64**, and calls
+it. It works because `boot/boot.asm` maps every page present+writable and never
+sets NX: a `.bss` buffer is directly callable. That is the same property the
+`LOAD segment with RWX permissions` warning names, and it is deliberate.
 
-The consequence for anyone reading the security section: **there is no
-compiled-code symbol table to be the boundary, because there is no compiled code.**
-The boundaries are the VM's policy, `apps/cap.c`'s argument validation, and the
-five gates on a `.text` patch. Nothing else.
+Native rather than targeting the driver VM, and the reason is arithmetic:
+`DVM_MAX_INSNS` is 256 instructions, which is about twenty lines of C, and the VM
+has no way to form the address of a local — so a C compiler aimed at it would
+spend most of its complexity emulating pointers.
+
+### What bounds a compiled program
+
+Interrupts are off on this machine, so a compiled `while (1) {}` would be the end
+of the session. Three bounds, all structural:
+
+* **Fuel.** `dec qword [r15]; js abort` at every loop back-edge and every call.
+  `r15` holds the runtime block and is never loaded from memory the program can
+  write, so the counter is unforgeable. `goto` is refused *because of this* —
+  unstructured flow would let a loop skip the back-edge check.
+* **Stack.** Compiled code runs on its own 64 KiB stack with a `cmp rsp, [r15+8]`
+  at every function entry, and a single frame is capped at compile time so the
+  check cannot be stepped over by one big local.
+* **Control flow.** Every call target in generated code is a compile-time
+  constant. No function pointers in the subset, no address-of-function, and
+  `switch` compiles to a compare chain and never a jump table. The reachable set
+  is {this unit's functions} + {the twelve-entry table}, fixed before the first
+  instruction executes.
+
+**The security boundary is that twelve-entry symbol table**, and every entry is a
+forwarder this module wrote rather than a raw kernel symbol. `print` is not
+`kputs`: it bounds length, forces printable ASCII and prefixes `cc| `, so a
+program printing `[vfs_write -> ok]` cannot forge a kernel trace line. `file_*`
+take a plain *name*, not a path, under a data root that is a different directory
+from the program store. `memcpy`/`memset`/`memcmp`/`strlen` refuse a span over
+64 KiB, because they are the only way to touch a lot of memory without spending
+fuel.
+
+### What it will not compile
+
+Refused **by name**, with a line, a column and the offending text: `float`,
+`double` and any floating literal (the build is `-mno-sse` and there is no FPU
+state to save); varargs; **function pointers in any position** — the load-bearing
+exclusion; `goto` and labels; struct/union by value as a parameter, an argument or
+a return type (struct *assignment* works); bitfields; `_Bool`, `_Generic`,
+`_Static_assert`; VLAs; K&R declarations; compound literals; designated
+initialisers; `#if`/`#elif`; `#`/`##`; variadic macros; and every hosted libc
+header. `const`, `volatile` and `register` are accepted and **ignored**, which is
+the one place this compiler is knowingly not C.
+
+Limits, each with its own diagnostic: 16 KiB of source, 32 KiB of machine code,
+16 KiB of globals, 64 functions, 6 parameters, 2 KiB of locals per function, 64
+switch cases, 16 saved programs. There is **no error recovery** — it stops at the
+first error, deliberately, because a parser that carries on past a confusion it did
+not understand invents errors, and four invented errors are worse than one true one
+for a caller with one turn. There is no optimiser; code is roughly 2–4x gcc's size.
+
+### The one thing that is still a halt
+
+**A wild pointer from compiled code halts the machine.** There is no memory
+protection; fuel bounds time and the `rsp` check bounds stack, but nothing bounds
+an address. Measured: `#PF`, `CR2 = 0x900000000`, `RIP` inside the code buffer,
+`HALTED : execution did not resume`. Wrapping the entry in `fault_guard_run()` does
+not help and the reason is correct — `fault_escape()` requires the guard's saved
+`rsp` to be *above* the faulting one, and compiled code runs on its own stack in
+`.bss` at a higher address than the boot stack. Fixing it needs one more field and
+one more branch in `arch/x86_64/fault.c` so that arming code can declare the bounds
+of a different stack its body will run on.
+
+### And the compiler's own stack was the worst bug on this branch
+
+Worth writing down because it is the shape of defect this project keeps producing.
+`cc_parse.c` has had a recursion guard from the start — `CC_MAX_BLOCK_DEPTH = 32`,
+with a comment saying that 500 nested parens must be a diagnostic and not a blown
+kernel stack. It bounded **nesting**. It did not bound the code generator: a
+left-leaning chain like `1+1+1+...` is *parsed* by an iterative precedence loop at
+constant depth and then *walked recursively* by `gen_expr()`, once per term.
+
+So about 2 KB of legal, in-subset, successfully-compiling C — an ordinary model
+message, one eighth of the size the tool advertises — recursed off the end of the
+root fiber's 64 KiB boot stack. What sits immediately below `stack_bottom` in
+`boot/boot.asm` is `p2_tables`: the identity map. The machine triple-faulted with
+no `#PF`, no fault record, no `faultchat` diagnosis and nothing on the serial line
+— the one failure mode the entire self-repair story cannot touch, because a triple
+fault has no handler.
+
+Four things changed, and the last one is the general lesson:
+
+1. `boot/boot.asm` now exports `stack_bottom`/`stack_top`, and `core/fiber.c`
+   lays a poison band at the bottom of the root stack and measures its true
+   high-water mark from `.bss`. `fiber_report()` prints **both** that number and
+   the yield-point sample it used to print alone — they read 5,144 and 656 on the
+   same boot, and believing the second is what let a live hazard be documented as
+   a diagnostics gap.
+2. Two 16 KiB automatic buffers (`cc_tokenize`'s string scan, `string_node`'s
+   literal concatenation) moved off the stack. They were 33 KiB of a 64 KiB stack,
+   invisible to any depth counter, and `string_node` sits on the recursive path.
+3. `statement()`'s 1 KiB switch-walk stack moved into its own function, taking
+   that frame from 1,296 bytes to 384 — at `-O0` a local lives in the frame
+   whether or not its branch is taken.
+4. **The bound is now measured rather than counted.** `cc_compile()` records its
+   own frame address and refuses to descend more than `CC_STACK_BUDGET` below it,
+   or closer than `CC_STACK_RESERVE` to the real end of the stack when something
+   told it where that is. Every recursive production tests it. The same input that
+   used to kill the machine now returns
+   `this construct is too deeply nested for the compiler to walk: it would need
+   more than 24576 bytes of kernel stack. Break the expression into named
+   intermediate variables` — and peaks at 41% of the root stack.
+
+A depth counter is a proxy for stack use, and the constant relating the two went
+stale twice without anyone noticing. The frame pointer is not a proxy.
 
 ## The driver model
 
@@ -1077,15 +1295,37 @@ under the verification flag.
 Stated plainly, because this is a hobby kernel going public and the interesting
 part is where it stops.
 
-**No isolation whatsoever.** One CPU, ring 0, single-threaded, no userspace, no
-scheduler, no memory protection. Every tool call runs in the kernel's own address
-space and finishes before the next one starts. All pages are mapped
-read-write-EXECUTE and NX is never set — the `LOAD segment with RWX permissions`
-link warning is **expected and intentional**, do not "fix" it. A null dereference
-does not fault, because the low 4 GiB is mapped writable and page 0 shares its
-2 MiB huge page with the video framebuffer; `0x1000000000` is the address to use
-for a guaranteed page fault. `mem_write` and the driver VM are real capabilities
-handed to a language model, bounded only by checks inside each tool.
+**No isolation whatsoever.** One CPU, ring 0, cooperatively scheduled, no
+userspace, no memory protection, no IOMMU, no privilege separation. Every tool
+call runs in the kernel's own address space and finishes before the next one
+starts. All pages are mapped read-write-EXECUTE and NX is never set — the
+`LOAD segment with RWX permissions` link warning is **expected and intentional**,
+do not "fix" it, and it is also what makes model-authored native code callable. A
+null dereference does not fault, because the low 4 GiB is mapped writable and page
+0 shares its 2 MiB huge page with the video framebuffer; `0x1000000000` is the
+address to use for a guaranteed page fault. `mem_write`, the driver VM and the C
+compiler are real capabilities handed to a language model, bounded only by checks
+inside each tool.
+
+**The compiled-code boundary is a twelve-entry symbol table, and that is the
+whole of it.** A compiled program's reachable call targets are fixed before its
+first instruction, because the subset admits no function pointers and `switch`
+never becomes a jump table, and every entry in the table is a forwarder written
+for this purpose rather than a raw kernel symbol. Fuel bounds time; a per-entry
+`rsp` check on a private 64 KiB stack bounds recursion. **Nothing bounds a
+pointer.** A compiled program that stores through a bad address takes a `#PF` and
+halts the machine, and the fault guard cannot catch it because compiled code runs
+on a stack at a *higher* address than the guard's saved `rsp`. That is one field
+and one branch in `arch/x86_64/fault.c` away from being survivable, and it is not
+done.
+
+**The compiler's own recursion was, until this pass, an unreported triple
+fault.** ~2 KB of legal in-subset C walked the code generator off the unguarded
+root stack into the identity-map page tables: no `#PF`, no fault record, no
+diagnosis, nothing on the wire. It is now bounded by a measured stack floor rather
+than a depth counter, and the root stack has a poison band. The general lesson is
+in the compiler section: a depth constant is a *proxy* for stack use, and the
+relationship between the two went stale twice without anyone noticing.
 
 **The model can read the key out of RAM.** No memory protection plus `mem_read`
 means the `x-api-key` header sitting in `net.c`'s request buffer is reachable. The
@@ -1118,14 +1358,21 @@ trace lines and overwrite them.
 **No model has ever been observed doing several of the things this file claims are
 possible.** Verified live, with a real key, and readable in a serial log: writing an
 AC'97 driver from a sentence and playing a tone through it; writing, debugging and
-saving a capability, then reusing it after a power cycle; fetching a URL; refusing
-to compile C and doing the job in the VM instead; and — under
-`-DTALKOS_REPAIR_DEMO` — diagnosing a `#DE` and patching the running kernel's
-`.text`. **Not** verified with a live model: an agenda item authored by the model
-that reinstalls a *driver* at boot (the autonomous boot path is proven with a
-capability, and with a hand-planted store), a self-repair on a bug nobody planted,
-and a capability composition the model reached for on its own rather than
-re-implementing inline.
+saving a capability, then reusing it after a power cycle; naming a capability it
+had saved *earlier in the same session* out of its own tool schema, with no listing
+tool; compiling and running real C and keeping it by name across a reboot;
+fetching a URL; and — under `-DTALKOS_REPAIR_DEMO` — diagnosing a `#DE` and
+patching the running kernel's `.text`.
+
+**Not** verified with a live model: an agenda item authored by the model that
+reinstalls a *driver* at boot (the autonomous boot path is proven with a
+capability, and with a hand-planted store); a self-repair on a bug nobody planted;
+a capability composition the model reached for on its own rather than
+re-implementing inline; a `do=say` agenda item driven by the model end to end
+(the re-entrancy that broke it is fixed and the refusal is unit-tested, but the
+*successful* path has only been proven from a hand-planted boot item); and
+anything at all under adversarial input from a live model rather than from the
+fuzzers.
 
 **Never booted on physical hardware.** Everything here is QEMU. Several things
 would probably break on real silicon: e1000 MMIO goes through a write-back
