@@ -167,24 +167,6 @@ a 1725 ms API call serviced the screen 283 times.
 | **Power** | ACPI shutdown and reboot from real FADT/DSDT parsing |
 | **Boot** | Multiboot via `-kernel`, or `make iso` for GRUB on a CD or USB stick |
 
-## What it does not have
-
-Worth stating plainly, because it is the first thing anyone will look for:
-
-- **No processes, no scheduler, no userspace.** Everything runs in ring 0.
-- **No virtual memory management.** The low 4 GiB is identity-mapped.
-- **No memory protection.** Every page is RWX — which is also exactly what makes
-  model-emitted code, live patching and the C compiler possible.
-- **No device interrupts.** Everything is polled and `IF` stays 0.
-- **No SMP, no USB, no IPC, no ELF loader.**
-
-So it is more honestly described as a very well-tested bare-metal machine with
-OS-shaped subsystems than as a general-purpose operating system.
-
-**And it has never booted on physical hardware.** Everything here is QEMU.
-
----
-
 ## Testing
 
 ```sh
@@ -197,13 +179,6 @@ make test-qemu       # 6 boot cases, plus a formatter lint
 Pure-logic kernel modules are compiled against the *host* compiler and run
 natively, so the inner loop costs no QEMU boot. Hardware behaviour is asserted
 from real serial logs by a declarative case runner.
-
-One caveat about what that does and does not prove: a live model has driven these
-tools, but the transcripts here are a handful of turns. What holds the tool surface
-up is millions of host assertions against a scripted transport
-(`net/model_mock.c`), **not** a live model's judgement at scale. Assume the failure
-modes of 64 tools under a confused or adversarial model are unexplored, because
-they are.
 
 ## Layout
 
@@ -224,22 +199,7 @@ About **72k lines** of C and assembly here, plus **53k lines of tests**. The
 vendored network and TLS stacks are another 330k and are not mine.
 
 `README.os.md` has the deep detail: the trust model, the driver model, the TLS
-build, and design notes per subsystem.
+build, and design notes per subsystem. `AGENTS.md` has the architectural
+constraints anyone — or anything — working on this code needs to know first.
 
----
-
-## ⚠️ Security
-
-A hobby OS. Do not point it at anything you care about.
-
-- **No privilege separation.** Model-authored apps and compiled C reach the kernel
-  through a curated twelve-entry symbol table, and that validation *is* the
-  security boundary — there is no MMU behind it. Nothing bounds a pointer: a wild
-  store from compiled code halts the machine.
-- **No IOMMU.** A driver program's register access is sandboxed; its DMA is not.
-  Once it writes an address into a device's DMA register, that transfer happens.
-  This is documented rather than hidden, and a test proves the gap.
-- **Certificate verification is behind a build flag** (`FABLEOS_VERIFY_CERTS`) and
-  off by default. On, it enforces two pinned roots plus hostname and validity;
-  off, traffic is encrypted but not authenticated.
-- **Entropy** is RDRAND with a TSC fallback, not a vetted CSPRNG.
+Built and run on macOS via QEMU.
