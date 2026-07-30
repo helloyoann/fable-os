@@ -25,6 +25,66 @@
  *   Read this as: "when a model does write these programs, this is exactly what
  *   happens" — proved for the machinery, pending for the model.
  *
+ * NO LONGER PENDING. THAT LAST SENTENCE IS OUT OF DATE, DELIBERATELY LEFT ABOVE
+ * SO THE CORRECTION IS VISIBLE RATHER THAN QUIET.
+ *   A live model has now reached these tools against real emulated sound cards
+ *   and made audible sound twice, driven by tests/qemu/live_audio.py. The raw
+ *   serial transcripts and the objective audio analyses are beside this file:
+ *
+ *     ac97b.log  / ac97b.wav.txt   AC'97 (8086:2415, class 04:01). Found the
+ *                                  card, hit MMIO_DENIED for using ld/st on I/O
+ *                                  ports, fixed it, synthesised 48000 square-wave
+ *                                  samples into the DMA arena with st32, built a
+ *                                  BDL and started the engine. MEASURED: 444.6 Hz,
+ *                                  500 ms, then 1050 ms at peak 16000, with 81.6%
+ *                                  of energy at the fundamental (a square wave is
+ *                                  8/pi^2 = 81.1% in theory).
+ *     ac97-final.log               The same again against the exact binary this
+ *                / .wav.txt        tree builds, after the description trims that
+ *                                  brought the registry back inside
+ *                                  CHAT_REQ_BYTES. A different program each time
+ *                                  — this one chose a TRIANGLE wave — and it also
+ *                                  hit DELAY_LIMIT (a single delay may not exceed
+ *                                  50 ms), read the message and split the wait
+ *                                  into a counted loop on the next attempt.
+ *                                  MEASURED: exactly 1000.0 Hz, peak exactly
+ *                                  8000, 98.5% of energy at the fundamental — a
+ *                                  triangle wave is 98.6% in theory, so the
+ *                                  waveform it said it wrote is the waveform that
+ *                                  came out.
+ *     hda2.log   / hda2.wav.txt    Intel HDA (8086:2668, class 04:03). Took the
+ *                                  controller out of reset, used the immediate
+ *                                  command interface, WALKED THE CODEC WIDGET
+ *                                  TREE rather than assuming a layout, and drove
+ *                                  the node the hardware said was the DAC.
+ *                                  MEASURED: 445.4 Hz continuously for 51 s.
+ *     ac97.log   / ac97.wav.txt    The same AC'97, SILENT, before a defect in
+ *                                  tools/audio_tools.c was fixed: audio_status
+ *                                  told the model to "register a PLAY program as
+ *                                  the sink", which no tool in this kernel can
+ *                                  do. Kept because it is the evidence for why
+ *                                  that text now reads the way it does.
+ *     hda.log    / hda.wav.txt     The same HDA, SILENT: the model read
+ *                                  8086:2668 as AC'97 and spent the session
+ *                                  applying AC'97 offsets to an HDA controller,
+ *                                  while class=04:03 was in front of it twice.
+ *                                  A model failure, not a kernel one — the
+ *                                  kernel is not allowed to know which chip it
+ *                                  is, so this is the honest cost of that rule.
+ *     adlib.log  / adlib.wav.txt   -device adlib. SILENT and unreachable: it is
+ *                                  an ISA device with no PCI config space, and
+ *                                  resolve_target() in tools/dvm_tools.c can
+ *                                  only accept a node named pci<bb>:<dd>.<f>.
+ *                                  The model enumerated the whole bus, found no
+ *                                  audio function, and correctly refused to
+ *                                  invent one.
+ *
+ *   The mock session below is still worth keeping and is still the thing a host
+ *   test can replay: it runs with no network, no key and no QEMU, and it fails
+ *   the build when the loop breaks. The live logs cannot do that. They prove a
+ *   different thing — that the contract is learnable by a model that has never
+ *   seen this machine — and the two claims should not be confused.
+ *
  * THE SESSION
  *   > There is an unclaimed device at 00:05.0. Work out what it is, bring it
  *     up, and tell me it is running.

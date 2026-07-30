@@ -38,6 +38,18 @@
 
 #include <stdlib.h>
 
+/* wait_ms PUMPS THE GUI AND THE APP RUNTIME while it waits, so agent_tools.c
+ * references gui_tick() and app_tick(). This binary links the agent and vfs
+ * tool families only — pulling in gui/wm.c and apps/runtime.c to satisfy two
+ * calls would drag the compositor, the font, the framebuffer and the mouse
+ * driver into a test about the agent tools. These are the whole of what those
+ * two do when nothing is open (see include/gui.h's event-loop section and
+ * app_tick()'s contract in include/app.h), so the stubs are faithful, and the
+ * behaviour under test here — the wait budget and its arithmetic — does not
+ * depend on either. tests/host/test_app_format.c owns the real app_tick. */
+void gui_tick(void) { }
+int  app_tick(void) { return 0; }
+
 /* REGISTER_TOOL collects pointers in a linker section; Mach-O has no
  * __start_/__stop_ symbols, so alias them to the linker-generated ones. The
  * tools themselves are compiled as their own translation units (see the
@@ -186,6 +198,29 @@ static void test_system_prompt_states_this_machine(void) {
     CHECK_CONTAINS(p, "trace line");
     /* the round budget is real */
     CHECK_CONTAINS(p, "rounds");
+
+    /* THIS MACHINE BUILDS GUI APPS ON DEMAND, AND THE PROMPT HAS TO SAY SO.
+     *
+     * Asked for "a window that says hello", the live model apologised that the
+     * only apps were calculator and notes and opened notes instead — while the
+     * `app` tool sat in the same request, able to author any window from a
+     * document. Two tools claimed the same headline in the same words, and the
+     * prompt never mentioned the capability at all, so nothing contradicted the
+     * narrower reading.
+     *
+     * A tool description alone is not enough: the model has to already believe
+     * the machine can do this before it goes looking for the tool that does it.
+     * These are the load-bearing clauses, each checkable against the source. */
+    CHECK_CONTAINS(p, "BUILD GUI APPS");
+    CHECK_CONTAINS(p, "no fixed catalogue");   /* mechanism, not encouragement */
+    CHECK_CONTAINS(p, "JSON document");
+    CHECK_CONTAINS(p, "stopwatch");            /* the requests it refused      */
+    CHECK_CONTAINS(p, "says hello");
+    CHECK_CONTAINS(p, "NOT the limit");        /* the wrong belief, named      */
+    CHECK_CONTAINS(p, "skeleton");             /* retrying is cheap            */
+    /* it is conditional, because a machine with no framebuffer registers no app
+     * tool and the prompt must not promise what the registry does not offer */
+    CHECK_CONTAINS(p, "If an app tool is offered");
 
     /* And it is actually sent. */
     fresh();
@@ -868,6 +903,36 @@ static void test_registration_and_schema(void) {
     CHECK_EQ(json_parse(schema, n, &v), JSON_OK);
     CHECK_EQ((int)v.type, (int)JSON_ARRAY);
     CHECK_EQ((int)json_count(&v), tool_count());
+
+    /* THE HEADROOM, AND WHY IT IS ASSERTED HERE RATHER THAN GUESSED.
+     *
+     * tools_load() refuses the ENTIRE array if it does not fit CHAT_TOOLS_BYTES,
+     * leaving the model with no tools at all — so the interesting number is not
+     * "does it fit" but "by how much". This binary links only the agent and vfs
+     * families, so it cannot measure the real 45-tool total; the boot banner
+     * does that, and chat.h's CHAT_REGISTRY_BYTES is where the banner's number
+     * is written down. `make test-qemu` fails if the two ever disagree, which
+     * is the guard this assertion lacked when its literal drifted 699 bytes
+     * below the truth while this suite kept printing it as a measured fact.
+     *
+     * What CAN be asserted here, and is the thing that actually breaks, is the
+     * SECOND bound: one request must hold the tool array, the system prompt and
+     * a full history inside CHAT_REQ_BYTES, or the loop starts evicting live
+     * exchanges on every send — the machine silently forgetting mid-job. The
+     * `app` and `gui_open` descriptions were deliberately grown to make the app
+     * capability discoverable, so this checks that spend against the real cliff
+     * (chat.h documents the arithmetic) using the measured registry total. */
+    const size_t registry_total = CHAT_REGISTRY_BYTES;   /* chat.h; see above */
+    const size_t framing        = 1400;    /* request line + headers, chat.h  */
+    size_t worst = registry_total + CHAT_HISTORY_BYTES +
+                   strlen(chat_system_prompt()) + framing;
+    printf("    (tools %zu + history %d + prompt %zu + framing %zu = %zu of "
+           "CHAT_REQ_BYTES %d; CHAT_TOOLS_BYTES headroom %zu)\n",
+           registry_total, CHAT_HISTORY_BYTES, strlen(chat_system_prompt()),
+           framing, worst, CHAT_REQ_BYTES,
+           (size_t)CHAT_TOOLS_BYTES - registry_total);
+    CHECK(registry_total < CHAT_TOOLS_BYTES);
+    CHECK(worst < CHAT_REQ_BYTES);
 }
 
 /* ====================================================================== */

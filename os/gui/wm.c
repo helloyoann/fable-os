@@ -559,6 +559,30 @@ int gui_window_focus(uint32_t id) {
 /* window lifecycle                                                       */
 /* ====================================================================== */
 
+/* THE PROMPT ROW IS NOT AVAILABLE TO WINDOWS.
+ *
+ * DECISION 1 at the top of gui.h states the rule in words — "Whatever else
+ * happens, `> ` must stay visible and typeable" — and until this line existed,
+ * nothing enforced it. A model may write {"width":4096,"height":4096} without
+ * knowing the screen size; clamping to the surface then produced a 1024x768
+ * window at 0,0, and console_sync() did exactly what it is designed to do:
+ * repaint the window over every console cell underneath. The banner, the prompt,
+ * and every trace line the operator would have checked the model against were
+ * drawn for microseconds and then deleted — measured at 0 of 1024 pixels
+ * differing from an untouched window row. A model that then clicks a field in
+ * that window has armed the one-line keyboard grab with both of its warnings
+ * (this file's "the next line you type goes into ...", and main.c's "[typing
+ * into ...] > ") invisible, so the operator's next sentence goes into the app.
+ *
+ * One text row is the whole cost. The console scrolls, so the prompt is on the
+ * last row for the entire life of the machine (see the scroll discussion in
+ * gui.h), which makes the last row exactly the thing to keep and nothing more.
+ * Clamping rather than refusing matches everything else here — a window is never
+ * refused for geometry — and the model is not left guessing, because
+ * tools/app_tools.c now reports the real frame in both the result and the trace
+ * line, so a document that asked for 768 is told it got 752. */
+#define GUI_CONSOLE_RESERVE_H  16   /* one 8x16 text row, at the bottom */
+
 static void clamp_frame(gui_rect_t *f) {
     int32_t sw = dst ? dst->w : 0, sh = dst ? dst->h : 0;
     if (f->w < GUI_MIN_W) f->w = GUI_MIN_W;
@@ -575,6 +599,15 @@ static void clamp_frame(gui_rect_t *f) {
     if (f->y > sh - (GUI_TITLE_H + 2 * GUI_BORDER))
         f->y = sh - (GUI_TITLE_H + 2 * GUI_BORDER);
     if (f->y < 0) f->y = 0;
+
+    /* Keep the bottom text row clear. Height first, then position, so a window
+     * that is merely LOW slides up instead of being shortened. */
+    if (sh > GUI_CONSOLE_RESERVE_H + GUI_MIN_H) {
+        int32_t floor_y = sh - GUI_CONSOLE_RESERVE_H;
+        if (f->h > floor_y)          f->h = floor_y;
+        if (f->y + f->h > floor_y)   f->y = floor_y - f->h;
+        if (f->y < 0)                f->y = 0;
+    }
 }
 
 static void set_title(gui_window_t *w, const char *title) {
@@ -585,7 +618,25 @@ static void set_title(gui_window_t *w, const char *title) {
             /* A title is drawn, not printed. A control character here would
              * either draw a code-page dingbat or, worse, be mistaken for
              * something meaningful by whoever reads it back out of a tool. */
-            w->title[i] = (c < 0x20 || c == 0x7F) ? '?' : (char)c;
+            if (c < 0x20 || c == 0x7F) c = '?';
+            /* Brackets fold the way tools/agent_tools.c copy_line() folds them,
+             * and for the same reason. A title is model-chosen text, and it does
+             * NOT stay inside the window: gui.c and kernel/main.c both kprintf it
+             * into the console -
+             *   gui: the next line you type goes into "%s", not to the model ...
+             *   [typing into "%s", not to the model] >
+             * - so a title of  a] [vfs_write /etc/x -> ok  closes the kernel's
+             * bracket early and opens a model-authored one after it. Worse, the
+             * first of those two lines is emitted from gui_tick() mid-typing, so
+             * it does NOT start at column zero: with the right number of echoed
+             * characters before it the payload's '[' wraps onto column zero and
+             * becomes a byte-exact forged trace line. Counting bytes against the
+             * console width is not a defence anybody wrote down and it breaks the
+             * moment GUI_TITLE_MAX, the console width, or either message changes.
+             * Folding does not depend on any of them. */
+            if (c == '[') c = '{';
+            if (c == ']') c = '}';
+            w->title[i] = (char)c;
             i++;
         }
     }
@@ -1006,8 +1057,14 @@ int gui_click_widget(uint32_t win, uint32_t widget_id) {
     gui_widget_t *wd = gui_widget_by_id(w, widget_id);
     if (!wd) return -2;
     if (wd->state & (GUI_W_DISABLED | GUI_W_NOHIT)) return -3;
-    gui_rect_t c = gui_client_rect(w);
-    (void)gui_click_at(c.x + wd->r.x + wd->r.w / 2, c.y + wd->r.y + wd->r.h / 2);
+    gui_rect_t c  = gui_client_rect(w);
+    int32_t    cx = c.x + wd->r.x + wd->r.w / 2;
+    int32_t    cy = c.y + wd->r.y + wd->r.h / 2;
+    /* See gui.h: a widget rect may legally hang outside the client area, but a
+     * press at a point outside this window's own frame would be delivered to
+     * whatever window is topmost there instead. Refuse rather than mislead. */
+    if (!gui_rect_contains(w->frame, cx, cy)) return -4;
+    (void)gui_click_at(cx, cy);
     return 0;
 }
 

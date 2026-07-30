@@ -946,10 +946,9 @@ static const tool_t fault_recover_tool = {
     .name        = "fault_recover",
     .description =
         "Arm what this machine should do the NEXT time it takes a fatal CPU "
-        "exception, instead of printing a report and halting. This changes what "
-        "the CPU executes, so it is the most consequential tool available: an "
-        "exception handler cannot ask a question, so the decision has to be made "
-        "in advance and is applied without further confirmation.\n"
+        "exception, instead of printing a report and halting. An exception handler "
+        "cannot ask a question, so this decision is made in advance and applied "
+        "without further confirmation - it changes what the CPU executes.\n"
         "Actions: \"skip\" steps over the faulting instruction (refused unless "
         "its length can be decoded with certainty); \"set_register\" writes a "
         "general-purpose register and then either re-executes the instruction "

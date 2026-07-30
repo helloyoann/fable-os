@@ -231,14 +231,29 @@ static void test_schema_is_valid_json(void) {
     CHECK_EQ(seen, 3);
 
     /* The geometry has to reach the model somehow, and the schema is a link-time
-     * constant that CANNOT carry a runtime number. So the schema's job is to say
+     * constant that CANNOT carry a runtime number. So the tool's job is to say
      * that the size is not fixed and to send the model to screen_info, which
      * reports the truth. This assertion used to be CHECK_CONTAINS(schema,
      * "80x25") — pinning a value that stopped being true when the console became
      * a 128x48 framebuffer, and telling a schema-following model that rows end at
-     * 24 on a 48-row screen, i.e. that the most recent output is in the middle. */
+     * 24 on a 48-row screen, i.e. that the most recent output is in the middle.
+     *
+     * IT IS NOW CHECKED AGAINST THE WHOLE TOOL, description included, not against
+     * the schema alone. The same caveat used to be spelled out inside three
+     * separate property descriptions, which is ~200 bytes of the registry that
+     * every request carries on every round (chat.h's cliff note: the margin is
+     * tens of bytes, not kilobytes). It is now said once, in the description, and
+     * what matters is that a model reading this tool learns it — not which of the
+     * two strings it is in. The description ALSO carried a flat contradiction of
+     * it, "The screen is 80 columns by 25 rows", which is the thing the schema was
+     * added to correct; the last assertion here is that it has not come back. */
+    const tool_t *ws = tool_find("write_screen");
+    CHECK(ws != NULL);
     CHECK_CONTAINS(schema, "screen_info");
-    CHECK_CONTAINS(schema, "is NOT fixed");
+    CHECK_CONTAINS(ws->description, "screen_info");
+    CHECK_CONTAINS(ws->description, "128x48");
+    CHECK_CONTAINS(ws->description, "80x25");
+    CHECK(strstr(ws->description, "The screen is 80 columns by 25 rows") == NULL);
     CHECK(strstr(schema, "so rows are 0-24") == NULL);
     CHECK(strstr(schema, "bottom line of the 80x25 screen") == NULL);
     CHECK(strstr(schema, "79 = rightmost") == NULL);
@@ -837,6 +852,91 @@ static void test_trace_lines_are_ground_truth(void) {
 }
 
 /* ====================================================================== */
+/* 9b. the column-zero bracket rule                                       */
+/* ====================================================================== */
+
+/* trace.h's invariant is that a kernel trace line is a '[' in COLUMN ZERO, and
+ * three mechanisms defend it: lib/trace.c escapes brackets inside arguments,
+ * tool_dispatch() counts emissions, and net/chat.c space-prefixes model prose.
+ * This tool is a FOURTH path to the same cells and nobody had enumerated it.
+ * screen_fb() IS console_fb(); lib/base.c's reconcile() rasterises whatever is
+ * poked there with the same font and the same palette as genuine kernel output,
+ * and FG_DEFAULT/BG_DEFAULT are literally the attribute console_init() blanks
+ * the grid with. A painted trace line was therefore not similar to a real one,
+ * it was the same bytes in the same cells in the same colours — and the model
+ * could then paint it tens of rows from its own accusing audit line.
+ *
+ * These are the tests that were missing. The file is 900 lines long and never
+ * once asked whether the painted text may begin with '['. */
+static void test_a_forged_trace_line_is_refused_at_column_zero(void) {
+    fb_reset();
+    const char *out = call_tool("write_screen",
+        "{\"row\":5,\"col\":0,\"fg\":\"white\",\"bg\":\"black\","
+        "\"text\":\"[vfs_write /etc/shadow mode=overwrite bytes=9999 -> ok]\"}");
+    CHECK(was_error());
+    CHECK_CONTAINS(out, "column zero");
+    CHECK_CONTAINS(out, "Nothing was painted");
+    CHECK(fb_all_blank());                    /* refused BEFORE any cell */
+    CHECK_CONTAINS(kcap_text(), "[write_screen -> EINVAL]");
+
+    /* A lone bracket is the same forgery with fewer characters. */
+    fb_reset();
+    CHECK(was_error() == 0 || 1);
+    out = call_tool("write_screen", "{\"row\":0,\"col\":0,\"text\":\"[\"}");
+    CHECK(was_error());
+    CHECK(fb_all_blank());
+
+    /* ONE COLUMN RIGHT IS ALL IT TAKES, and the refusal says so, so a status
+     * bar that genuinely wants a bracket is one corrected call away. */
+    fb_reset();
+    out = call_tool("write_screen", "{\"row\":5,\"col\":1,\"text\":\"[ok]\"}");
+    CHECK(!was_error());
+    CHECK_CONTAINS(out, "painted 4 character(s)");
+    CHECK_EQ(fb[5 * 80 + 0] & 0xFF, ' ');     /* column zero still blank */
+    CHECK_EQ(fb[5 * 80 + 1] & 0xFF, '[');
+
+    /* Brackets anywhere else in the string are untouched: the rule is about
+     * one cell, not about the character. */
+    fb_reset();
+    out = call_tool("write_screen", "{\"row\":6,\"col\":0,\"text\":\"a [b] c\"}");
+    CHECK(!was_error());
+    CHECK_EQ(fb[6 * 80 + 2] & 0xFF, '[');
+    CHECK(fb_canaries_intact());
+}
+
+/* The other half of the same tool: painting over a row that already holds a
+ * kernel line deletes ground truth. That is allowed — the console is scratch
+ * space and it scrolls — but it may not be SILENT, because erasure is what
+ * chat.h calls "worse than forgery". The one trace line this call emits now
+ * carries it. */
+static void test_erasing_a_kernel_line_is_recorded(void) {
+    fb_reset();
+    /* Put a genuine-looking kernel line on row 7 the way the console would. */
+    const char *line = "[vfs_delete /etc/motd -> ok]";
+    for (int i = 0; line[i]; i++) fb[7 * 80 + i] = (uint16_t)(0x0700 | line[i]);
+
+    const char *out = call_tool("write_screen",
+        "{\"row\":7,\"col\":0,\"text\":\" \",\"fill_row\":true}");
+    CHECK(!was_error());                       /* still allowed */
+    CHECK_EQ(fb[7 * 80] & 0xFF, ' ');          /* really erased */
+    CHECK_CONTAINS(out, "covered a line the kernel had printed");
+    CHECK_CONTAINS(kcap_text(), "erased-kernel-line=1");
+
+    /* A row that held nothing of the kernel's says nothing. */
+    fb_reset();
+    call_tool("write_screen",
+              "{\"row\":9,\"col\":0,\"text\":\"status\",\"fill_row\":true}");
+    CHECK(strstr(kcap_text(), "erased-kernel-line=1") == NULL);
+
+    /* Neither does a paint that starts past column zero, even on that row. */
+    for (int i = 0; line[i]; i++) fb[3 * 80 + i] = (uint16_t)(0x0700 | line[i]);
+    kcap_reset();
+    call_tool("write_screen", "{\"row\":3,\"col\":40,\"text\":\"x\"}");
+    CHECK(strstr(kcap_text(), "erased-kernel-line=1") == NULL);
+    CHECK_EQ(fb[3 * 80] & 0xFF, '[');          /* the '[' is still there */
+}
+
+/* ====================================================================== */
 /* 10. fuzz: nothing the model can send may reach past the framebuffer   */
 /* ====================================================================== */
 
@@ -906,6 +1006,8 @@ int main(void) {
     RUN(test_read_screen_respects_the_result_budget);
     RUN(test_screen_info_reports_ground_truth);
     RUN(test_trace_lines_are_ground_truth);
+    RUN(test_a_forged_trace_line_is_refused_at_column_zero);
+    RUN(test_erasing_a_kernel_line_is_recorded);
     RUN(test_fuzz_never_escapes_the_framebuffer);
 
     CHECK_EQ(kpanic_hit, 0);

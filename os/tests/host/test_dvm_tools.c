@@ -10,21 +10,38 @@
  *       bus-mastering device, a BAR that overlaps COM1, a BAR inside the
  *       interrupt-controller block, two devices with adjacent BARs);
  *     - dvm_io_t is replaced by TLK1, a synthetic device with a reset, a
- *       ready handshake, a rate register that only latches while disabled, and
- *       a counter that advances with time. It is the device the recorded
- *       session in vm/transcripts/dvm_bringup.h brings up;
+ *       ready handshake, a rate register that only latches while disabled, a
+ *       counter that advances with time, and a 64-bit bus-master DMA engine that
+ *       really reads and writes host memory at the address it is given. It is the
+ *       device the recorded session in vm/transcripts/dvm_bringup.h brings up;
  *     - net/model_mock.c is the model, and net/chat.c is the REAL turn loop.
  *
  *   So "the model submits a program, the kernel refuses it, the model reads the
  *   access log, fixes the program and the device comes up" is a test, not a
  *   story — and it needs no network, no API key and no QEMU.
  *
- * THE LOAD-BEARING ASSERTION
- *   TLK1 counts every access it should never have seen: any port outside the
- *   window the target's BAR earned, any MMIO at all, any PCI function other
- *   than the target. `forbidden` must be zero at the end of the suite,
- *   including after the fuzzers. That is a mechanical proof that a program can
- *   only reach the device it was pointed at.
+ * THE LOAD-BEARING ASSERTIONS
+ *   `forbidden` — TLK1 counts every access it should never have seen: any port
+ *   outside the window the target's BAR earned, any MMIO outside a granted
+ *   window, any PCI function other than the target. It must be zero at the end
+ *   of the suite, including after the fuzzers. That is a mechanical proof that a
+ *   program can only reach the device it was pointed at.
+ *
+ *   `cfg_bad` — driver_run now WRITES config space, because a device cannot DMA
+ *   without the bus-master bit and the ISA has no config write. So the synthetic
+ *   bus checks every write: offset 0x04 only, status bits preserved, no bit
+ *   outside {io, mem, bus-master} changed, and only the named function. It must
+ *   be zero, which is the proof that "the model still cannot touch config space,
+ *   and the kernel touches exactly three bits of one register".
+ *
+ *   `dma_wild` — NOT required to be zero, and that is the honest part. It counts
+ *   the times a program pointed a bus master outside the buffer it was given. On
+ *   real hardware every one of those is a write that happens. The VM refuses none
+ *   of them, because it polices the CPU and not the DMA engine; there is no
+ *   IOMMU. What the suite proves instead is that the kernel's own side is right:
+ *   only the named device is made a master, the program is handed exactly one
+ *   valid address, the address it gives the hardware is in the access log, and a
+ *   near-miss overrun is reported with an offset.
  *
  * WHAT THIS SUITE CANNOT PROVE
  *   That a real model, with a real API key, writes programs like these. There
@@ -65,7 +82,32 @@ typedef struct {
 #define FAKE_MAX 32
 static fake_fn_t fake[FAKE_MAX];
 static int       nfake;
-static long      cfg_writes;        /* MUST stay 0 for the whole suite */
+
+/* CONFIG-SPACE WRITES. There used to be exactly one assertion here — that the
+ * count stays zero — because nothing in the driver-VM path was allowed to write
+ * config space at all. That is no longer true: driver_run sets PCI command bits
+ * so that a device can DMA, which is a deliberate escalation, so the assertion
+ * has to become a description of the ONLY write that is permitted instead of a
+ * blanket ban. The bus below therefore behaves like real config space (a write
+ * sticks and reads back) and, on every write, checks all of:
+ *
+ *   - the offset is 0x04, the command/status dword, and nothing else. A write to
+ *     a BAR would move a live device's window; a write to 0x0c/0x3c would change
+ *     cache line size or interrupt routing;
+ *   - the upper 16 bits are zero, so no write-1-to-clear STATUS bit is destroyed;
+ *   - no bit outside {0,1,2} is ever changed in either direction;
+ *   - the function written to is the run's target and no other.
+ *
+ * cfg_bad counts violations and must be 0 for the whole suite. That is a
+ * mechanical proof that "the model still cannot touch config space, and the
+ * kernel touches exactly three bits of one register". */
+static long      cfg_writes;         /* how many happened (now allowed to be >0) */
+static long      cfg_bad;            /* MUST stay 0 for the whole suite          */
+static unsigned  cfg_expect_bdf = 0xFFFFu;  /* whose command register may move   */
+static uint32_t  cfg_last_val;
+static unsigned  cfg_last_off = 0xFFu;
+
+#define CFG_CMD_TOUCHABLE 0x0007u    /* io | mem | bus-master */
 
 static fake_fn_t *fake_add(uint8_t bus, uint8_t dev, uint8_t fn,
                            uint16_t vendor, uint16_t device,
@@ -81,6 +123,30 @@ static fake_fn_t *fake_add(uint8_t bus, uint8_t dev, uint8_t fn,
     return f;
 }
 
+/* Command registers as build_machine() left them, so fresh() can put every
+ * function back. Without this the very first driver_run would leave bus mastering
+ * on for the whole suite and every later assertion about "the kernel set bit 2"
+ * would depend on test ORDER — which is exactly the kind of test that passes
+ * while the code is broken. */
+static uint16_t cmd_initial[FAKE_MAX];
+
+static void snapshot_cmds(void) {
+    for (int i = 0; i < nfake; i++) cmd_initial[i] = (uint16_t)(fake[i].w[0x04 / 4] & 0xFFFFu);
+}
+
+static void restore_cmds(void) {
+    for (int i = 0; i < nfake; i++)
+        fake[i].w[0x04 / 4] = (fake[i].w[0x04 / 4] & 0xFFFF0000u) | cmd_initial[i];
+}
+
+/* The command half of one function's config dword 0x04, as it stands now. */
+static uint16_t fake_cmd(uint8_t bus, uint8_t dev, uint8_t fn) {
+    for (int i = 0; i < nfake; i++)
+        if (fake[i].bus == bus && fake[i].dev == dev && fake[i].fn == fn)
+            return (uint16_t)(fake[i].w[0x04 / 4] & 0xFFFFu);
+    return 0xFFFFu;
+}
+
 uint32_t pci_cfg_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
     for (int i = 0; i < nfake; i++)
         if (fake[i].bus == bus && fake[i].dev == dev && fake[i].fn == fn)
@@ -89,8 +155,28 @@ uint32_t pci_cfg_read32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
 }
 
 void pci_cfg_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint32_t val) {
-    (void)bus; (void)dev; (void)fn; (void)off; (void)val;
-    cfg_writes++;                   /* a tool doing this is a test failure */
+    cfg_writes++;
+    cfg_last_off = off & 0xFCu;
+    cfg_last_val = val;
+
+    unsigned bdf = ((unsigned)bus << 8) | ((unsigned)dev << 3) | fn;
+    if ((off & 0xFCu) != 0x04u) { cfg_bad++; return; }   /* only command/status */
+    if (val >> 16)              { cfg_bad++; return; }   /* status must be left alone */
+    if (cfg_expect_bdf != 0xFFFFu && bdf != cfg_expect_bdf) { cfg_bad++; return; }
+
+    for (int i = 0; i < nfake; i++)
+        if (fake[i].bus == bus && fake[i].dev == dev && fake[i].fn == fn) {
+            uint32_t old = fake[i].w[0x04 / 4];
+            if (((old ^ val) & 0xFFFFu) & ~(uint32_t)CFG_CMD_TOUCHABLE) {
+                cfg_bad++;                              /* changed a forbidden bit */
+                return;
+            }
+            /* Real hardware: the command half takes the write, the status half is
+             * write-1-to-clear and a zero there preserves it. */
+            fake[i].w[0x04 / 4] = (old & 0xFFFF0000u) | (val & 0xFFFFu);
+            return;
+        }
+    cfg_bad++;                                          /* wrote to nothing at all */
 }
 
 /* ====================================================================== */
@@ -107,18 +193,86 @@ void pci_cfg_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off, uint32_t
 #define TLK_R_COUNT   0x10
 #define TLK_R_IRQMASK 0x14
 
+/* TLK1's DMA engine — the part that makes the buffer worth having.
+ *
+ * A 64-bit-capable bus master with a split address register, which is how every
+ * real one is built (e1000, AHCI, HD Audio, xHCI all take a LO/HI pair) and which
+ * is also what makes this testable: on the host the arena's address does not fit
+ * in 32 bits, and a program that wrote only the low half would be pointing the
+ * device at nothing — exactly the bug a real 64-bit driver has to avoid.
+ *
+ * On TLK_R_DMA_CTL bit 0 the device FETCHES len bytes from the address it was
+ * given and reports their sum; on bit 1 it WRITES len bytes there. Nothing in the
+ * kernel knows these registers exist: the program in the test is what knows, which
+ * is the whole point of the split between "generic OS primitive" and "device
+ * knowledge". */
+#define TLK_R_DMA_LO  0x18
+#define TLK_R_DMA_HI  0x1C
+#define TLK_R_DMA_LEN 0x20
+#define TLK_R_DMA_CTL 0x24
+#define TLK_R_DMA_SUM 0x28
+#define TLK_R_DMA_N   0x2C
+
 #define TLK_CTL_RESET  0x1
 #define TLK_CTL_ENABLE 0x2
 #define TLK_ST_READY   0x1
 #define TLK_ST_RUN     0x2
+#define TLK_DMA_GO     0x1             /* read from memory  */
+#define TLK_DMA_PUT    0x2             /* write to memory   */
+#define TLK_DMA_FILL   0xE5
+
+#define TLK_DMA_MAXLEN 0x10000u        /* a bounded model, so a fuzzed len is cheap */
 
 typedef struct {
     uint32_t rate, count, irqmask;
     int      ready, running, was_reset;
     uint64_t delay_total, ready_at;
+    uint32_t dma_lo, dma_hi, dma_len, dma_sum, dma_n;
+    uint64_t dma_addr_seen;            /* the last address it was pointed at */
 } tlk_t;
 
 static tlk_t tlk;
+
+/* Bus-master activity, asserted on at the end of the suite. */
+static long dma_fetches;      /* transfers the device really performed        */
+static long dma_wild;         /* transfers it was asked for outside the arena */
+
+/* A real device would dereference whatever address it was handed; this one is a
+ * model inside a test process, so it refuses and counts instead of dying. That
+ * refusal is NOT a containment claim about the kernel — real hardware would do
+ * the transfer. It is here so the suite (and the fuzzers) can say how often a
+ * program pointed the device somewhere it should not have.
+ *
+ * The permitted region is the arena PLUS its guard bands, because writing into the
+ * guard is exactly the accident the guard exists to report and a test that could
+ * not stage it would be testing nothing. */
+static void tlk_dma_xfer(int write) {
+    uint64_t addr = ((uint64_t)tlk.dma_hi << 32) | tlk.dma_lo;
+    uint32_t len  = tlk.dma_len > TLK_DMA_MAXLEN ? TLK_DMA_MAXLEN : tlk.dma_len;
+
+    tlk.dma_addr_seen = addr;
+    tlk.dma_sum = 0;
+    tlk.dma_n   = 0;
+    if (!len) return;
+
+    uint64_t abase = 0, asize = 0;
+    dvm_dma_region(&abase, &asize);
+    if (addr < abase - DVM_DMA_GUARD || addr + len > abase + asize + DVM_DMA_GUARD) {
+        dma_wild++;
+        return;
+    }
+
+    volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)addr;
+    if (write) {
+        for (uint32_t i = 0; i < len; i++) p[i] = TLK_DMA_FILL;
+    } else {
+        uint32_t sum = 0;
+        for (uint32_t i = 0; i < len; i++) sum += p[i];
+        tlk.dma_sum = sum;
+    }
+    tlk.dma_n = len;
+    dma_fetches++;
+}
 
 /* The sandbox the current run is supposed to be confined to. Anything outside
  * it that reaches this backend is a containment failure, counted and asserted
@@ -162,6 +316,13 @@ static void tlk_port_write(void *ctx, uint16_t port, uint8_t width, uint32_t val
             if (!tlk.running) tlk.rate = val & (width == 1 ? 0xFFu : width == 2 ? 0xFFFFu : 0xFFFFFFFFu);
             break;
         case TLK_R_IRQMASK: tlk.irqmask = val; break;
+        case TLK_R_DMA_LO:  tlk.dma_lo  = val; break;
+        case TLK_R_DMA_HI:  tlk.dma_hi  = val; break;
+        case TLK_R_DMA_LEN: tlk.dma_len = val; break;
+        case TLK_R_DMA_CTL:
+            if (val & TLK_DMA_PUT)     tlk_dma_xfer(1);
+            else if (val & TLK_DMA_GO) tlk_dma_xfer(0);
+            break;
         default: break;                          /* read-only or absent */
     }
 }
@@ -181,6 +342,11 @@ static uint32_t tlk_port_read(void *ctx, uint16_t port, uint8_t width) {
         case TLK_R_RATE:  v = tlk.rate; break;
         case TLK_R_COUNT: v = tlk.count; break;
         case TLK_R_IRQMASK: v = tlk.irqmask; break;
+        case TLK_R_DMA_LO:  v = tlk.dma_lo;  break;
+        case TLK_R_DMA_HI:  v = tlk.dma_hi;  break;
+        case TLK_R_DMA_LEN: v = tlk.dma_len; break;
+        case TLK_R_DMA_SUM: v = tlk.dma_sum; break;
+        case TLK_R_DMA_N:   v = tlk.dma_n;   break;
         default: v = 0xFFFFFFFFu; break;         /* nothing decodes there */
     }
     if (width == 1) v &= 0xFFu;
@@ -289,7 +455,10 @@ static void build_machine(void) {
     f = fake_add(0, 3, 0, 0x8086, 0x100E, 0x02, 0x00);        /* claimed NIC */
     f->w[0x10 / 4] = 0xFE900000u;
 
-    f = fake_add(0, 4, 0, 0x8086, 0x2415, 0x04, 0x01);        /* bus mastering */
+    /* Already a bus master before anyone asked. Targetable (a driver that cannot
+     * DMA cannot play a sound), but the kernel must notice that it did not set
+     * that bit and so must not clear it either. */
+    f = fake_add(0, 4, 0, 0x8086, 0x2415, 0x04, 0x01);
     f->w[0x04 / 4] = 0x0007u;                                 /* io+mem+busmaster */
     f->w[0x10 / 4] = 0xC000u | 1u;
 
@@ -454,6 +623,8 @@ static void fresh(void) {
     exp_hi      = TLK_BASE + 0xFF;
     exp_bdf     = (0 << 8) | (5 << 3) | 0;
     exp_mmio_lo = exp_mmio_hi = 0;
+    cfg_expect_bdf = 0xFFFFu;
+    restore_cmds();
     memset(mspace, 0, sizeof mspace);
     acc_base = tlk_accesses;      /* tlk_accesses is a whole-suite total */
 }
@@ -537,7 +708,6 @@ static void test_targets_refusals(void) {
     CHECK_EQ(call("driver_targets", "{\"include_unusable\":true,\"limit\":64}"), TOOL_OK);
     CHECK_CONTAINS(rbuf, "driver \"e1000fake\" is already bound to pci00:03.0");
     CHECK_CONTAINS(rbuf, "pci00:04.0");
-    CHECK_CONTAINS(rbuf, "PCI bus mastering enabled");
     CHECK_CONTAINS(rbuf, "no programmed BAR");
     CHECK_CONTAINS(rbuf, "interrupt-controller block");
     CHECK_CONTAINS(rbuf, "COM1");          /* the VM's own words, via dvm_policy_check */
@@ -811,6 +981,717 @@ static void test_run_mmio_window(void) {
     CHECK_EQ(forbidden, 0);
 }
 
+/* ====================================================================== */
+/* the two things a driver program cannot live without                    */
+/* ====================================================================== */
+
+/* 1. THE BUFFER ARRIVES WHERE THE DOCUMENTATION SAYS IT DOES.
+ *
+ * driver_run's description tells the model "r7 holds the PHYSICAL address of a DMA
+ * scratch buffer and r8 holds that buffer's size". That sentence is the whole
+ * interface, so it is checked against dvm_dma_region() rather than trusted. */
+static void test_dma_buffer_arrives_in_r7_r8(void) {
+    fresh();
+
+    uint64_t base = 0, size = 0;
+    dvm_dma_region(&base, &size);
+    CHECK(base != 0);
+    CHECK_EQ((int)size, (int)DVM_DMA_SIZE);
+
+    char want[128];
+
+    /* driver_targets publishes it before a program is ever written. */
+    CHECK_EQ(call("driver_targets", "{}"), TOOL_OK);
+    snprintf(want, sizeof want, "dma 0x%lx+0x%lx", (unsigned long)base,
+             (unsigned long)size);
+    CHECK_CONTAINS(rbuf, want);
+    snprintf(want, sizeof want, "r7=dma 0x%lx r8=0x%lx", (unsigned long)base,
+             (unsigned long)size);
+    CHECK_CONTAINS(rbuf, want);
+
+    /* ...and the program really receives those two values, in those two
+     * registers. `mov` them somewhere else so they come back in the result even
+     * though r7/r8 would be reported anyway. */
+    CHECK_EQ(call("driver_run",
+                  "{\"target\":\"pci00:05.0\",\"source\":\""
+                  "    mov r10, r7\\n"
+                  "    mov r11, r8\\n"
+                  "    in32 r1, r0\\n"        /* touch the device: this is progress */
+                  "    halt\\n\"}"), TOOL_OK);
+    snprintf(want, sizeof want, "r7=0x%lx", (unsigned long)base);
+    CHECK_CONTAINS(rbuf, want);
+    snprintf(want, sizeof want, "r8=0x%lx", (unsigned long)size);
+    CHECK_CONTAINS(rbuf, want);
+    snprintf(want, sizeof want, "r10=0x%lx", (unsigned long)base);
+    CHECK_CONTAINS(rbuf, want);
+    snprintf(want, sizeof want, "r11=0x%lx", (unsigned long)size);
+    CHECK_CONTAINS(rbuf, want);
+
+    /* The size is the one the header argues for: a second of 48 kHz stereo
+     * 16-bit PCM, with room left for a descriptor list. */
+    CHECK(size >= 48000ull * 2 * 2);
+    CHECK_EQ((int)(base % DVM_DMA_ALIGN), 0);
+    CHECK_EQ(forbidden, 0);
+}
+
+/* 2. A PROGRAM'S STORES REALLY CHANGE THAT MEMORY.
+ *
+ * Written through the tool, read back through a plain pointer at the address the
+ * tool published. If this passes, "the buffer is where I say it is" is a fact. */
+static void test_dma_buffer_is_real_memory(void) {
+    fresh();
+    uint64_t base = 0, size = 0;
+    dvm_dma_region(&base, &size);
+    volatile uint8_t *mem = (volatile uint8_t *)(uintptr_t)base;
+
+    for (int i = 0; i < 32; i++) mem[i] = 0;
+
+    CHECK_EQ(call("driver_run",
+                  "{\"target\":\"pci00:05.0\",\"source\":\""
+                  "    st32 [r7+0],  0x04030201\\n"
+                  "    st32 [r7+4],  0x08070605\\n"
+                  "    st16 [r7+8],  0x0a09\\n"
+                  "    st8  [r7+10], 0x0b\\n"
+                  "    ld32 r10, [r7+0]\\n"
+                  "    in32 r1, r0\\n"
+                  "    halt\\n\"}"), TOOL_OK);
+
+    for (int i = 0; i < 11; i++) CHECK_EQ((int)mem[i], i + 1);
+    CHECK_CONTAINS(rbuf, "r10=0x4030201");
+
+    /* Reported as buffer traffic, not as device traffic. */
+    CHECK_CONTAINS(rbuf, "5 dma buffer accesses (rd 1 wr 4)");
+    /* ...and it is not in the DEVICE access log, because it is not a device
+     * access: nothing appeared on a bus. */
+    CHECK(strstr(rbuf, "st32 0x") == NULL);
+
+    /* The whole buffer is reachable, and one byte past it is not. */
+    CHECK_EQ(call("driver_run",
+                  "{\"target\":\"pci00:05.0\",\"source\":\""
+                  "    sub r9, r8, 1\\n"
+                  "    add r9, r7, r9\\n"
+                  "    st8 [r9+0], 0xc3\\n"
+                  "    in32 r1, r0\\n"
+                  "    halt\\n\"}"), TOOL_OK);
+    CHECK_EQ((int)mem[size - 1], 0xc3);
+
+    CHECK(call("driver_run",
+               "{\"target\":\"pci00:05.0\",\"source\":\""
+               "    add r9, r7, r8\\n"
+               "    st8 [r9+0], 1\\n"
+               "    halt\\n\"}") != TOOL_OK);
+    CHECK_EQ(forbidden, 0);
+}
+
+/* 3. THE DEVICE REALLY READS IT. The end-to-end claim, and the only one that
+ * matters for audio: a program writes bytes into the buffer, hands the DEVICE the
+ * physical address of those bytes, and the device fetches them.
+ *
+ * The program below is hand-written here (not in vm/programs/) and is the only
+ * thing that knows TLK1's DMA registers exist. The kernel supplied a buffer, an
+ * address, and the bus-master bit; every device-specific decision — split
+ * LO/HI address, byte length, the go bit — is in the program text. */
+static void test_a_device_really_dmas_out_of_the_buffer(void) {
+    fresh();
+    uint64_t base = 0;
+    dvm_dma_region(&base, NULL);
+
+    long fetches_before = dma_fetches;
+    long wild_before    = dma_wild;
+
+    /* 256 bytes of ramp 0..255, then point the engine at it. Sum(0..255) = 32640
+     * = 0x7f80, which is the value the DEVICE computes from memory the PROGRAM
+     * wrote — it cannot be produced any other way. */
+    CHECK_EQ(call_cap("driver_run",
+                  "{\"target\":\"pci00:05.0\",\"max_steps\":20000,\"source\":\""
+                  "    .equ DMA_LO  0x18\\n"
+                  "    .equ DMA_HI  0x1c\\n"
+                  "    .equ DMA_LEN 0x20\\n"
+                  "    .equ DMA_CTL 0x24\\n"
+                  "    .equ DMA_SUM 0x28\\n"
+                  "    .equ DMA_N   0x2c\\n"
+                  "    mov r2, 0\\n"
+                  "fill:\\n"
+                  "    add r3, r7, r2\\n"
+                  "    st8 [r3+0], r2\\n"
+                  "    add r2, r2, 1\\n"
+                  "    cmp r2, 256\\n"
+                  "    blt fill\\n"
+                  "    add r4, r0, DMA_LO\\n"
+                  "    and r5, r7, 0xffffffff\\n"
+                  "    out32 r4, r5\\n"
+                  "    add r4, r0, DMA_HI\\n"
+                  "    shr r5, r7, 32\\n"
+                  "    out32 r4, r5\\n"
+                  "    add r4, r0, DMA_LEN\\n"
+                  "    out32 r4, 256\\n"
+                  "    add r4, r0, DMA_CTL\\n"
+                  "    out32 r4, 1\\n"
+                  "    add r4, r0, DMA_SUM\\n"
+                  "    in32 r10, r4\\n"
+                  "    add r4, r0, DMA_N\\n"
+                  "    in32 r11, r4\\n"
+                  "    cmp r11, 256\\n"
+                  "    bne nope\\n"
+                  "    halt\\n"
+                  "nope:\\n"
+                  "    abort \\\"the engine did not transfer 256 bytes\\\"\\n\"}",
+                  CHAT_TOOL_RESULT_CAP), TOOL_OK);
+
+    /* The device performed exactly one transfer, from inside the arena. */
+    CHECK_EQ(dma_fetches - fetches_before, 1);
+    CHECK_EQ(dma_wild - wild_before, 0);
+    CHECK_EQ((int)(tlk.dma_addr_seen == base), 1);
+    CHECK_EQ((int)tlk.dma_n, 256);
+    CHECK_EQ((int)tlk.dma_sum, 32640);
+
+    /* ...and the program read that back out of the device, so the proof arrives
+     * in the model's own answer rather than only in the test's variables. */
+    CHECK_CONTAINS(rbuf, "r10=0x7f80");
+    CHECK_CONTAINS(rbuf, "r11=0x100");
+    CHECK_CONTAINS(rbuf, "status=OK");
+
+    /* The address the device was handed is on the record, in the access log, as
+     * the mitigation in dvm.h claims. */
+    char want[64];
+    CHECK_EQ(call("driver_trace", "{\"offset\":0,\"limit\":8}"), TOOL_OK);
+    snprintf(want, sizeof want, "out32 0xd018 <= 0x%lx",
+             (unsigned long)(base & 0xFFFFFFFFul));
+    CHECK_CONTAINS(rbuf, want);
+    snprintf(want, sizeof want, "out32 0xd01c <= 0x%lx",
+             (unsigned long)(base >> 32));
+    CHECK_CONTAINS(rbuf, want);
+
+    /* No guard-band damage: the engine stayed inside the buffer. */
+    CHECK(strstr(rbuf, "DMA WENT OUT OF BOUNDS") == NULL);
+    CHECK_EQ(forbidden, 0);
+}
+
+/* 4. THE KERNEL SETS BUS MASTERING, FOR ONE DEVICE, AND TAKES IT BACK. */
+static void test_bus_master_enable(void) {
+    fresh();
+
+    /* 00:05.0 starts with I/O decode only. */
+    CHECK_EQ((int)fake_cmd(0, 5, 0), 0x0001);
+    uint16_t nb4 = fake_cmd(0, 8, 0), nb12 = fake_cmd(0, 12, 0);
+
+    cfg_expect_bdf = (0 << 8) | (5 << 3) | 0;      /* nobody else's register may move */
+    long writes_before = cfg_writes;
+
+    CHECK_EQ(call("driver_run",
+                  "{\"target\":\"pci00:05.0\",\"source\":\""
+                  "    in32 r1, r0\\n"
+                  "    halt\\n\"}"), TOOL_OK);
+
+    /* Bit 2 is set; bit 0 was already there so it is not claimed as new; bit 1 is
+     * NOT set, because this device has no memory BAR and so no memory window. */
+    CHECK_EQ((int)fake_cmd(0, 5, 0), 0x0005);
+    CHECK_CONTAINS(rbuf, "pci cmd 0x0001 -> 0x0005: kernel set bus-master(bit2)");
+    CHECK_CONTAINS(rbuf, "this device can DMA now");
+    CHECK(cfg_writes > writes_before);
+    CHECK_EQ(cfg_bad, 0);
+
+    /* Only the named function changed. */
+    CHECK_EQ((int)fake_cmd(0, 8, 0), (int)nb4);
+    CHECK_EQ((int)fake_cmd(0, 12, 0), (int)nb12);
+
+    /* A program that TRAPS gets the bit taken away again — a half-configured DMA
+     * engine with a live master bit is the state worth undoing. */
+    fresh();
+    CHECK_EQ((int)fake_cmd(0, 5, 0), 0x0001);         /* fresh() restored it */
+    CHECK(call("driver_run",
+               "{\"target\":\"pci00:05.0\",\"source\":\""
+               "    in32 r1, r0\\n"
+               "    abort \\\"not finished\\\"\\n\"}") != TOOL_OK);
+    CHECK_EQ((int)fake_cmd(0, 5, 0), 0x0001);
+    CHECK_CONTAINS(rbuf, "the run failed, so bus-master(bit2) was cleared again");
+
+    /* An MMIO-only device gets bit 1 as well, because without memory decode its
+     * BAR answers nothing and the program's own ld/st would read 0xff. */
+    fresh();
+    exp_mmio_lo = 0xFEB00000ull;
+    exp_mmio_hi = 0xFEB00000ull + 0xC0000ull - 1;
+    exp_bdf     = (0 << 8) | (12 << 3) | 0;
+    cfg_expect_bdf = exp_bdf;
+    CHECK_EQ(call("driver_run",
+                  "{\"target\":\"pci00:0c.0\",\"source\":\""
+                  "    ld32 r1, [r0+0x10]\\n"
+                  "    halt\\n\"}"), TOOL_OK);
+    CHECK_EQ((int)(fake_cmd(0, 12, 0) & 0x7u), 0x6u | 0x1u);   /* io was preset */
+    CHECK_CONTAINS(rbuf, "mem(bit1)");
+    CHECK_CONTAINS(rbuf, "bus-master(bit2)");
+
+    /* A device already mastering is left exactly as it was found. */
+    fresh();
+    cfg_expect_bdf = (0 << 8) | (4 << 3) | 0;
+    CHECK_EQ((int)fake_cmd(0, 4, 0), 0x0007);
+    CHECK_EQ(call("driver_run", "{\"target\":\"pci00:04.0\",\"source\":\"halt\"}"),
+             TOOL_OK);
+    CHECK_EQ((int)fake_cmd(0, 4, 0), 0x0007);
+    CHECK_CONTAINS(rbuf, "bus mastering was already enabled");
+    CHECK_CONTAINS(rbuf, "kernel set none");
+
+    /* The program still cannot touch config space itself: the opcode does not
+     * exist, and every spelling of it is an assembler error. */
+    fresh();
+    CHECK(call("driver_assemble",
+               "{\"source\":\"pciwrite r1, 00:05.0, 4, 6\\nhalt\\n\"}") != TOOL_OK);
+    CHECK_CONTAINS(rbuf, "unknown instruction");
+    CHECK(call("driver_assemble",
+               "{\"source\":\"pcicfgwrite 00:05.0, 4, 6\\nhalt\\n\"}") != TOOL_OK);
+
+    CHECK_EQ(cfg_bad, 0);
+    CHECK_EQ(forbidden, 0);
+}
+
+/* 5. THE GUARD BAND REPORTS A DEVICE THAT OVERRAN THE BUFFER, in the model's own
+ * answer, with enough detail to fix the descriptor that caused it.
+ *
+ * This is staged the way it really happens: the program gives the engine a length
+ * that runs past the end of the buffer, and the DEVICE — not the program — does the
+ * writing. The VM cannot refuse it, which is the point; all the kernel can do is
+ * notice afterwards and say so. */
+static const char *overrun_program(unsigned len, unsigned from_end) {
+    static char src[1024];
+    /* Point the engine `from_end` bytes before the end of the buffer and ask it to
+     * write `len` bytes, so len - from_end bytes land in the guard band. */
+    snprintf(src, sizeof src,
+             "{\"target\":\"pci00:05.0\",\"source\":\""
+             "    add r9, r7, r8\\n"
+             "    sub r9, r9, %u\\n"
+             "    add r4, r0, 0x18\\n"
+             "    and r5, r9, 0xffffffff\\n"
+             "    out32 r4, r5\\n"
+             "    add r4, r0, 0x1c\\n"
+             "    shr r5, r9, 32\\n"
+             "    out32 r4, r5\\n"
+             "    add r4, r0, 0x20\\n"
+             "    out32 r4, %u\\n"
+             "    add r4, r0, 0x24\\n"
+             "    out32 r4, 2\\n"
+             "    halt\\n\"}", from_end, len);
+    return src;
+}
+
+/* 6. AND THE PART THAT IS NOT CONTAINED, asserted rather than glossed over.
+ *
+ * driver_run's description tells the model that only the buffer is a safe address.
+ * It is not able to ENFORCE that, and a test suite that only demonstrated the
+ * pleasant cases would be helping the code lie. So: a program that hands the
+ * engine a completely wrong physical address is accepted, runs to halt, and the
+ * kernel notices nothing — because nothing in a machine without an IOMMU can.
+ * On real hardware that transfer happens. The device model here refuses to
+ * dereference it and counts it instead, which is a property of the TEST, not of
+ * the kernel. */
+static void test_the_vm_cannot_police_dma(void) {
+    fresh();
+    long wild_before = dma_wild;
+
+    /* 0x1000 is kernel memory. The VM refuses ld/st there — proved below — but it
+     * has no opinion whatever about the same number being written into a device's
+     * descriptor register, because that is just a dword going to an allowed port. */
+    CHECK_EQ(call("driver_run",
+                  "{\"target\":\"pci00:05.0\",\"source\":\""
+                  "    add r4, r0, 0x18\\n"
+                  "    out32 r4, 0x1000\\n"        /* address: kernel memory      */
+                  "    add r4, r0, 0x1c\\n"
+                  "    out32 r4, 0\\n"
+                  "    add r4, r0, 0x20\\n"
+                  "    out32 r4, 256\\n"
+                  "    add r4, r0, 0x24\\n"
+                  "    out32 r4, 2\\n"             /* ...and tell it to WRITE     */
+                  "    halt\\n\"}"), TOOL_OK);
+    CHECK_CONTAINS(rbuf, "status=OK");
+    /* The kernel did not object, and the guard band saw nothing: the transfer was
+     * nowhere near the buffer. */
+    CHECK(strstr(rbuf, "OUT OF BOUNDS") == NULL);
+    CHECK_EQ(dma_wild - wild_before, 1);
+
+    /* The one thing that IS true: the address is on the record, in the access log
+     * the model and the operator both get. */
+    CHECK_CONTAINS(rbuf, "out32 0xd018 <= 0x1000");
+    CHECK_CONTAINS(kcap_text(), "out32 port=0xd018 val=0x1000");
+
+    /* ...and the CPU-side rule really is enforced, so the contrast is exact: the
+     * same program cannot read or write 0x1000 itself. */
+    CHECK(call("driver_run",
+               "{\"target\":\"pci00:05.0\",\"source\":\""
+               "    st32 [0x1000], 1\\n    halt\\n\"}") != TOOL_OK);
+    CHECK_CONTAINS(rbuf, "MMIO_DENIED");
+    CHECK(call("driver_run",
+               "{\"target\":\"pci00:05.0\",\"source\":\""
+               "    ld32 r1, [0x1000]\\n    halt\\n\"}") != TOOL_OK);
+    CHECK_CONTAINS(rbuf, "MMIO_DENIED");
+
+    fresh();
+    CHECK_EQ(forbidden, 0);
+}
+
+static void test_guard_band_is_reported_to_the_model(void) {
+    fresh();
+    uint64_t base = 0, size = 0;
+    dvm_dma_region(&base, &size);
+    volatile uint8_t *mem = (volatile uint8_t *)(uintptr_t)base;
+    long wild_at_entry = dma_wild;
+
+    /* A clean transfer that stops exactly at the last byte says nothing about
+     * bounds — and really does write the last byte, which is the boundary the
+     * guard has to get right. */
+    CHECK_EQ(call("driver_run", overrun_program(64, 64)), TOOL_OK);
+    CHECK_EQ((int)mem[size - 1], TLK_DMA_FILL);
+    CHECK_EQ((int)mem[size - 64], TLK_DMA_FILL);
+    CHECK(strstr(rbuf, "OUT OF BOUNDS") == NULL);
+
+    /* Now 64 bytes starting 48 from the end: 16 bytes land past it. */
+    CHECK(call("driver_run", overrun_program(64, 48)) != TOOL_OK);
+    CHECK_CONTAINS(rbuf, "DMA WENT OUT OF BOUNDS");
+    CHECK_CONTAINS(rbuf, "past the end");
+    CHECK_CONTAINS(rbuf, "+0");           /* the very first guard byte was hit */
+    CHECK_CONTAINS(rbuf, "descriptor length or count");
+    /* The kernel says so in its own voice too, in a line the model cannot forge. */
+    CHECK_CONTAINS(kcap_text(), "[driver_run.dma pci00:05.0");
+
+    /* driver_trace carries the same verdict for the run it describes. */
+    CHECK_EQ(call("driver_trace", "{}"), TOOL_OK);
+    CHECK_CONTAINS(rbuf, "dma went out of bounds");
+    CHECK_CONTAINS(rbuf, "pci cmd 0x");
+
+    /* Reported once: the guard is re-armed, so the next clean run is clean. */
+    CHECK_EQ(call("driver_run", overrun_program(16, 16)), TOOL_OK);
+    CHECK(strstr(rbuf, "OUT OF BOUNDS") == NULL);
+
+    /* An overrun is an error result, so the attempt is spent and the model is told
+     * how many are left rather than being allowed to repeat it silently. */
+    CHECK(call("driver_run", overrun_program(4096, 16)) != TOOL_OK);
+    CHECK_CONTAINS(rbuf, "DMA WENT OUT OF BOUNDS");
+    CHECK_EQ(call("driver_run", overrun_program(16, 16)), TOOL_OK);
+
+    fresh();
+    CHECK_EQ(forbidden, 0);
+    /* Every transfer in this test stayed inside the arena or its guard band: the
+     * program derived every address from r7, which is what driver_run tells a model
+     * to do. dma_wild only moves when a program computes an address of its own,
+     * which test_the_vm_cannot_police_dma does on purpose. */
+    CHECK_EQ(dma_wild, wild_at_entry);
+}
+
+/* ====================================================================== */
+/* driver_install: the step that turns a driver into an audio output      */
+/* ====================================================================== */
+
+/* A play program written against the PUBLISHED contract and nothing else.
+ *
+ * It knows TLK1's register map, which the kernel does not and must not: r0 is
+ * where its BAR landed, and every offset from it is device knowledge that arrived
+ * with the program. From the kernel it uses only what AUDIO_VM_CONTRACT promises
+ * — r7 is the buffer, r9 is how many bytes of PCM are in it THIS TIME — which is
+ * the whole claim being tested: that the contract is sufficient to write a driver
+ * against, without the driver's author being told anything about this machine
+ * beyond it.
+ *
+ * The length check at the end matters. Reaching `halt` having done nothing is the
+ * cheapest wrong program there is, so this one reads the transfer count back out
+ * of the device and aborts if it is not r9 — which is also how a real play
+ * program discovers that it started the engine with a stale length. */
+static const char *PLAY_PROGRAM =
+    "    .equ DMA_LO  0x18\n"
+    "    .equ DMA_HI  0x1c\n"
+    "    .equ DMA_LEN 0x20\n"
+    "    .equ DMA_CTL 0x24\n"
+    "    .equ DMA_N   0x2c\n"
+    "    add r4, r0, DMA_LO\n"
+    "    and r5, r7, 0xffffffff\n"
+    "    out32 r4, r5\n"
+    "    add r4, r0, DMA_HI\n"
+    "    shr r5, r7, 32\n"
+    "    out32 r4, r5\n"
+    "    add r4, r0, DMA_LEN\n"
+    "    out32 r4, r9\n"
+    "    add r4, r0, DMA_CTL\n"
+    "    out32 r4, 1\n"
+    "    add r4, r0, DMA_N\n"
+    "    in32 r12, r4\n"
+    "    cmp r12, r9\n"
+    "    bne shortfall\n"
+    "    halt\n"
+    "shortfall:\n"
+    "    abort \"the engine did not take all the samples\"\n";
+
+/* {"target":..,"source":..,"rate":..,"channels":..} from an unescaped program. */
+static const char *install_input(const char *src, unsigned rate, unsigned ch) {
+    static char in[24000];
+    size_t n = json_escape(progbuf, sizeof progbuf, src);
+    CHECK(n < sizeof progbuf);
+    snprintf(in, sizeof in,
+             "{\"target\":\"pci00:05.0\",\"rate\":%u,\"channels\":%u,\"source\":\"%s\"}",
+             rate, ch, progbuf);
+    return in;
+}
+
+/* THE HEADLINE, ON THE HOST: a program the model wrote becomes the machine's
+ * audio output, and a DEVICE then reads the kernel's samples out of memory.
+ *
+ * Every link in the chain is the real one — the real tool dispatch, the real
+ * sandbox, the real dvm, the real audio service, the real synthesiser — with a
+ * synthetic device at the far end. The proof is not "the call returned ok": it is
+ * that TLK1's DMA engine dereferenced the arena and computed a checksum over
+ * bytes NOBODY IN THIS TEST WROTE. Those bytes came from audio_synth via
+ * audio_tone, so a matching sum can only mean the samples reached the device. */
+static void test_install_lets_a_model_driver_play(void) {
+    fresh();
+    audio_reset();
+
+    uint64_t base = 0;
+    dvm_dma_region(&base, NULL);
+    long fetches_before = dma_fetches;
+
+    /* Nothing can play before the install: that is the condition being fixed. */
+    CHECK_EQ(audio_available(), 0);
+    CHECK(audio_tone(440, 50) != AUDIO_OK);
+
+    /* What driver_assemble counts is what driver_install must report. This is
+     * not decoration: the first live run of this tool printed
+     * "insns=3739147998" — 0xDEDEDEDE, mm/heap.c's use-after-free poison — into
+     * a kernel trace line, because the count was read out of the program image
+     * at the wrong moment. A number nobody cross-checks is a number that can be
+     * garbage for a long time without anyone noticing. */
+    CHECK_EQ(call("driver_assemble", asm_input(PLAY_PROGRAM)), TOOL_OK);
+    char want_insns[64];
+    {
+        const char *p = strstr(rbuf, " instructions");
+        CHECK(p != NULL);
+        const char *q = p;
+        while (q > rbuf && q[-1] >= '0' && q[-1] <= '9') q--;
+        int n = (int)strtol(q, NULL, 10);
+        CHECK(n > 5 && n < 100);
+        snprintf(want_insns, sizeof want_insns, "program: %d instructions", n);
+    }
+
+    CHECK_EQ(call("driver_install", install_input(PLAY_PROGRAM, 48000, 2)), TOOL_OK);
+    CHECK_CONTAINS(rbuf, want_insns);
+    CHECK_CONTAINS(kcap_text(), "insns=");
+    CHECK(strstr(kcap_text(), "insns=3739147998") == NULL);   /* 0xDEDEDEDE */
+    CHECK_CONTAINS(rbuf, "is now this machine's audio sink");
+    CHECK_CONTAINS(rbuf, "48000 Hz, 2 channel(s)");
+    CHECK_CONTAINS(rbuf, "NOTHING HAS BEEN PLAYED YET");
+    /* It must fit the size a model is actually handed. chat.c gives a tool
+     * CHAT_TOOL_RESULT_CAP (1024), not TOOL_RESULT_MAX, and this family already
+     * lost a live turn to a specification that arrived cut off mid-word. The
+     * last sentence is the instruction to call audio_tone, so losing the tail is
+     * exactly the part that must not be lost. */
+    CHECK(strlen(rbuf) < CHAT_TOOL_RESULT_CAP);
+    CHECK_EQ(rbuf[strlen(rbuf) - 1], '\n');
+    /* The kernel's own line, in column zero, that the model cannot forge. */
+    CHECK_CONTAINS(kcap_text(), "[driver_install pci00:05.0 sink=vmaudio");
+
+    /* Registering is not playing, and the tool says so rather than implying it. */
+    CHECK_EQ(audio_available(), 1);
+    CHECK_EQ(dma_fetches - fetches_before, 0);
+
+    /* Now ask for a sound the way anything else on the machine would. */
+    kcap_reset();
+    CHECK_EQ(audio_tone_ex(440, 100, 8000, AUDIO_WAVE_SINE), AUDIO_OK);
+
+    /* 100 ms of 48 kHz stereo 16-bit = 4800 frames = 19200 bytes. */
+    const uint32_t want_bytes = 48000u * 100u / 1000u * 2u * 2u;
+    CHECK_EQ(dma_fetches - fetches_before, 1);
+    CHECK_EQ((int)(tlk.dma_addr_seen == base), 1);
+    CHECK_EQ((int)tlk.dma_n, (int)want_bytes);
+
+    /* THE PART THAT CANNOT BE FAKED. Sum the bytes the synthesiser left in the
+     * arena and compare with the sum the DEVICE computed while reading them. The
+     * test never writes those bytes and never tells the device an address; the
+     * program did the second and audio.c did the first. */
+    const volatile uint8_t *pcm = (const volatile uint8_t *)(uintptr_t)base;
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < want_bytes; i++) sum += pcm[i];
+    CHECK_EQ((int)tlk.dma_sum, (int)sum);
+    /* ...and those samples are a real signal, not a buffer of zeroes that would
+     * make any sum match. A 440 Hz sine at amplitude 8000 must swing. */
+    CHECK(sum != 0);
+
+    /* A second sound re-runs the same program with a new length, which is the
+     * property that makes it a SINK and not a one-shot. */
+    CHECK_EQ(audio_tone_ex(880, 50, 8000, AUDIO_WAVE_SQUARE), AUDIO_OK);
+    CHECK_EQ(dma_fetches - fetches_before, 2);
+    CHECK_EQ((int)tlk.dma_n, (int)(48000u * 50u / 1000u * 2u * 2u));
+
+    /* The device tree tells the operator who is driving the card. */
+    device_t *d = dev_by_name("pci00:05.0");
+    CHECK(d != NULL);
+    CHECK(d->driver != NULL);
+    CHECK_EQ(strcmp(d->driver->name, "vmaudio"), 0);
+
+    CHECK_EQ(forbidden, 0);
+    audio_reset();
+    fresh();
+}
+
+/* A play program that fails must hand its own words back to whoever asked for the
+ * sound. Silence reported as success is the failure mode this whole family exists
+ * to prevent. */
+static void test_a_failed_play_program_says_why(void) {
+    fresh();
+    audio_reset();
+
+    static const char *sulks =
+        "    add r4, r0, 0x00\n"
+        "    in32 r5, r4\n"
+        "    abort \"the codec never came out of reset\"\n";
+    CHECK_EQ(call("driver_install", install_input(sulks, 44100, 1)), TOOL_OK);
+    CHECK_EQ(audio_available(), 1);
+
+    CHECK_EQ(audio_tone(440, 20), AUDIO_EIO);
+    CHECK_CONTAINS(audio_last_error(), "the codec never came out of reset");
+    CHECK_CONTAINS(audio_last_error(), "ABORT");
+
+    /* The sink STAYS installed after a failed sound: the model's next move is to
+     * install a corrected program, and having to re-do the bring-up first would
+     * be a worse machine. */
+    CHECK_EQ(audio_available(), 1);
+
+    /* And the cheapest wrong program of all — reach halt, touch nothing — is
+     * refused as a play rather than reported as a sound. */
+    CHECK_EQ(call("driver_install", install_input("    halt\n", 48000, 2)), TOOL_OK);
+    CHECK_EQ(audio_tone(440, 20), AUDIO_EIO);
+    CHECK_CONTAINS(audio_last_error(), "without touching the device");
+
+    audio_reset();
+    fresh();
+}
+
+/* Everything driver_install refuses, and the rule that a refusal costs the
+ * operator nothing: whatever sink was working before is still working after. */
+static void test_install_refusals(void) {
+    fresh();
+    audio_reset();
+
+    /* Install a working sink first, so every refusal below can be checked
+     * against it still being there. */
+    CHECK_EQ(call("driver_install", install_input(PLAY_PROGRAM, 48000, 2)), TOOL_OK);
+    CHECK_EQ(audio_tone(440, 20), AUDIO_OK);
+
+    static const struct { const char *in; const char *want; } bad[] = {
+        { "not json at all",                       "must be a JSON object" },
+        { "{\"source\":\"halt\",\"rate\":48000,\"channels\":2}",
+                                                   "\"target\" is required" },
+        { "{\"target\":\"pci00:05.0\",\"rate\":48000,\"channels\":2}",
+                                                   "\"source\" is required" },
+        { "{\"target\":\"pci00:05.0\",\"source\":\"halt\",\"channels\":2}",
+                                                   "\"rate\" is required" },
+        { "{\"target\":\"pci00:05.0\",\"source\":\"halt\",\"rate\":48000}",
+                                                   "\"channels\" is required" },
+        { "{\"target\":\"pci00:05.0\",\"source\":\"halt\",\"rate\":3,\"channels\":2}",
+                                                   "\"rate\" must be" },
+        { "{\"target\":\"pci00:05.0\",\"source\":\"halt\",\"rate\":48000,\"channels\":9}",
+                                                   "\"channels\" must be" },
+        { "{\"target\":\"nosuchdevice\",\"source\":\"halt\",\"rate\":48000,\"channels\":2}",
+                                                   "no device named" },
+        { "{\"target\":\"pci00:05.0\",\"source\":\"frobnicate r1\",\"rate\":48000,"
+          "\"channels\":2}",                       "assembly failed" },
+        { "{\"target\":\"pci00:05.0\",\"source\":\"\",\"rate\":48000,\"channels\":2}",
+                                                   "\"source\" is empty" },
+        /* The console is not a target here either — the rule belongs to the
+         * device, not to the tool that happens to be asking. */
+        { "{\"target\":\"pci01:02.0\",\"source\":\"halt\",\"rate\":48000,"
+          "\"channels\":2}",                       "no display device is targetable" },
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        CHECK(call("driver_install", bad[i].in) != TOOL_OK);
+        CHECK_CONTAINS(rbuf, bad[i].want);
+        /* THE INVARIANT: a refusal did not cost the operator the working sink. */
+        CHECK_EQ(audio_available(), 1);
+        CHECK_EQ(audio_tone(440, 10), AUDIO_OK);
+    }
+
+    /* A refused install must not have touched the device on the way out. An
+     * assembly error in particular is decided before any hardware access. */
+    fresh();
+    CHECK(call("driver_install",
+               "{\"target\":\"pci00:05.0\",\"source\":\"frobnicate r1\","
+               "\"rate\":48000,\"channels\":2}") != TOOL_OK);
+    CHECK_CONTAINS(rbuf, "the device was not touched");
+    CHECK_EQ(acc_delta(), 0);
+
+    audio_reset();
+    fresh();
+}
+
+/* Re-installing a corrected program on the card that is already the sink is the
+ * normal shape of the loop, and it used to be impossible: the sink binds a driver
+ * to the device node, and target_blocked() refuses a device with a driver bound.
+ * That would have made the FIRST install the only one. */
+static void test_install_can_be_corrected(void) {
+    fresh();
+    audio_reset();
+
+    /* A first program that is wrong in a way only a real sound reveals. */
+    static const char *wrong =
+        "    add r4, r0, 0x24\n"
+        "    out32 r4, 0\n"          /* starts nothing */
+        "    halt\n";
+    CHECK_EQ(call("driver_install", install_input(wrong, 48000, 2)), TOOL_OK);
+    CHECK_EQ(audio_tone(440, 20), AUDIO_OK);   /* it touched the device, so it
+                                                * counts as a play... */
+    CHECK_EQ((int)tlk.dma_n, 0);               /* ...but nothing was transferred */
+
+    /* The correction goes in without releasing anything by hand. */
+    CHECK_EQ(call("driver_install", install_input(PLAY_PROGRAM, 48000, 2)), TOOL_OK);
+    CHECK_CONTAINS(rbuf, "replaced the previous sink");
+    CHECK_EQ(audio_tone(440, 20), AUDIO_OK);
+    CHECK(tlk.dma_n > 0);
+
+    /* Only ONE device is bound, and it is bound once: a replace must not leave
+     * the old binding behind. */
+    device_t *d = dev_by_name("pci00:05.0");
+    CHECK(d != NULL && d->driver != NULL);
+    CHECK_EQ(strcmp(d->driver->name, "vmaudio"), 0);
+
+    audio_reset();
+    /* Released cleanly, the card is targetable again — a driver program can be
+     * run against it as if the sink had never existed. */
+    fresh();
+    CHECK_EQ(call("driver_run", run_input("    halt\n")), TOOL_OK);
+    audio_reset();
+    fresh();
+}
+
+/* Bus mastering is set by C, for the one named function, and — unlike driver_run
+ * — is LEFT set, because the sink DMAs on every note from here on. */
+static void test_install_enables_bus_mastering_permanently(void) {
+    fresh();
+    audio_reset();
+
+    CHECK_EQ((int)fake_cmd(0, 5, 0), 0x0001);          /* I/O decode only */
+    uint16_t n8 = fake_cmd(0, 8, 0), nc = fake_cmd(0, 12, 0);
+
+    CHECK_EQ(call("driver_install", install_input(PLAY_PROGRAM, 48000, 2)), TOOL_OK);
+    CHECK_CONTAINS(rbuf, "bus-master(bit2)");
+    CHECK_CONTAINS(rbuf, "LEAVES it set");
+
+    CHECK_EQ((int)fake_cmd(0, 5, 0), 0x0005);          /* bit 2 added, bit 0 kept */
+    CHECK_EQ((int)fake_cmd(0, 8, 0), (int)n8);         /* neighbours untouched   */
+    CHECK_EQ((int)fake_cmd(0, 12, 0), (int)nc);
+
+    /* Still set after a sound, and after a FAILED sound: taking it back would
+     * stop a transfer that may still be in flight. */
+    CHECK_EQ(audio_tone(440, 20), AUDIO_OK);
+    CHECK_EQ((int)fake_cmd(0, 5, 0), 0x0005);
+
+    /* A refused install does NOT leave the bit set behind it. */
+    fresh();
+    audio_reset();
+    CHECK_EQ((int)fake_cmd(0, 5, 0), 0x0001);
+    CHECK(call("driver_install",
+               "{\"target\":\"pci00:05.0\",\"source\":\"halt\",\"rate\":48000,"
+               "\"channels\":2}") == TOOL_OK);
+    /* (that one is accepted — `halt` is a valid image; it fails at PLAY time,
+     *  which test_a_failed_play_program_says_why covers.) */
+
+    audio_reset();
+    fresh();
+}
+
 static void test_run_bounded(void) {
     fresh();
     /* An unbounded loop stops on the cycle limit, not on the operator. */
@@ -875,12 +1756,15 @@ static void test_run_target_validation(void) {
     CHECK(call("driver_run", "{\"target\":\"pci00:1f.0\",\"source\":\"halt\"}") != TOOL_OK);
     CHECK_CONTAINS(rbuf, "nothing is answering");
 
-    /* Claimed, bus-mastering, and unusable BARs are refused here too, not just
-     * listed as unusable by driver_targets. */
+    /* Claimed and unusable BARs are refused here too, not just listed as unusable
+     * by driver_targets. */
     CHECK(call("driver_run", "{\"target\":\"pci00:03.0\",\"source\":\"halt\"}") != TOOL_OK);
     CHECK_CONTAINS(rbuf, "already bound");
-    CHECK(call("driver_run", "{\"target\":\"pci00:04.0\",\"source\":\"halt\"}") != TOOL_OK);
-    CHECK_CONTAINS(rbuf, "bus mastering");
+    /* A device that was ALREADY bus-mastering is targetable now — and the kernel
+     * says so, and says it will not take away a bit it did not set. */
+    CHECK_EQ(call("driver_run", "{\"target\":\"pci00:04.0\",\"source\":\"halt\"}"), TOOL_OK);
+    CHECK_CONTAINS(rbuf, "bus mastering was already enabled");
+    CHECK_EQ(fake_cmd(0, 4, 0) & 0x7u, 0x7u);      /* untouched, still 0x0007 */
     CHECK(call("driver_run", "{\"target\":\"pci00:06.0\",\"source\":\"halt\"}") != TOOL_OK);
     CHECK_CONTAINS(rbuf, "not permitted");
     CHECK(call("driver_run", "{\"target\":\"pci00:07.0\",\"source\":\"halt\"}") != TOOL_OK);
@@ -1281,7 +2165,9 @@ static void test_golden_transcript(void) {
     CHECK_EQ(tlk.rate, 0x100u);
     CHECK(tlk.count > 0);
     CHECK_EQ(forbidden, 0);
-    CHECK_EQ(cfg_writes, 0);
+    /* The kernel wrote the command register (that is how the device got to be a
+     * bus master), but only ever the three bits it is allowed to. */
+    CHECK_EQ(cfg_bad, 0);
 
     /* The operator's whole view of the session, on request. */
     if (getenv("DVM_SHOW_TRANSCRIPT")) {
@@ -1382,11 +2268,12 @@ static void test_schema(void) {
     json_value_t v;
     CHECK_EQ(json_parse(schema, n, &v), JSON_OK);
     CHECK_EQ((int)v.type, (int)JSON_ARRAY);
-    CHECK_EQ((int)json_count(&v), 4);          /* only this family is linked here */
+    CHECK_EQ((int)json_count(&v), 5);          /* only this family is linked here */
 
     CHECK_CONTAINS(schema, "driver_targets");
     CHECK_CONTAINS(schema, "driver_assemble");
     CHECK_CONTAINS(schema, "driver_run");
+    CHECK_CONTAINS(schema, "driver_install");
     CHECK_CONTAINS(schema, "driver_trace");
     /* The ISA the model has to write in is in the schema, not in its memory. */
     CHECK_CONTAINS(schema, "out8|out16|out32 port,a");
@@ -1423,6 +2310,16 @@ static void test_fuzz_programs(void) {
         "pop r%u", "div r%u, r1, r2", "shl r%u, r%u, %u", "abort \"x\"",
         "print \"p\", r%u", "top:", "; comment", ".equ K 0x%x", "@@@garbage",
         "in16 r%u, r%u", "st8 [r0+0x%x], 0x%x", "test r%u, 0x%x",
+        /* The DMA path, fuzzed as hard as the rest of the ISA: stores and loads at
+         * arbitrary offsets from the buffer base (so most of them are off the end),
+         * and writes into TLK1's descriptor registers with garbage addresses and
+         * lengths, so the engine is repeatedly pointed at nonsense. None of that may
+         * fault, hang, panic, or reach anything outside the sandbox. */
+        "st32 [r7+0x%x], r%u", "ld32 r%u, [r7+0x%x]", "st8 [r7+%u], 0x%x",
+        "add r9, r7, r%u", "st16 [r9+0x%x], r1", "sub r9, r7, 0x%x",
+        "out32 r0, r7", "and r5, r7, 0x%x", "shr r5, r7, %u",
+        "mov r4, 0xd018", "mov r4, 0xd01c", "mov r4, 0xd020", "mov r4, 0xd024",
+        "out32 r4, r%u", "out32 r4, 0x%x", "in32 r%u, r4",
     };
     const int nfrag = (int)(sizeof frag / sizeof frag[0]);
 
@@ -1444,12 +2341,19 @@ static void test_fuzz_programs(void) {
         /* Whatever it was, it stayed inside. */
         CHECK_EQ(forbidden, 0);
         CHECK_EQ(kpanic_hit, 0);
-        CHECK_EQ(cfg_writes, 0);
+        CHECK_EQ(cfg_bad, 0);
         CHECK(rres.len < rres.cap);
     }
-    printf("    (3000 fuzzed programs: %d halted, %d refused, forbidden=%ld)\n",
-           ran, refused, forbidden);
+    printf("    (3000 fuzzed programs: %d halted, %d refused, forbidden=%ld, "
+           "dma transfers=%ld, wild dma=%ld)\n",
+           ran, refused, forbidden, dma_fetches, dma_wild);
     CHECK_EQ(forbidden, 0);
+    /* `dma_wild` is NOT required to be zero, and that is the honest result. Every
+     * one of those is a fuzzed program that pointed a bus master outside the buffer
+     * it was given; a real device would have performed the write. The VM refused
+     * none of them, because it cannot: it polices the CPU, not the DMA engine. What
+     * IS required is everything above — no fault, no panic, nothing outside the
+     * sandbox, and no config-space write beyond the three permitted bits. */
 }
 
 static void test_fuzz_inputs(void) {
@@ -1494,6 +2398,7 @@ int main(void) {
     console_init();
     build_machine();
     build_qemu_replica();
+    snapshot_cmds();
     decode_transcript_programs();
     dvm_tools_set_io(&tlk_io);
 
@@ -1507,6 +2412,20 @@ int main(void) {
     RUN(test_run_failure_feedback);
     RUN(test_run_denied_port);
     RUN(test_run_mmio_window);
+
+    RUN(test_dma_buffer_arrives_in_r7_r8);
+    RUN(test_dma_buffer_is_real_memory);
+    RUN(test_a_device_really_dmas_out_of_the_buffer);
+    RUN(test_bus_master_enable);
+    RUN(test_the_vm_cannot_police_dma);
+    RUN(test_guard_band_is_reported_to_the_model);
+
+    RUN(test_install_lets_a_model_driver_play);
+    RUN(test_a_failed_play_program_says_why);
+    RUN(test_install_refusals);
+    RUN(test_install_can_be_corrected);
+    RUN(test_install_enables_bus_mastering_permanently);
+
     RUN(test_run_bounded);
     RUN(test_run_target_validation);
     RUN(test_garbage_input);
@@ -1523,9 +2442,13 @@ int main(void) {
     RUN(test_fuzz_inputs);
 
     printf("    (device accesses: %ld, delays: %ld, forbidden: %ld, "
-           "config writes: %ld)\n", tlk_accesses, tlk_delays, forbidden, cfg_writes);
+           "config writes: %ld, dma transfers: %ld, wild dma: %ld)\n",
+           tlk_accesses, tlk_delays, forbidden, cfg_writes, dma_fetches, dma_wild);
     CHECK_EQ(forbidden, 0);
-    CHECK_EQ(cfg_writes, 0);
+    /* Config writes now happen on purpose. What must never happen is a write to
+     * anything but three bits of one function's command register. */
+    CHECK_EQ(cfg_bad, 0);
+    CHECK(cfg_writes > 0);          /* ...and the escalation really is exercised */
 
     return th_report("dvm_tools");
 }

@@ -26,6 +26,9 @@
  *                    model should burn its typos.
  *   driver_run       assemble + execute against ONE NAMED DEVICE. TOOL_MUTATES:
  *                    it writes to real device registers.
+ *   driver_install   keep a second, shorter program as the machine's AUDIO SINK,
+ *                    re-run by core/audio.c for every sound. This is the step
+ *                    that turns "the card is up" into "the machine can play".
  *   driver_trace     page through the access log of the last run, for when the
  *                    tail that fitted in driver_run's answer was not enough.
  *
@@ -47,6 +50,8 @@
  *       inside it is refused outright;
  *     - exactly one PCI function is opened for `pcicfg`, and config-space
  *       WRITES do not exist in the ISA at all;
+ *     - the VM's own DMA scratch buffer is granted, at an address this file gets
+ *       from dvm.c and never computes;
  *     - the whole thing is then handed to dvm_policy_check(), so the VM's own
  *       compiled-in deny list (PICs, PIT, PS/2, CMOS, COM1, 0xCF8, all memory
  *       below the end of the kernel image) gets the last word. A device whose
@@ -58,14 +63,50 @@
  *     and the legacy ports those devices use are on the VM's deny list anyway;
  *   - a device with a driver bound: two drivers on one device is a race, and
  *     the resident driver would be the one to fall over;
- *   - a device with PCI bus mastering already enabled. This one matters. The VM
- *     polices every access the PROGRAM makes, but a bus-mastering device does
- *     DMA on its own, and there is no IOMMU on this machine: a descriptor
- *     address written into the wrong register would let the device scribble
- *     over the kernel, and no amount of instruction checking would see it. So
- *     bus mastering is neither enabled here nor tolerated, and DMA-capable
- *     bring-up stays with a C caller that owns the buffers (see
- *     vm/programs/ac97_boot.c, which is exactly that).
+ *   - a display controller: that is the operator's console (see target_blocked).
+ *
+ * DMA, AND THE PART THAT IS NOT CONTAINED
+ *   A program that can only poke registers can reset a codec. It cannot play a
+ *   sound, because a DMA engine has to be handed a physical address and the VM
+ *   used to have no memory to name. Two things fixed that, and both of them are
+ *   real privilege, so they are described here plainly rather than buried:
+ *
+ *     1. A DMA SCRATCH BUFFER. include/dvm.h owns one 256 KiB page-aligned static
+ *        arena. build_sandbox() grants it and passes its physical address and size
+ *        in r7/r8. This file never computes that address: it asks dvm.c, and
+ *        dvm_policy_allow_dma() refuses anything that is not a subrange of dvm.c's
+ *        own array, so a bug here cannot turn into a window on the heap.
+ *
+ *     2. BUS MASTER ENABLE, set by this file. `pcicfg` is a read-only opcode and
+ *        stays that way — one bad config dword moves a live device's BAR — so
+ *        t_driver_run() sets PCI command bit 2 (plus bit 0 and/or bit 1 if the
+ *        sandbox granted I/O or memory windows, without which the program cannot
+ *        reach its own BARs) on the ONE named function, reads the register back to
+ *        see which bits actually stuck, and clears exactly the bits it added if the
+ *        program did not reach halt. A program that halted keeps them, because it
+ *        may have started a transfer the operator is meant to hear.
+ *
+ *   WHAT THAT DOES NOT BUY. The VM bounds what the PROGRAM touches. Nothing here
+ *   bounds what the HARDWARE does once the program has written an address into a
+ *   device's DMA register. There is no IOMMU on this machine. A device given a
+ *   wrong physical address will DMA over kernel memory and no instruction check
+ *   can see it happen.
+ *
+ *   The mitigations are worth listing exactly, because the difference between
+ *   "mitigated" and "prevented" is the whole point:
+ *     - only the one named target is made a bus master, and only by C;
+ *     - the program is told exactly one valid buffer address and one size;
+ *     - the arena is its own .bss object with 64 KiB of poisoned guard band
+ *       either side, and dvm_dma_check() reports an overrun of up to that much
+ *       as a fact with a byte offset, to the model and to the trace;
+ *     - every value the program wrote into a device register is in the access
+ *       log, so the address it handed the hardware is on the record.
+ *
+ *   A determined program can still compute a completely different 32-bit number
+ *   and write it into a descriptor-base register, and that DMA will happen. This
+ *   is the same trust any real kernel extends to a driver it loads. The honest
+ *   description of this path is "a trusted driver, written this turn, whose
+ *   register accesses are sandboxed and whose DMA is not".
  *
  * THE RETRY LOOP
  *   A first attempt is usually wrong, and the interesting question is what the
@@ -107,16 +148,22 @@
  *   - A program that halts cleanly is a driver. Keeping the assembled image and
  *     re-entering it on demand (dvm.h's entry-point hook, which does not exist
  *     yet) is how a model-authored driver becomes resident rather than one-shot.
- *   - DMA needs three things the ISA deliberately lacks: caller-owned buffers,
- *     the bus-master bit, and a way to bound where a device may write. An IOMMU
- *     would make the third possible; until then ac97_boot.c's shape (C owns the
- *     memory, the VM owns the registers) is the honest answer.
+ *   - The third thing DMA wants and still does not have is a way to BOUND where a
+ *     device may write. VT-d would give it: a domain whose only mapping is the
+ *     arena turns a wrong descriptor address into a fault instead of corruption,
+ *     and would let this file stop describing the DMA path as trust.
+ *   - dvm_dma_check() runs once, after the run. A device that keeps mastering
+ *     afterwards can dirty the guard band later and be blamed on the next run. A
+ *     "stop everything this device was doing" path (clear the master bit and the
+ *     device's own run bit) would need device knowledge the kernel refuses to
+ *     have; the honest alternative is what happens now, which is to say so.
  *   - BAR sizes are inferred. A `pci_size_bar` operation that writes all-ones
  *     and restores, under an explicit lock, would make the windows exact.
  */
 
 #include "tool.h"
 #include "dvm.h"
+#include "audio.h"
 #include "device.h"
 #include "driver.h"
 #include "pci.h"
@@ -151,6 +198,10 @@
 #define DRV_STEPS_DEF       100000u
 #define DRV_STEPS_MAX       1000000u
 #define DRV_PRINTS          32u
+/* Enough to write every byte of the scratch buffer as 16-bit samples, which is
+ * the widest thing a program is likely to want to do with it. dvm.c's ceiling is
+ * one access per byte. */
+#define DRV_MAX_DMA_OPS     (DVM_DMA_SIZE / 2)
 #define DRV_TRACE_IO_LINES  128u     /* console lines at trace=io            */
 #define DRV_TRACE_ALL_LINES 256u     /* ...and at trace=all                  */
 
@@ -163,6 +214,20 @@
  * interface is a console painted into video memory, this is not "a device" -
  * it is the operator's eyes. See target_blocked(). */
 #define PCI_CLASS_DISPLAY   0x03u
+
+/* The PCI command register, and the ONLY config-space write anywhere in the
+ * driver-VM path. The ISA has no config write on purpose (one bad dword moves a
+ * live MMIO window), so the three bits a DMA-capable bring-up needs are set here,
+ * by C, for the one named target, and undone if the program fails.
+ *
+ * The upper half of dword 0x04 is the STATUS register and its error bits are
+ * write-1-to-clear, so every write below puts ZERO there: writing back the value
+ * that was read would silently clear a Master Abort or Received Target Abort that
+ * is evidence about this very device. */
+#define PCI_CMD_REG         0x04
+#define PCI_CMD_IO          0x0001u   /* I/O space decode:    reach an I/O BAR   */
+#define PCI_CMD_MEM         0x0002u   /* memory space decode: reach a memory BAR */
+#define PCI_CMD_MASTER      0x0004u   /* bus master: the device may DMA          */
 
 /* ====================================================================== */
 /* small helpers                                                          */
@@ -539,9 +604,9 @@ static uint64_t window_size(uint64_t base, int is_io) {
 
 typedef struct {
     dvm_policy_t pol;
-    uint64_t     args[7];        /* r0..r5 = BAR bases, r6 = bdf           */
+    uint64_t     args[DVM_NARGS]; /* see DVM_ARG_*: BARs, bdf, dma base+size */
     int          nargs;
-    char         text[192];      /* "ports 0xd000-0xd0ff; mmio none; ..."  */
+    char         text[224];       /* "ports 0xd000-0xd0ff; mmio none; ..."   */
     int          nwin;
 } sandbox_t;
 
@@ -608,15 +673,83 @@ static int target_blocked(const target_t *t, char *why, size_t cap) {
         if (b.is64) i++;
     }
 
-    if (t->command & 0x4) {
-        snprintf(why, cap,
-                 "%s has PCI bus mastering enabled: it can DMA into memory on its "
-                 "own, and the VM can only police what a program does through the "
-                 "CPU. There is no IOMMU here, so this device is not targetable",
-                 t->name);
-        return 1;
-    }
+    /* A device that is ALREADY bus-mastering used to be refused here, on the
+     * grounds that the VM cannot police DMA. It is now targetable, because a
+     * driver that cannot DMA cannot play a sound, and because refusing it did not
+     * actually make the machine safe — it only made the capability unreachable.
+     * What changed is that the kernel now sets the bit deliberately, for one
+     * device, and takes it back if the program fails (see cmd_enable).
+     *
+     * The one thing that IS different about a device found already mastering: we
+     * did not set that bit, so we must not clear it either. Something else — the
+     * firmware, or an earlier successful program — put it there, and clearing it
+     * could stop a transfer already in flight. cmd_enable records only the bits it
+     * added, which is exactly this distinction. */
     return 0;
+}
+
+/* ====================================================================== */
+/* bus mastering: the kernel's one config-space write                      */
+/* ====================================================================== */
+
+/* What the run needs enabled, given the windows it was granted:
+ *
+ *   PCI_CMD_MASTER (bit 2) — REQUIRED for DMA, and the reason this function
+ *     exists. With it clear, the host bridge does not forward the device's
+ *     master transactions: the descriptor fetch never happens, the device reports
+ *     no error, and the symptom is silence with a position counter stuck at zero.
+ *     There is no way for the program to set it, because `pcicfg` reads only.
+ *   PCI_CMD_IO (bit 0) — needed only if the sandbox granted port windows. With
+ *     it clear the function does not decode I/O cycles at all, so every in/out
+ *     the program makes reads 0xff and writes into the void.
+ *   PCI_CMD_MEM (bit 1) — the same for memory BARs.
+ *
+ * Deliberately NOT touched: bit 10 (Interrupt Disable). IF is 0 and every PIC
+ * line is masked on this machine, so an asserted INTx is delivered nowhere and
+ * disabling it would buy nothing while widening the set of bits that have to be
+ * restored correctly. Status bits are not touched either — see PCI_CMD_REG.
+ *
+ * Returns the bits this call ADDED and that read back as set. `before` gets the
+ * command register as it was found. A bit that was already set is not in the
+ * return value, so cmd_restore() cannot clear something it did not enable. */
+static uint16_t cmd_enable(const target_t *t, uint16_t want, uint16_t *before) {
+    uint32_t dw  = pci_cfg_read32(t->bus, t->dev, t->fn, PCI_CMD_REG);
+    uint16_t cmd = (uint16_t)(dw & 0xFFFFu);
+    if (before) *before = cmd;
+
+    uint16_t add = (uint16_t)(want & ~cmd);
+    if (!add) return 0;
+
+    pci_cfg_write32(t->bus, t->dev, t->fn, PCI_CMD_REG, (uint32_t)(cmd | add));
+
+    /* Read back rather than assume. A bit that does not stick means the function
+     * does not implement that capability (a device with no BARs of that kind, or
+     * no master capability at all), and reporting "we enabled it" would send the
+     * model looking for a bug in its program instead of in its assumptions. */
+    uint16_t got = (uint16_t)(pci_cfg_read32(t->bus, t->dev, t->fn, PCI_CMD_REG) & 0xFFFFu);
+    return (uint16_t)(got & add);
+}
+
+/* Undo exactly `added`, and nothing else. Called only when the program failed:
+ * a program that reached `halt` may have left the device happily DMAing a tone
+ * out of the buffer, and clearing bus mastering underneath it would cut the sound
+ * off in the middle — which is the one outcome the operator would read as "it
+ * did not work". */
+static void cmd_restore(const target_t *t, uint16_t added) {
+    if (!added) return;
+    uint32_t dw  = pci_cfg_read32(t->bus, t->dev, t->fn, PCI_CMD_REG);
+    uint16_t cmd = (uint16_t)(dw & 0xFFFFu);
+    pci_cfg_write32(t->bus, t->dev, t->fn, PCI_CMD_REG,
+                    (uint32_t)(cmd & (uint16_t)~added));
+}
+
+static void put_cmd_bits(char *buf, size_t cap, uint16_t bits) {
+    int n = 0;
+    buf[0] = '\0';
+    if (bits & PCI_CMD_IO)     n = catf(buf, cap, n, "%sio(bit0)", n ? "+" : "");
+    if (bits & PCI_CMD_MEM)    n = catf(buf, cap, n, "%smem(bit1)", n ? "+" : "");
+    if (bits & PCI_CMD_MASTER) n = catf(buf, cap, n, "%sbus-master(bit2)", n ? "+" : "");
+    if (!n) catf(buf, cap, 0, "none");
 }
 
 /* Build the policy from the target's BARs. Returns 0, or -1 with `why` set. */
@@ -627,6 +760,7 @@ static int build_sandbox(const target_t *t, sandbox_t *sb,
     dvm_policy_init(&sb->pol);
     sb->pol.max_steps           = max_steps;
     sb->pol.max_io              = DRV_MAX_IO;
+    sb->pol.max_dma_ops         = DRV_MAX_DMA_OPS;
     sb->pol.max_delay_us        = delay_us;
     sb->pol.max_prints          = DRV_PRINTS;
     sb->pol.trace               = trace;
@@ -689,10 +823,10 @@ static int build_sandbox(const target_t *t, sandbox_t *sb,
         }
         /* i is 0..5 here — the loop bound is 6 and the 64-bit skip below has not
          * run yet — so this test cannot currently bind. Kept deliberately: it is
-         * the bound on a write into args[7] from an index the BAR walk advances in
+         * the bound on a write into args[] from an index the BAR walk advances in
          * two places, and a guard on an array write in the code that derives the
          * sandbox is worth more than the line it costs. */
-        if (i < 6) sb->args[i] = b.base;
+        if (i < 6) sb->args[DVM_ARG_BAR0 + i] = b.base;
         sb->nwin++;
         if (b.is64) i++;
     }
@@ -705,11 +839,32 @@ static int build_sandbox(const target_t *t, sandbox_t *sb,
     }
 
     dvm_policy_allow_pci(&sb->pol, t->bus, t->dev, t->fn);
-    sb->args[6] = (uint64_t)(((uint32_t)t->bus << 8) | ((uint32_t)t->dev << 3) | t->fn);
-    sb->nargs   = 7;
+    sb->args[DVM_ARG_BDF] =
+        (uint64_t)(((uint32_t)t->bus << 8) | ((uint32_t)t->dev << 3) | t->fn);
 
-    snprintf(sb->text, sizeof sb->text, "ports %s; mmio %s; pci %02x:%02x.%x",
-             np ? ports : "none", nm ? mmio : "none", t->bus, t->dev, t->fn);
+    /* The DMA scratch buffer. Every program gets the whole arena: exactly one
+     * program runs at a time on this machine, so there is nothing to divide it
+     * between, and a fixed address and size are one less thing for a model to get
+     * wrong across a retry. The address comes from dvm.c — this file never
+     * computes one, which is why dvm_policy_allow_dma() cannot be talked into a
+     * window on the heap. */
+    uint64_t dma_base = 0, dma_size = 0;
+    dvm_dma_region(&dma_base, &dma_size);
+    if (dvm_policy_allow_dma(&sb->pol, dma_base, dma_size) != 0) {
+        snprintf(why, cap,
+                 "the VM refused to grant its own dma scratch buffer (0x%lx+0x%lx), "
+                 "which is a kernel bug, not a problem with your program",
+                 (unsigned long)dma_base, (unsigned long)dma_size);
+        return -1;
+    }
+    sb->args[DVM_ARG_DMA_BASE] = dma_base;
+    sb->args[DVM_ARG_DMA_SIZE] = dma_size;
+    sb->nargs = DVM_NARGS;
+
+    snprintf(sb->text, sizeof sb->text,
+             "ports %s; mmio %s; pci %02x:%02x.%x; dma 0x%lx+0x%lx",
+             np ? ports : "none", nm ? mmio : "none", t->bus, t->dev, t->fn,
+             (unsigned long)dma_base, (unsigned long)dma_size);
 
     /* The VM's deny list gets the last word: a BAR overlapping COM1 or the PIT
      * makes the whole device untargetable, and it says so in its own words. */
@@ -890,11 +1045,13 @@ static void attempts_record(const char *name, int ok) {
 static struct {
     int          valid;
     char         target[DRV_NAME_MAX + 1];
-    char         sandbox[192];
+    char         sandbox[224];          /* must hold sandbox_t.text              */
     char         insn[80];              /* the stopping instruction, disassembled */
     char         srcline[112];          /* the model's own text for that line     */
+    char         dma_msg[DVM_MSG_MAX];  /* "" unless a device overran the buffer  */
     uint32_t     ninsn;
     unsigned     attempt;
+    uint16_t     cmd_before, cmd_added, cmd_cleared;
     dvm_result_t res;
 } g_last;
 
@@ -985,13 +1142,42 @@ static void put_registers(tool_result_t *r, const dvm_result_t *res) {
 
 static void put_counters(tool_result_t *r, const dvm_result_t *res) {
     tool_result_printf(r,
-        "ran %lu steps, %lu accesses (port rd %lu wr %lu, mmio rd %lu wr %lu, "
-        "pci %lu), %lu us delay, %lu prints\n",
+        "ran %lu steps, %lu device accesses (port rd %lu wr %lu, mmio rd %lu wr %lu, "
+        "pci %lu), %lu dma buffer accesses (rd %lu wr %lu), %lu us delay, %lu prints\n",
         (unsigned long)res->steps, (unsigned long)res->io_ops,
         (unsigned long)res->n_port_rd, (unsigned long)res->n_port_wr,
         (unsigned long)res->n_mmio_rd, (unsigned long)res->n_mmio_wr,
-        (unsigned long)res->n_pci_rd, (unsigned long)res->delay_us,
-        (unsigned long)res->prints);
+        (unsigned long)res->n_pci_rd,
+        (unsigned long)res->n_dma_rd + res->n_dma_wr,
+        (unsigned long)res->n_dma_rd, (unsigned long)res->n_dma_wr,
+        (unsigned long)res->delay_us, (unsigned long)res->prints);
+}
+
+/* What the KERNEL did to config space around this run. The model needs this for
+ * two reasons: "bus mastering is on" is a precondition its program cannot check
+ * for itself (pcicfg can read the bit but not set it), and if a run failed it
+ * needs to know the bit is gone again before the next attempt. */
+static void put_bme(tool_result_t *r, uint64_t dma_base,
+                    uint16_t before, uint16_t added, uint16_t cleared) {
+    char bits[48];
+    put_cmd_bits(bits, sizeof bits, added);
+
+    /* One line if nothing unusual happened. Every extra line here is a line of
+     * access log the model does not get to read, so this stays terse. */
+    tool_result_printf(r, "pci cmd 0x%04x -> 0x%04x: kernel set %s%s\n",
+                       (unsigned)before, (unsigned)(before | added), bits,
+                       (before & PCI_CMD_MASTER)
+                           ? " (bus mastering was already enabled, so the kernel did not "
+                             "set it and will not clear it)" : "");
+    if (cleared) {
+        char cb[48];
+        put_cmd_bits(cb, sizeof cb, cleared);
+        tool_result_printf(r, "  the run failed, so %s was cleared again\n", cb);
+    } else if ((before | added) & PCI_CMD_MASTER) {
+        tool_result_printf(r, "  this device can DMA now: r%d=0x%lx is the only address "
+                              "it is safe to give it (no IOMMU)\n",
+                           DVM_ARG_DMA_BASE, (unsigned long)dma_base);
+    }
 }
 
 /* The tail of the log: the last thing that happened is what explains a trap. */
@@ -1074,9 +1260,25 @@ static void target_row(device_t *d, void *ctx) {
         tool_result_printf(s->r, "  usable: yes  sandbox: %s\n", sb.text);
         tool_result_printf(s->r, "  preloaded:");
         for (int i = 0; i < 6; i++)
-            if (sb.args[i])
-                tool_result_printf(s->r, " r%d=0x%lx", i, (unsigned long)sb.args[i]);
-        tool_result_printf(s->r, " r6=bdf 0x%lx\n", (unsigned long)sb.args[6]);
+            if (sb.args[DVM_ARG_BAR0 + i])
+                tool_result_printf(s->r, " r%d=0x%lx", i,
+                                   (unsigned long)sb.args[DVM_ARG_BAR0 + i]);
+        /* The addresses are already on the sandbox line above; what this line adds
+         * is WHICH REGISTER each arrives in, which is the part a program needs. */
+        tool_result_printf(s->r, " r%d=bdf 0x%lx r%d=dma 0x%lx r%d=0x%lx\n",
+                           DVM_ARG_BDF, (unsigned long)sb.args[DVM_ARG_BDF],
+                           DVM_ARG_DMA_BASE, (unsigned long)sb.args[DVM_ARG_DMA_BASE],
+                           DVM_ARG_DMA_SIZE, (unsigned long)sb.args[DVM_ARG_DMA_SIZE]);
+        {
+            char bits[48];
+            uint16_t want = PCI_CMD_MASTER |
+                            (sb.pol.nport ? PCI_CMD_IO  : 0) |
+                            (sb.pol.nmmio ? PCI_CMD_MEM : 0);
+            put_cmd_bits(bits, sizeof bits, (uint16_t)(want & ~t.command));
+            tool_result_printf(s->r, "  driver_run sets pci cmd %s (cmd 0x%04x%s)\n",
+                               bits, (unsigned)t.command,
+                               (t.command & PCI_CMD_MASTER) ? ", master already on" : "");
+        }
         unsigned used = attempts_used(t.name);
         if (used)
             tool_result_printf(s->r, "  attempts used: %u of %d\n",
@@ -1136,12 +1338,12 @@ static const tool_t driver_targets_tool = {
     .description =
         "List the devices a driver program may be run against. For each one: the "
         "sandbox it would get (port ranges and MMIO windows derived from that "
-        "device's own BARs), the PCI function opened for pcicfg, and the registers "
-        "preloaded before the first instruction (r0-r5 = BAR bases, r6 = bdf). "
-        "include_unusable=true also lists the devices that cannot be driven and "
-        "why: already claimed by a driver, bus-mastering (DMA cannot be policed), "
-        "no programmed BAR, or a BAR the VM never allows. driver_run accepts only "
-        "a target named here.",
+        "device's own BARs), the PCI function opened for pcicfg, the DMA scratch "
+        "buffer, the registers preloaded before the first instruction, and the "
+        "PCI command bits the kernel will set on it. include_unusable=true also "
+        "lists the devices that cannot be driven and why: claimed by a driver, no "
+        "programmed BAR, a display controller (the operator's console), or a BAR the "
+        "VM never allows. driver_run accepts only a target named here.",
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
         "\"include_unusable\":{\"type\":\"boolean\",\"description\":\"also list devices that cannot be targeted, with the reason\"},"
@@ -1388,12 +1590,59 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
     }
     g_last.ninsn = prog->ninsn;
 
+    /* ---- the escalation, done by C for one device ----
+     *
+     * Bus mastering is what turns "a program that pokes registers" into "a
+     * program that can play sound", and it is also the single most dangerous bit
+     * on the machine: from here until it is cleared, this device can write
+     * anywhere in the low 4 GiB that a value in one of its registers tells it to.
+     * There is no IOMMU. So it is set here, in C, for THIS function only, after
+     * the sandbox has been proved buildable, and it is undone below if the program
+     * did not reach halt. The ISA still has no config-space write. */
+    uint16_t cmd_before = 0;
+    uint16_t want_bits  = PCI_CMD_MASTER |
+                          (sb.pol.nport ? PCI_CMD_IO  : 0) |
+                          (sb.pol.nmmio ? PCI_CMD_MEM : 0);
+    uint16_t cmd_added  = cmd_enable(&t, want_bits, &cmd_before);
+    {
+        char bits[48], had[48];
+        put_cmd_bits(bits, sizeof bits, cmd_added);
+        put_cmd_bits(had,  sizeof had,  (uint16_t)(want_bits & cmd_before));
+        trace_ok("driver_run.bme", "%s cmd 0x%04x -> 0x%04x set=%s already=%s",
+                 t.name, (unsigned)cmd_before, (unsigned)(cmd_before | cmd_added),
+                 bits, had);
+    }
+
     /* ---- run it ---- */
     dvm_result_t res;
     dvm_status_t st = dvm_run(prog, &sb.pol, rio, sb.args, sb.nargs, &res);
 
-    g_last.valid = 1;
-    g_last.res   = res;
+    /* Did a DEVICE write outside the buffer? This is the only check on this
+     * machine that can notice, and it only notices a near miss. */
+    char dma_msg[DVM_MSG_MAX];
+    dma_msg[0] = '\0';
+    int dma_overrun = dvm_dma_check(dma_msg, sizeof dma_msg);
+    if (dma_overrun) trace_err(TOOL_EINVAL, "driver_run.dma", "%s %s", t.name, dma_msg);
+
+    /* A program that halted may have left the device mid-transfer, and taking its
+     * bus-master bit away now would stop the sound the run just started. A program
+     * that trapped gets it taken back: whatever it did, it is not finished, and a
+     * half-configured DMA engine with a live master bit is the one state worth
+     * spending a config write to leave. */
+    uint16_t cmd_cleared = 0;
+    if (st != DVM_OK && cmd_added) {
+        cmd_restore(&t, cmd_added);
+        cmd_cleared = cmd_added;
+        trace_ok("driver_run.bme", "%s program failed: cleared the bits the kernel set",
+                 t.name);
+    }
+
+    g_last.valid       = 1;
+    g_last.res         = res;
+    g_last.cmd_before  = cmd_before;
+    g_last.cmd_added   = cmd_added;
+    g_last.cmd_cleared = cmd_cleared;
+    snprintf(g_last.dma_msg, sizeof g_last.dma_msg, "%s", dma_msg);
     if (st != DVM_OK || res.line) {
         source_line(res.line, g_last.srcline, sizeof g_last.srcline);
         if (res.pc < prog->ninsn) dvm_disasm(prog, res.pc, g_last.insn, sizeof g_last.insn);
@@ -1407,7 +1656,11 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
      * let the model clear its own budget between failures - and a bound the
      * model can clear is not a bound. Convergence requires that the program
      * actually spoke to the device. */
-    int converged = (st == DVM_OK) && res.io_ops > 0;
+    /* An out-of-bounds DMA is a broken driver even when the program itself reached
+     * halt: the device wrote outside the only buffer it was given. Crediting that
+     * as progress would clear the attempt budget for a program that is corrupting
+     * memory, which is the last program that should get unlimited retries. */
+    int converged = (st == DVM_OK) && res.io_ops > 0 && !dma_overrun;
     attempts_record(t.name, converged);
 
     /* ---- what the model reads ---- */
@@ -1416,6 +1669,7 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
                        (unsigned)t.vendor, (unsigned)t.device,
                        g_last.attempt, DRV_ATTEMPT_BUDGET);
     tool_result_printf(r, "sandbox: %s\n", g_last.sandbox);
+    put_bme(r, sb.args[DVM_ARG_DMA_BASE], cmd_before, cmd_added, cmd_cleared);
 
     if (st == DVM_OK) {
         tool_result_printf(r, "status=OK - the program reached halt at line %lu\n",
@@ -1437,6 +1691,13 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
 
     put_counters(r, &res);
     put_registers(r, &res);
+    if (dma_overrun) {
+        r->is_error = 1;
+        tool_result_printf(r, "DMA WENT OUT OF BOUNDS: %s. The guard band either side of "
+                              "the buffer caught it, so nothing else was corrupted this "
+                              "time, but a length or descriptor count you gave the device "
+                              "is wrong.\n", dma_msg);
+    }
     put_log_tail(r);
 
     if (!converged) {
@@ -1466,21 +1727,31 @@ static int t_driver_run(const tool_call_t *c, tool_result_t *r) {
 static const tool_t driver_run_tool = {
     .name = "driver_run",
     .description =
-        "Write a device driver and run it. The program is assembled and executed "
-        "on the kernel's driver VM against ONE NAMED DEVICE from driver_targets. "
-        "The sandbox is derived from that device's BARs, so a program can only "
-        "reach the device you named - not kernel memory, the interrupt "
-        "controllers, the console, the PCI config ports or any other device - and "
-        "it cannot loop forever. Everything it does to the hardware comes back to "
-        "you; on a trap: the reason, the source line, that instruction "
-        "disassembled, the final registers, and the tail of the access log with "
-        "the values the device really returned. Fix it and call again, but only 5 "
-        "failed attempts per target are allowed, so read the log instead of "
-        "guessing. This writes to real hardware registers.\n"
+        "Write a device driver and run it, on the kernel's driver VM, against ONE "
+        "NAMED DEVICE from driver_targets. The sandbox is derived from that "
+        "device's BARs: a program reaches that device and the DMA buffer below and "
+        "nothing else - not kernel memory, the interrupt controllers, the console "
+        "or any other device - and it cannot loop forever. On a trap you get the "
+        "reason, the source line, that instruction disassembled, the final "
+        "registers, and the tail of the access log with the values the device "
+        "really returned. Fix it and call again; 5 failed attempts per target, so "
+        "read the log instead of guessing. This writes to real hardware "
+        "registers.\n"
         "MACHINE: 16 registers r0-r15, 64-bit, UNSIGNED. A 32-deep data stack and "
-        "a separate 16-deep call stack. No memory: device registers are the only "
-        "mutable state. On entry r0-r5 hold this device's BAR base addresses (0 if "
-        "that BAR is unused) and r6 holds its bdf for pcicfg.\n"
+        "a separate 16-deep call stack. ON ENTRY: r0-r5 hold this device's BAR base "
+        "addresses (0 if that BAR is unused), r6 holds its bdf for pcicfg, r7 holds "
+        "the PHYSICAL address of a DMA scratch buffer and r8 holds that buffer's "
+        "size in bytes.\n"
+        "THE DMA BUFFER (r7 = PHYSICAL address, r8 = size): the only memory here. "
+        "ld/st reach any naturally-aligned location in [r7, r7+r8) just as they reach "
+        "MMIO. 256 KiB, page-aligned. Because r7 is physical it is what you "
+        "write into a device's buffer or descriptor-base register: derive every "
+        "address you give hardware from r7, bound every length by r8. Contents are "
+        "whatever the last program left. Buffer accesses cost a step each - raise "
+        "max_steps to fill it (~48000 st32 per second of 48 kHz stereo). The kernel "
+        "enables PCI bus mastering on your target first so a device can reach the "
+        "buffer; there is no IOMMU, so any OTHER address you hand a device is really "
+        "written to, and the guard band only catches a near miss.\n"
         "INSTRUCTIONS (a, b = register or number):\n"
         " halt | abort \"why\" | nop\n"
         " mov rd,a | add|sub|mul|div|mod|and|or|xor|shl|shr rd,a,b | not rd,a\n"
@@ -1488,7 +1759,7 @@ static const tool_t driver_run_tool = {
         " cmp a,b (unsigned) | test a,b (sets zero = ((a&b)==0))\n"
         " jmp L | beq|bne|blt|ble|bgt|bge L | call L | ret | push a | pop rd\n"
         " out8|out16|out32 port,a | in8|in16|in32 rd,port\n"
-        " ld8|ld16|ld32 rd,[base+disp] | st8|st16|st32 [base+disp],a\n"
+        " ld8|ld16|ld32 rd,[base+disp] | st8|st16|st32 [base+disp],a  (MMIO or dma)\n"
         " pcicfg rd,bdf,off   (config-space READ only; bdf may be written 00:05.0)\n"
         " delay us            (microseconds; a floor, not a precise timer)\n"
         " print \"text\" | print \"text\",a   (goes to the operator's console)\n"
@@ -1496,12 +1767,13 @@ static const tool_t driver_run_tool = {
         "comments start with ; or # or //; commas are optional; case-insensitive; "
         "numbers may be decimal, 0x hex, 0b binary or contain _; "
         "`.equ NAME value` defines a constant.\n"
-        "HOW TO WRITE ONE: check the class with pcicfg before touching a port; "
+        "HOW TO WRITE ONE: "
         "reset the device, then poll for ready with a COUNTED retry loop and a "
         "delay as backoff (never an unbounded loop); write a register, read it "
         "back, and `abort \"...\"` with a specific reason if it did not stick; "
-        "leave the values you want reported in registers, because the final "
-        "register file comes back to you.",
+        "for DMA, build the device's descriptors inside the buffer at r7 and give it "
+        "addresses derived from r7, never literals; leave the values you want in "
+        "registers, because the final register file comes back to you.",
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
         "\"target\":{\"type\":\"string\",\"description\":\"device name from driver_targets, e.g. \\\"pci00:05.0\\\"\"},"
@@ -1514,6 +1786,281 @@ static const tool_t driver_run_tool = {
     .invoke = t_driver_run,
 };
 REGISTER_TOOL(driver_run_tool);
+
+/* ====================================================================== */
+/* driver_install                                                         */
+/* ====================================================================== */
+
+/* THE WIRE BETWEEN "I BROUGHT THE CARD UP" AND "THE MACHINE CAN MAKE A SOUND".
+ *
+ * Why this exists. core/audio.c has had audio_register_vm() — a full, validated,
+ * host-tested path for installing a model-authored play program as the machine's
+ * audio sink — and nothing in the kernel called it. The consequence was not a
+ * missing nicety: it was a dead end that a live model walked into. It found the
+ * unclaimed card, brought it up correctly with driver_run, and then spent most of
+ * a turn looking for the registration step that did not exist. driver_run leaves
+ * a device configured and mastering; audio_tone needs a sink; there was no verb
+ * that turned the first into the second. This tool is that verb.
+ *
+ * WHAT IT DOES NOT DO, deliberately: it does not run the program. Registration
+ * validates the image (dvm_program_validate) and the sandbox (dvm_policy_check),
+ * so a corrupt program or an impossible policy is refused here, while the model
+ * can still fix it. But "does this program actually drive the device" is a
+ * question only a real sound can answer, and the kernel refuses to answer it by
+ * running the program against an EMPTY buffer: at install time r9/r10/r11 would
+ * all be zero, so a correct program would be asked to play nothing and could
+ * only look broken. The first audio_tone is the test, and its failure carries the
+ * program's own `abort` text back to the model.
+ *
+ * THE SANDBOX IS THE SAME ONE. build_sandbox() is shared with driver_run, so a
+ * play program is granted exactly what a bring-up program was granted for that
+ * device, and audio.c re-checks that the DMA grant starts at the arena base and
+ * covers the PCM — which is what makes r7 mean the same thing in both programs.
+ *
+ * THE PRIVILEGE IS THE SAME ONE, and it is now PERMANENT rather than for the
+ * length of one run. cmd_enable() sets bus mastering on the named function and
+ * this tool does NOT take it back on success, because the sink is expected to
+ * DMA on every note from here on. There is still no IOMMU: an installed play
+ * program that computes a wrong address DMAs over kernel memory on every sound,
+ * not once. dvm_dma_check() after each play turns a near miss into a failed
+ * sound; a far miss is not detectable on this machine. See this file's header.
+ *
+ * The trace console is turned OFF for an installed program on purpose: a sink is
+ * re-run for every note, and a per-access trace would bury the operator's
+ * transcript in device I/O the moment an app starts beeping. The access log the
+ * recorder keeps is left alone for the same reason — driver_trace must go on
+ * showing the last driver_run, not whatever the last note did. */
+
+static int t_driver_install(const tool_call_t *c, tool_result_t *r) {
+    json_value_t in;
+    if (parse_obj(c, &in) != TOOL_OK)
+        return fail(r, TOOL_EINVAL, "driver_install", "", "input must be a JSON object");
+
+    char name[DRV_NAME_MAX + 1];
+    int  rc = f_str(&in, "target", name, sizeof name, NULL);
+    if (rc == 0)  return fail(r, TOOL_EINVAL, "driver_install", "",
+                              "\"target\" is required: the device this play program "
+                              "drives, from driver_targets");
+    if (rc == -1) return fail(r, TOOL_EINVAL, "driver_install", "",
+                              "\"target\" must be a string");
+    if (rc == -2) return fail(r, TOOL_ENOENT, "driver_install", "<oversized>",
+                              "no such device: a name longer than %d characters cannot "
+                              "match anything registered", DRV_NAME_MAX);
+
+    bases_invalidate();
+
+    char why[DVM_MSG_MAX + 96];
+    target_t t;
+    if (resolve_target(name, &t, why, sizeof why) != 0)
+        return fail(r, TOOL_ENOENT, "driver_install", name, "%s", why);
+
+    /* Re-installing on the card that is ALREADY the sink is the normal way to
+     * correct a play program, and target_blocked() would otherwise refuse it —
+     * the driver bound to that node is this tool's own previous install. So that
+     * one case skips the check, and the release that makes it true happens far
+     * below, after everything else has been validated, so a refused re-install
+     * leaves the sink that works in place. */
+    audio_status_t cur;
+    audio_status(&cur);
+    int replacing = (cur.kind != AUDIO_SINK_NONE && name_eq(cur.device, t.name));
+
+    if (!replacing && target_blocked(&t, why, sizeof why) != 0)
+        return fail(r, TOOL_EINVAL, "driver_install", t.name, "%s", why);
+
+    /* ---- the format the model configured the device for ----
+     *
+     * Required rather than defaulted. The kernel cannot read a codec's sample
+     * rate back out of a device it knows nothing about, so this number is the
+     * model's testimony about what it programmed, and a wrong one is a sound at
+     * the wrong pitch rather than an error. Making it explicit at least puts the
+     * claim on the record. */
+    int64_t rate = 0, ch = 0;
+    rc = f_int(&in, "rate", AUDIO_RATE_MIN, AUDIO_RATE_MAX, &rate);
+    if (rc == 0)  return fail(r, TOOL_EINVAL, "driver_install", t.name,
+                              "\"rate\" is required: the sample rate in Hz you "
+                              "configured the device for");
+    if (rc == -1) return fail(r, TOOL_EINVAL, "driver_install", t.name,
+                              "\"rate\" must be an integer");
+    if (rc == -2) return fail(r, TOOL_EINVAL, "driver_install", t.name,
+                              "\"rate\" must be %lu-%lu Hz",
+                              (unsigned long)AUDIO_RATE_MIN, (unsigned long)AUDIO_RATE_MAX);
+
+    rc = f_int(&in, "channels", 1, 2, &ch);
+    if (rc == 0)  return fail(r, TOOL_EINVAL, "driver_install", t.name,
+                              "\"channels\" is required: 1 for mono or 2 for "
+                              "interleaved stereo, as you configured the device");
+    if (rc == -1) return fail(r, TOOL_EINVAL, "driver_install", t.name,
+                              "\"channels\" must be an integer");
+    if (rc == -2) return fail(r, TOOL_EINVAL, "driver_install", t.name,
+                              "\"channels\" must be 1 (mono) or 2 (stereo)");
+
+    audio_format_t fmt;
+    memset(&fmt, 0, sizeof fmt);
+    fmt.rate_hz  = (uint32_t)rate;
+    fmt.channels = (uint8_t)ch;
+    fmt.bits     = 16;                 /* the only width the synthesiser emits */
+
+    /* The sink's name in reports and in the device tree is fixed, not chosen. A
+     * model-supplied one would be a schema property on every round for no
+     * decision worth making — only one sink can exist at a time, and what the
+     * operator needs to read in the device tree is what KIND of thing is driving
+     * the card, not a label the model invented. */
+    const char *sink = "vmaudio";
+
+    rc = want_source(&in, r, "driver_install", t.name);
+    if (rc != 0) return rc;
+
+    /* The delay budget is the sink's business, not the model's: core/audio.c
+     * raises it on a copy to cover the length of each sound (see run_vm), so a
+     * number chosen here would be overwritten for every note anyway. What is
+     * passed is the floor a bring-up-style poll loop needs before the first
+     * sample is due. */
+    /* The step budget is not negotiable here either, and unlike driver_run that is
+     * a statement about what a play program IS. It points a device at samples
+     * somebody else wrote and waits; DRV_STEPS_DEF is four orders of magnitude more
+     * than that needs. A program that wants more is synthesising audio in the VM,
+     * one st16 at a time, per note — which is the kernel's job and is already done
+     * before this program is entered. */
+    sandbox_t sb;
+    if (build_sandbox(&t, &sb, DRV_STEPS_DEF, DRV_DELAY_DEF_US, DVM_TRACE_OFF,
+                      why, sizeof why) != 0)
+        return fail(r, TOOL_EINVAL, "driver_install", t.name, "%s", why);
+
+    const dvm_io_t *io = hardware_io();
+    if (!io)
+        return fail(r, TOOL_EINVAL, "driver_install", t.name,
+                    "this build has no hardware I/O backend, so no program can run");
+
+    dvm_program_t *prog = (dvm_program_t *)kmalloc(sizeof *prog);
+    if (!prog)
+        return fail(r, TOOL_ENOSPC, "driver_install", t.name,
+                    "no memory for a program image right now");
+
+    dvm_asm_err_t aerr;
+    memset(&aerr, 0, sizeof aerr);
+    if (dvm_assemble(g_src, g_srclen, prog, &aerr) != 0) {
+        r->is_error = 1;
+        tool_result_printf(r, "target=%s: the play program was not installed\n", t.name);
+        put_asm_error(r, &aerr);
+        tool_result_printf(r, "the device was not touched and the audio sink is "
+                              "unchanged\n");
+        trace_err(TOOL_EINVAL, "driver_install", "%s asm line=%d", t.name, aerr.line);
+        kfree(prog);
+        return TOOL_EINVAL;
+    }
+
+    /* From here the machine changes. Order matters: drop the old sink only now,
+     * so everything above could still have refused without costing the operator
+     * a working one. */
+    if (replacing) audio_release();
+
+    uint16_t cmd_before = 0;
+    uint16_t want_bits  = PCI_CMD_MASTER |
+                          (sb.pol.nport ? PCI_CMD_IO  : 0) |
+                          (sb.pol.nmmio ? PCI_CMD_MEM : 0);
+    uint16_t cmd_added  = cmd_enable(&t, want_bits, &cmd_before);
+
+    audio_vm_spec_t spec;
+    memset(&spec, 0, sizeof spec);
+    spec.program = prog;              /* audio.c COPIES the image */
+    spec.policy  = sb.pol;
+    spec.io      = io;
+    for (int i = 0; i < 6; i++) spec.bar[i] = sb.args[DVM_ARG_BAR0 + i];
+    spec.bdf     = sb.args[DVM_ARG_BDF];
+
+    int arc = audio_register_vm(sink, t.node, &fmt, &spec);
+
+    /* audio.c has its own copy now, so this one goes back. Read anything wanted
+     * from the image BEFORE the free — reporting ninsn out of freed memory was
+     * the first bug in this function. */
+    uint32_t ninsn = prog->ninsn;
+    kfree(prog);
+
+    if (arc != AUDIO_OK) {
+        if (cmd_added) cmd_restore(&t, cmd_added);
+        r->is_error = 1;
+        tool_result_printf(r, "target=%s: the audio service refused this play "
+                              "program\n  %s\n", t.name, audio_last_error());
+        if (replacing)
+            tool_result_printf(r, "the sink that was installed on this device has "
+                                  "been released, so nothing is registered now\n");
+        else
+            tool_result_printf(r, "the audio sink is unchanged\n");
+        trace_err(TOOL_EINVAL, "driver_install", "%s refused", t.name);
+        return TOOL_EINVAL;
+    }
+
+    /* ---- what the model reads ---- */
+    tool_result_printf(r, "installed: \"%s\" is now this machine's audio sink, "
+                          "playing through %s %02x:%02x.%x %04x:%04x\n",
+                       sink, t.name, t.bus, t.dev, t.fn,
+                       (unsigned)t.vendor, (unsigned)t.device);
+    tool_result_printf(r, "sandbox: %s\n", sb.text);
+    tool_result_printf(r, "program: %lu instructions, re-run from its first one for "
+                          "every sound\n", (unsigned long)ninsn);
+    tool_result_printf(r, "format: %lu Hz, %u channel(s), 16-bit signed "
+                          "little-endian%s\n",
+                       (unsigned long)fmt.rate_hz, (unsigned)fmt.channels,
+                       fmt.channels == 2 ? ", interleaved" : "");
+    {
+        char bits[48];
+        put_cmd_bits(bits, sizeof bits, cmd_added);
+        tool_result_printf(r, "pci cmd 0x%04x -> 0x%04x: kernel set %s, and LEAVES it "
+                              "set - this device bus-masters on every sound now\n",
+                           (unsigned)cmd_before, (unsigned)(cmd_before | cmd_added),
+                           cmd_added ? bits : "nothing (already enabled)");
+    }
+    tool_result_printf(r, "NOTHING HAS BEEN PLAYED YET. Registration checked the "
+                          "image and the sandbox; whether the program really drives "
+                          "the device is a question only a sound answers. Call "
+                          "audio_tone next: if the program traps or reaches halt "
+                          "without touching the device, you get its reason back and "
+                          "can install a corrected one.\n");
+    if (replacing)
+        tool_result_printf(r, "(this replaced the previous sink on the same device)\n");
+
+    /* `ninsn`, NOT prog->ninsn: prog was freed above. This line read the freed
+     * image in the first live run and printed 0xDEDEDEDE (mm/heap.c's poison) as
+     * an instruction count, inside a kernel trace line — the one kind of output
+     * on this machine that is supposed to be ground truth. The result text beside
+     * it was correct, which is exactly why it survived: two copies of the same
+     * fact, one of them wrong. Pinned by test_install_lets_a_model_driver_play. */
+    trace_ok("driver_install", "%s sink=%s insns=%lu %luHz/%uch",
+             t.name, sink, (unsigned long)ninsn,
+             (unsigned long)fmt.rate_hz, (unsigned)fmt.channels);
+    return TOOL_OK;
+}
+
+/* THE DESCRIPTION IS DELIBERATELY SHORT, and that is a budget decision worth
+ * writing down rather than a lack of things to say. Every tool's schema is sent
+ * on EVERY round (see chat.h's cliff note: the registry plus a full history plus
+ * the system prompt has ~84 bytes of slack inside CHAT_REQ_BYTES), so a kilobyte
+ * spent teaching the play contract here is a kilobyte spent on every turn of
+ * every conversation, including the ones that never touch audio. The contract is
+ * therefore taught by audio_status's RESULT, which costs nothing until a model
+ * actually asks. This text has one job: make the step discoverable and name the
+ * tool that explains it. */
+static const tool_t driver_install_tool = {
+    .name = "driver_install",
+    .description =
+        "Install a play program as this machine's audio sink: this is what makes "
+        "audio_tone and audio_melody work at all. Bring the card up with driver_run "
+        "first, then call audio_status for the PLAY CONTRACT and write the short "
+        "second program it describes - the kernel has already written the samples, "
+        "so it only points the device at them and waits. Same ISA and sandbox as "
+        "driver_run. Installing does not play; the first audio_tone does, and gives "
+        "back the reason if the program fails.",
+    .input_schema =
+        "{\"type\":\"object\",\"properties\":{"
+        "\"target\":{\"type\":\"string\",\"description\":\"the device, from driver_targets\"},"
+        "\"source\":{\"type\":\"string\",\"description\":\"the play program\"},"
+        "\"rate\":{\"type\":\"integer\",\"description\":\"sample rate Hz you configured the device for\"},"
+        "\"channels\":{\"type\":\"integer\",\"description\":\"1 mono or 2 stereo, as configured\"}"
+        "},\"required\":[\"target\",\"source\",\"rate\",\"channels\"]}",
+    .flags  = TOOL_MUTATES,
+    .invoke = t_driver_install,
+};
+REGISTER_TOOL(driver_install_tool);
 
 /* ====================================================================== */
 /* driver_trace                                                           */
@@ -1551,8 +2098,20 @@ static int t_driver_trace(const tool_call_t *c, tool_result_t *r) {
             tool_result_printf(r, "  line %lu: %s\n",
                                (unsigned long)g_last.res.line, g_last.srcline);
     }
+    tool_result_printf(r, "sandbox: %s\n", g_last.sandbox);
+    {
+        char bits[48];
+        put_cmd_bits(bits, sizeof bits, g_last.cmd_added);
+        tool_result_printf(r, "pci cmd 0x%04x -> 0x%04x: the kernel set %s%s\n",
+                           (unsigned)g_last.cmd_before,
+                           (unsigned)(g_last.cmd_before | g_last.cmd_added), bits,
+                           g_last.cmd_cleared ? ", then cleared it again because the run "
+                                                "failed" : "");
+    }
     put_counters(r, &g_last.res);
     put_registers(r, &g_last.res);
+    if (g_last.dma_msg[0])
+        tool_result_printf(r, "dma went out of bounds: %s\n", g_last.dma_msg);
 
     if (!g_log_n) {
         tool_result_printf(r, "no device events were recorded\n");
@@ -1606,9 +2165,9 @@ static const tool_t driver_trace_tool = {
         "Read back the device access log of the most recent driver_run: every port "
         "and MMIO access in order with its width and the value written or read, "
         "the delays, the final registers, and why the program stopped. driver_run "
-        "already returns the tail of this; use driver_trace for the earlier part "
-        "of a long run. Only the last 256 events are kept, and the answer says so "
-        "when older ones were dropped.",
+        "returns the tail of this; use driver_trace for the earlier part of a long "
+        "run. Only the last 256 events are kept, and the answer says so when older "
+        "ones were dropped.",
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
         "\"offset\":{\"type\":\"integer\",\"description\":\"first event to print, 0-based (default 0)\"},"

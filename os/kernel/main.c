@@ -33,6 +33,7 @@
 #include "chat.h"
 #include "model.h"
 #include "gui.h"
+#include "app.h"
 
 /* Exercise the VFS end-to-end: mount, mkdir, create/write/seek/read a file,
  * stat it, and list a directory. Proves the whole path without a disk. */
@@ -101,13 +102,25 @@ static void ready_banner(int net_up) {
 /* Block for a line, but through the non-blocking poll so there is one obvious
  * place to service anything else the machine needs to do between sentences.
  *
- * This is that place, and gui_tick() is the only other thing in it: the pointer,
- * the windows and the repaint all happen here, between characters, on the same
- * single thread. gui_tick() is bounded, never blocks, and returns immediately
- * when no window is open — see the event-loop section of include/gui.h. */
+ * This is that place. Two things run in it: the pointer, the windows and the
+ * repaint (gui_tick), and the periodic handlers of model-authored apps
+ * (app_tick). Both are bounded, neither blocks, and both return immediately
+ * when nothing is open — see the event-loop section of include/gui.h and the
+ * APP_MAX_TICKS / APP_TICK_MIN_MS reasoning in include/app.h.
+ *
+ * ORDER MATTERS: app_tick() first. A tick handler's assignments change widget
+ * text, which marks damage; gui_tick()'s gui_sync() is what paints damage. The
+ * other way round a clock would be a frame stale, which on a machine whose only
+ * moving picture IS the clock is the whole of the visible behaviour.
+ *
+ * Without this line a document carrying {"tick": 1000} is validated, accepted,
+ * answered with a success trace line and a window — and never updates. Every
+ * other failure in this system comes back as an error the model can act on;
+ * that one came back as a lie. */
 static int wait_for_sentence(char *buf, int cap) {
     if (input_source_count() == 0) return INPUT_NONE;
     for (;;) {
+        (void)app_tick();
         gui_tick();
         int n = input_poll(buf, cap);
         if (n != INPUT_NONE) return n;

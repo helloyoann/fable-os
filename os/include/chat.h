@@ -187,20 +187,82 @@
  *
  * THE CLIFF THIS IS APPROACHING, stated so the next agent to add a family does
  * not discover it at boot. One request must hold this schema, the system prompt
- * (~3.4 KiB) and the history (up to CHAT_HISTORY_BYTES), inside CHAT_REQ_BYTES,
- * which in turn must stay inside net/net.c's 64 KiB HTTP framing buffer:
+ * and the history (up to CHAT_HISTORY_BYTES), inside CHAT_REQ_BYTES, which in
+ * turn must stay inside net/net.c's 64 KiB HTTP framing buffer:
  *
- *     40960 (tools) + 16384 (history) + 3400 (prompt) + ~1300 (framing)
- *   = 62044, against CHAT_REQ_BYTES = 61440
+ *     40960 (tools) + 16384 (history) + 4333 (prompt) + ~1400 (framing)
+ *   = 63077, against CHAT_REQ_BYTES = 61440
  *
- * So at this size a MAXIMAL schema plus a FULL history already spills by about a
- * kilobyte, and the loop handles that the documented way — it drops the oldest
- * exchange and rebuilds. Growing this further therefore does not just cost BSS:
- * past roughly 54 tools the machine starts forgetting mid-job on every long
- * conversation, and the fix is not another constant here. It is either a bigger
- * request buffer in net/net.c (owned elsewhere) or sending the schema more
- * cleverly than in full on every round. */
+ * So at this size a MAXIMAL schema plus a FULL history already spills, and the
+ * loop handles that the documented way — it drops the oldest exchange and
+ * rebuilds. Growing this further therefore does not just cost BSS: past roughly
+ * 52 tools the machine starts forgetting mid-job on every long conversation, and
+ * the fix is not another constant here. It is either a bigger request buffer in
+ * net/net.c (owned elsewhere) or sending the schema more cleverly than in full
+ * on every round.
+ *
+ * WHERE THE REGISTRY ACTUALLY IS, so nobody re-derives it from a stale comment.
+ * The boot banner prints the truth ("tools : 45 registered (N bytes of
+ * schema)"), and that number lives in exactly one place in this tree — the
+ * constant below — which tests/host/test_app.c, tests/host/test_agency.c and
+ * tests/qemu/harness.py all read. Against that REAL total the request is
+ *
+ *     39125 + 16384 + 4506 + 1400 = 61415 of 61440   ->   25 bytes of slack
+ *
+ * and CHAT_TOOLS_BYTES has 1835 bytes free. READ THOSE TWO NUMBERS TOGETHER: the
+ * binding limit is the 25, not the 1835. It is possible to add a description that
+ * fits CHAT_TOOLS_BYTES comfortably and still push the worst-case request past
+ * CHAT_REQ_BYTES, and that is where the machine starts forgetting mid-job.
+ *
+ * 25 BYTES IS NOT HEADROOM, IT IS THE CLIFF EDGE. The 49th tool (driver_install,
+ * the step that turns a driver a model just wrote into this machine's audio
+ * output) cost ~900 bytes and could only be paid for by taking the same number
+ * back out of nine other descriptions — deleting a false claim about the screen
+ * size, a lecture on console geometry repeated in three tools, and prose that
+ * said twice what it needed to say once. That worked, and it will not work again.
+ * The next family cannot be paid for this way: the remaining descriptions are at
+ * the point where cutting them removes facts a model needs. Whoever adds tool 50
+ * has to fix the STRUCTURE first — send the schema once per conversation rather
+ * than once per round, or page it, or grow net/net.c's framing buffer so
+ * CHAT_REQ_BYTES can move. Do not shave another 900 bytes of prose.
+ *
+ * The earlier version of this paragraph said 4008 bytes of slack, computed from a
+ * CHAT_REGISTRY_BYTES that was 4 KiB stale — so the slack it advertised had
+ * already been spent. tests/host/test_agency.c and test_app.c assert the sum
+ * above; they went red the moment the constant was corrected, which is the only
+ * reason the overflow was found at all. Do not "fix" them by raising a constant:
+ * raising CHAT_TOOLS_BYTES moves the maximal-request cliff, and raising
+ * CHAT_REQ_BYTES needs a bigger framing buffer in net/net.c (owned elsewhere).
+ * Something has to get shorter. */
 #define CHAT_TOOLS_BYTES       40960
+
+/* WHAT THE 45-TOOL REGISTRY ASSEMBLES TO TODAY, in bytes, measured.
+ *
+ * WHY A CONSTANT AND NOT A COMMENT. No host test links all 45 tools — each test
+ * binary links the two or three families it exercises — so the only place the
+ * real total exists is the boot banner, and the last three times it was written
+ * down it was written as a literal inside a printf, in three files, and drifted
+ * 699 bytes in the UNSAFE direction while every suite stayed green. The suites
+ * were printing it as a measured fact and this header was pointing at them as
+ * the authority, so the next agent sizing a description would have believed it
+ * had 699 bytes it did not have.
+ *
+ * This is now one number with teeth: `make test-qemu` parses the banner and
+ * FAILS if the kernel disagrees with it (tests/qemu/harness.py, tool_registry's
+ * expect_schema_bytes). Growing a description is therefore a two-line change —
+ * the description, and this — and forgetting the second line is loud rather
+ * than silent. Get the new value from the banner, never by arithmetic on the
+ * old one; that is precisely how the last drift happened. */
+/* 39125 read off the banner, 2026-07, with 49 tools. NOTE FOR WHOEVER GROWS A
+ * DESCRIPTION NEXT: this is no longer bounded by CHAT_TOOLS_BYTES (1835 bytes
+ * spare) but by CHAT_REQ_BYTES, and the margin there is 25 bytes. The
+ * worst-case request is REGISTRY + CHAT_HISTORY_BYTES + the system prompt +
+ * framing, and tests/host/test_agency.c and test_app.c assert it fits. When this
+ * value was stale at 35142 those two guards were passing on a number 4 KiB too
+ * small, so the overflow they exist to catch had already happened and was
+ * invisible. Read the banner, set this, and if the guards then fail, something
+ * has to get shorter - the failure is real. */
+#define CHAT_REGISTRY_BYTES    39125
 
 /* The user turn that carries a round's tool_result blocks plus the kernel's
  * budget note.

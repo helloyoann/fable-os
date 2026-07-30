@@ -73,13 +73,30 @@ enum {
     AO_VAR,         /* arg = var index                                     */
     AO_WIDGET,      /* arg = widget index; yields the widget's text         */
     AO_KEY,         /* the text of the widget that fired the handler        */
+    AO_TIME,        /* arg = ATF_*; the event's time snapshot (see below)   */
+    /* AO_TIME is the LAST leaf. app_expr_eval()'s leaf fast path is
+     * "k <= AO_TIME", so a new leaf goes here and nowhere else. */
     AO_ADD, AO_SUB, AO_MUL, AO_DIV, AO_MOD,
     AO_EQ, AO_NE, AO_LT, AO_LE, AO_GT, AO_GE,
     AO_AND, AO_OR,
     AO_NOT, AO_NEG,
     AO_NUM, AO_TEXT, AO_CAT, AO_LEN, AO_DIGITS, AO_HAS, AO_ISERR,
     AO_ABS, AO_MIN, AO_MAX,
+    AO_ROUND, AO_RAND, AO_AT,
     AO__COUNT
+};
+
+/* Which field of the time snapshot an AO_TIME leaf reads. `now` is monotonic
+ * seconds since boot (millisecond resolution); the rest come from the wall clock
+ * and are the ERR value when this machine has no readable one. */
+enum {
+    ATF_NOW = 0,
+    ATF_CLOCK,        /* "HH:MM:SS" */
+    ATF_TODAY,        /* "YYYY-MM-DD" */
+    ATF_HOUR,
+    ATF_MINUTE,
+    ATF_SECOND,
+    ATF__COUNT
 };
 
 typedef struct app_op {
@@ -101,6 +118,7 @@ typedef struct app_expr {
 #define AS_SET   0
 #define AS_IF    1
 #define AS_STOP  2
+#define AS_CALL  3
 
 #define AT_VAR     0
 #define AT_WIDGET  1
@@ -108,11 +126,43 @@ typedef struct app_expr {
 typedef struct app_stmt {
     uint8_t  kind;
     uint8_t  tgt_kind;      /* AS_SET: AT_VAR or AT_WIDGET                  */
-    uint16_t tgt;           /* AS_SET: var or widget index                  */
+    uint16_t tgt;           /* AS_SET: var or widget index;                 */
+                            /* AS_CALL: index into inst->call[]             */
     uint16_t expr;          /* AS_SET / AS_IF: expression index             */
     uint16_t then_first, then_count;
     uint16_t else_first, else_count;
 } app_stmt_t;
+
+/* ====================================================================== */
+/* compiled capability calls — {"call":...,"with":{...},"into":...}         */
+/* ====================================================================== */
+
+/* Arguments a single capability may take. Four covers audio.tone (hz, ms, amp,
+ * wave) and every capability sketched in app.h's CAPABILITIES section; it is a
+ * static bound so that a call statement is a fixed-size record and compiling one
+ * allocates nothing. */
+#define APP_CAP_MAX_ARGS   4
+
+/* Call statements per document. Eight is far more than any UI needs (a keypad
+ * with one sound is ONE call statement, because a tag lets one handler serve ten
+ * keys) and bounds both this array and the expression slots the arguments
+ * occupy: 8 * 4 = 32 of APP_MAX_EXPRS. */
+#define APP_MAX_CALLS      8
+
+/* One compiled call. `argmask` bit k means "argument k of this capability was
+ * supplied", and then expr[k] is the expression that produces it; an absent
+ * optional argument uses the table's default and expr[k] is meaningless. The
+ * arguments are NOT evaluated at compile time — they are expressions, exactly
+ * like a `set`'s "to" — so their BOUNDS are enforced when the handler runs. See
+ * apps/cap.c. */
+typedef struct app_call {
+    uint8_t  cap;                        /* index into apps/cap.c's table    */
+    uint8_t  argmask;
+    uint16_t expr[APP_CAP_MAX_ARGS];
+    uint8_t  has_into;                   /* "into" was given                 */
+    uint8_t  into_kind;                  /* AT_VAR or AT_WIDGET              */
+    uint16_t into;
+} app_call_t;
 
 /* ====================================================================== */
 /* handlers                                                               */
@@ -120,14 +170,22 @@ typedef struct app_stmt {
 
 #define AE_CLICK   0
 #define AE_SUBMIT  1
+#define AE_TICK    2
 
 /* Selectors (names and tags) are resolved at load time into a bitmask of widget
  * indices, so dispatch is a shift and a test and no string comparison happens on
- * a click. APP_MAX_WIDGETS is 48, which fits a uint64_t with room to spare. */
+ * a click. APP_MAX_WIDGETS is 48, which fits a uint64_t with room to spare.
+ *
+ * AE_TICK has no selector (mask is 0) and carries a period instead. `due` is the
+ * monotonic millisecond reading at which it may next run; app_tick() sets it to
+ * now+period AFTER running, so a slow or long-delayed tick can never accumulate a
+ * backlog to catch up on — see app_tick() in runtime.c. */
 typedef struct app_handler {
     uint8_t  ev;
     uint64_t mask;
     uint16_t first, count;      /* statement block                          */
+    uint32_t period;            /* AE_TICK: milliseconds between runs        */
+    uint64_t due;               /* AE_TICK: monotonic ms of the next run     */
 } app_handler_t;
 
 /* ====================================================================== */
@@ -160,7 +218,18 @@ typedef struct app_inst {
     app_handler_t handler[APP_MAX_HANDLERS];
     uint16_t      nhandler;
 
-    char      lasterr[128];
+    app_call_t call[APP_MAX_CALLS];
+    uint16_t   ncall;
+
+    /* The last runtime note, app_last_error()'s buffer.
+     *
+     * 224 AND NOT 128, because a capability refusal is the longest sentence this
+     * runtime produces and it is the one that has to survive whole: at 128 the
+     * audio service's own "no audio output driver is registered ... register
+     * itself as the audio sink first" lost its last clause, which is the clause
+     * that says what to DO about it. The bound matches app_error_t.msg, so a
+     * refusal reads the same whether it happened at load time or at run time. */
+    char      lasterr[224];
 } app_inst_t;
 
 /* ====================================================================== */
@@ -198,5 +267,132 @@ app_val_t app_expr_eval(const app_inst_t *in, uint16_t index,
 /* Bump the shared ERR counter in app_stats(). Defined in runtime.c so that
  * expr.c stays free of state. */
 void app_note_err_value(void);
+
+/* Bump the counter of capability calls the kernel actually PERFORMED. Same
+ * arrangement, for the same reason: cap.c holds no statistics of its own, so
+ * app_stats() stays the one place a tool reads them from. */
+void app_note_sound(void);
+
+/* ====================================================================== */
+/* the environment: time and randomness                                    */
+/* ====================================================================== */
+
+/* THE TWO IMPURE THINGS AN EXPRESSION CAN READ, and both are reached through
+ * runtime.c so that expr.c keeps holding no state and touching no hardware.
+ *
+ * app_env_now() hands back the SNAPSHOT runtime.c took when the event began, not
+ * a fresh reading. Two reasons, both load-bearing:
+ *   - `hour` and `minute` in one handler must not straddle a minute boundary and
+ *     render 10:59 as "11:59". One snapshot per event makes every expression in
+ *     that event agree.
+ *   - the wall clock is a device (CMOS port I/O). Reading it per operand would
+ *     put unbounded-ish I/O inside the evaluator; reading it at most once per
+ *     event, and only if the document actually mentions it, keeps evaluation the
+ *     flat arithmetic loop it is documented to be.
+ * Returns 1 when *wall is a usable reading, 0 when this machine has no readable
+ * wall clock (then every wall-clock leaf is ERR). *ms is always set.
+ *
+ * app_env_random() returns 64 fresh bits from the machine's entropy source
+ * (RDRAND, or the TSC mixer behind it — lib/libc_shim.c's mbedtls_hardware_poll,
+ * reused rather than reinvented). It cannot fail and cannot block: the source
+ * itself falls back rather than spinning. */
+int      app_env_now(uint64_t *ms, app_wall_t *wall);
+uint64_t app_env_random(void);
+
+/* ====================================================================== */
+/* apps/cap.c — the capability broker                                      */
+/* ====================================================================== */
+
+/* THE SEAM. runtime.c compiles and evaluates; cap.c decides what a capability
+ * IS, validates it and performs it. Neither reaches into the other's structures:
+ * cap.c never sees an app_inst_t (it holds an app id and calls back through
+ * app_cap_deliver), and runtime.c never mentions audio.h. That is what keeps
+ * "the kernel brokers every call" a property of the code rather than a claim —
+ * there is exactly one function in this kernel that can turn a document into a
+ * hardware action, and it is app_cap_service(). */
+
+/* What kind of value an argument is, and how it is bounded. Numbers are whole
+ * numbers after rounding (a fractional expression result is rounded to nearest,
+ * halves away from zero) and are checked against [lo,hi] INCLUSIVE. Strings are
+ * validated by the capability itself, and `choices` is the list a refusal
+ * quotes. */
+enum { ACA_NUM = 0, ACA_STR };
+
+typedef struct app_cap_arg {
+    const char *name;
+    uint8_t     kind;        /* ACA_NUM | ACA_STR                            */
+    uint8_t     required;
+    int64_t     lo, hi;      /* ACA_NUM: inclusive bounds                    */
+    int64_t     def;         /* ACA_NUM: value used when absent              */
+    const char *choices;     /* ACA_STR: what is accepted, and the default   */
+} app_cap_arg_t;
+
+int                  app_cap_lookup(const char *name);   /* -1 = unknown     */
+const char          *app_cap_name(int cap);              /* "" out of range  */
+int                  app_cap_count(void);
+int                  app_cap_nargs(int cap);
+const app_cap_arg_t *app_cap_arg(int cap, int index);    /* NULL out of range */
+
+/* Every capability name, comma-separated, for the refusal an unknown one earns.
+ * Truncates rather than overflowing; always NUL-terminated. */
+void app_cap_names(char *dst, size_t cap);
+
+/* One call, with its arguments ALREADY EVALUATED by runtime.c. Returns APP_OK
+ * when the call was accepted (it will be performed by the next
+ * app_cap_service()), or APP_EINVAL / APP_EBUSY. Nothing here touches hardware:
+ * that is app_cap_service()'s job and nowhere else's.
+ *
+ * A refusal is written TWICE, because it has two readers: `why` is the whole
+ * sentence with the bound in it (it becomes the app's note, which app
+ * action=state hands the model) and `brief` is a phrase short enough for the
+ * "into" widget, which shows GUI_TEXT_MAX-1 characters. Either may be NULL. */
+typedef struct app_cap_req {
+    uint32_t         app;                     /* app (== window) id          */
+    int              cap;
+    uint64_t         now_ms;                  /* the event's time snapshot   */
+    const app_val_t *arg;                     /* APP_CAP_MAX_ARGS values     */
+    uint8_t          argmask;
+    uint8_t          has_into, into_kind;
+    uint16_t         into;
+} app_cap_req_t;
+
+int app_cap_request(const app_cap_req_t *rq, char *why, size_t why_cap,
+                    char *brief, size_t brief_cap);
+
+/* Is a call waiting to be performed? Cheap enough for the idle loop to ask on
+ * every pass: it reads one flag. */
+int app_cap_pending(void);
+
+/* Perform the pending call, if any: this is the ONLY place in apps/ that reaches
+ * a driver. Returns 1 if a call was performed (or deliberately dropped), 0 if
+ * there was nothing to do. `now_ms` is a fresh monotonic reading. */
+int app_cap_service(uint64_t now_ms);
+
+/* Write `text` into a var or widget of a running app. Implemented in runtime.c
+ * (it owns the pool) and called by cap.c to report an outcome that is only known
+ * after the sound has played. A no-op if that app has closed in the meantime. */
+void app_cap_deliver(uint32_t app, uint8_t tgt_kind, uint16_t tgt,
+                     const char *text);
+
+/* Record a one-line note against a running app (app_last_error(), and the
+ * "note:" line app action=state prints). Also runtime.c's, for the same reason. */
+void app_cap_note(uint32_t app, const char *text);
+
+/* Copy `src` into `dst` with every byte that could corrupt the console turned
+ * into a space: control characters, and '[' and ']'.
+ *
+ * WHY THIS EXISTS, AND WHY IT IS NOT DECORATIVE. A failure sentence from a sink
+ * can contain MODEL BYTES — a VM play program's `abort "reason"` reaches
+ * audio_last_error() verbatim — and this module puts that sentence into a widget
+ * and into app_last_error(), which a tool result prints. trace.h's one invariant
+ * is that a '[' in column zero is the kernel speaking; a reason of
+ * "\n[vfs_write fd=3 -> ok]" would forge one the moment anything echoed it. The
+ * trace line this module emits carries no sink text at all, and this makes the
+ * other two paths safe as well. */
+void app_cap_clean(char *dst, size_t cap, const char *src);
+
+/* Test hook: drop the pending call and forget the rate limiter, so a suite can
+ * start each case from a known state. Nothing in the kernel calls it. */
+void app_cap_reset(void);
 
 #endif /* APP_IMPL_H */

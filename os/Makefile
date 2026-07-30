@@ -32,10 +32,19 @@ OBJCOPY := x86_64-elf-objcopy
 # believes they passed produces a kernel that gets 401 and an operator who
 # does not know why.
 # ===========================================================================
-ifneq ($(strip $(KEY)),)
-$(error KEY= is gone: the API key is never compiled in. Put KEY="sk-ant-..." \
-in os/.env (gitignored) and run `make run` — it is handed to the guest at boot \
-over fw_cfg. See the README section "The API key never enters the build".)
+#
+# Test $(origin KEY), NOT $(KEY). Make imports the environment as make
+# variables, so a plain `ifneq ($(strip $(KEY)),)` also fires when KEY merely
+# happens to be exported in the caller's shell — which is exactly what happens
+# when a zsh/bash dotenv plugin auto-sources os/.env on cd. The operator then
+# gets told "KEY= is gone" for a command they never typed, with a key sitting
+# correctly in the file the message tells them to use. Only a command-line
+# assignment is a mistake worth stopping the build for.
+ifeq ($(origin KEY),command line)
+$(error KEY= on the command line is gone: the API key is never compiled in. Put \
+KEY="sk-ant-..." in os/.env (gitignored) and run `make run` — it is handed to the \
+guest at boot over fw_cfg. See the README section "The API key never enters the \
+build".)
 endif
 
 # One-off diagnostic builds. Empty in every normal build; the only current use
@@ -123,13 +132,14 @@ TOOL_SRCS := $(wildcard tools/*.c)
 
 KERNEL_SRCS := kernel/main.c kernel/drivers.c $(TOOL_SRCS) \
                arch/x86_64/idt.c arch/x86_64/fault.c \
-               core/kobject.c core/tool.c mm/heap.c device/device.c \
+               core/kobject.c core/tool.c core/audio.c mm/heap.c device/device.c \
                fs/vfs/vfs.c fs/native/ramfs.c fs/fs.c \
                lib/base.c lib/libc_shim.c lib/trace.c \
                lib/fb.c lib/font.c lib/font_spleen8x16.c \
                gui/wm.c gui/widgets.c gui/gui_demo.c \
-               apps/runtime.c apps/expr.c apps/app_selftest.c \
-               vm/dvm.c vm/programs/ac97_boot.c \
+               apps/runtime.c apps/expr.c apps/cap.c apps/app_selftest.c \
+               apps/app_format_selftest.c apps/app_audio_selftest.c \
+               vm/dvm.c \
                drivers/serial/serial.c drivers/fwcfg/fwcfg.c drivers/pci/pci.c \
                drivers/acpi/acpi.c drivers/acpi/power.c \
                drivers/acpi/power_selftest.c \
@@ -151,6 +161,29 @@ KERNEL_SRCS := kernel/main.c kernel/drivers.c $(TOOL_SRCS) \
 # undefined reference to fault_inject or fault_inject_name.
 ifneq ($(findstring TALKOS_FAULT,$(EXTRA_CFLAGS)),)
 KERNEL_SRCS += arch/x86_64/fault_inject.c
+endif
+
+# THE REFERENCE AUDIO BRING-UP, IN THE FIXTURE BUILD ONLY — same argument as
+# fault_inject.c above, for a stronger reason.
+#
+# This kernel's premise is that it knows NOTHING about the sound card an operator
+# attaches: the model is supposed to write that driver at run time through the
+# driver VM. A hand-written AC'97 driver in the image contradicts the premise and
+# also prevents the experiment, because it claims the device and initialises the
+# codec before anyone can type a sentence. So the reference bring-up moved out of
+# vm/programs/ to tests/qemu/fixtures/ and is linked ONLY when a build asks for it
+# by name. It is still a boot-time driver in that build, which is what lets
+# tests/qemu/cases/ac97.case assert it and keeps the proof that the VM can drive
+# real silicon from rotting.
+#
+#   make EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE
+#
+# The case's `build-cflags:` line makes the harness do exactly that and then put
+# the tree back; the fixture also #errors if compiled without the define. A
+# default `make` links no audio code at all — verify with:
+#   nm kernel.elf | grep -i ac97      (expect nothing)
+ifneq ($(findstring TALKOS_AC97_REFERENCE,$(EXTRA_CFLAGS)),)
+KERNEL_SRCS += tests/qemu/fixtures/ac97_boot.c
 endif
 
 KERNEL_OBJS := $(KERNEL_SRCS:.c=.o)
@@ -243,6 +276,17 @@ READ_KEY = set +x +v; key=; \
 	  fi; \
 	fi; \
 	if [ -z "$$key" ]; then key=$${ANTHROPIC_API_KEY:-}; fi;
+#      ^ and NOTHING after it. There is deliberately no `key=$${KEY:-}` fallback
+#      for an exported shell KEY. It reads plausible — KEY is this project's own
+#      name for the key inside os/.env — but `KEY` in the ENVIRONMENT is a
+#      maximally generic name that a licence key, a GPG key id or an unrelated
+#      secret may already be sitting in, and taking it would send that secret to
+#      api.anthropic.com in the x-api-key header. That is exactly the
+#      exfiltration the two-names rule above exists to prevent; the rule would
+#      be worth little if the environment half quietly read a third, vaguer
+#      name. The dotenv-plugin problem that motivated the $(origin KEY) guard is
+#      already solved by that guard alone: in that scenario os/.env exists and
+#      the loop above wins, so this line would never have fired anyway.
 
 # Expands to the -fw_cfg arguments in "$@", or to nothing at all. No key is the
 # supported default: the kernel boots, says it has none, and the API answers 401.
@@ -284,7 +328,12 @@ lwip/%.o mbedtls/%.o: CFLAGS += -w
 # there is nothing stale to catch yet.
 -include $(OBJS:.o=.d)
 
-kernel.elf: $(OBJS) linker.ld
+# Makefile is a prerequisite because this file decides WHICH OBJECTS ARE LINKED,
+# and that is not visible in any timestamp. Removing a source from KERNEL_SRCS
+# (say, an audio driver that must not ship) leaves every remaining object older
+# than kernel.elf, so make would say "Nothing to be done" and the image would
+# still contain the code that was just removed. One prerequisite, one relink.
+kernel.elf: $(OBJS) linker.ld Makefile
 	$(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBGCC)
 
 kernel.bin: kernel.elf
@@ -323,12 +372,26 @@ RESIZE_WINDOW = ( W=$$((720 * $(ZOOM))); H=$$((400 * $(ZOOM) + 28)); \
 	done; \
 	echo "note: could not resize the QEMU window (grant your terminal Accessibility permission)" >&2 ) &
 
+# Extra QEMU arguments, appended verbatim. The point of this hook is hardware the
+# kernel has NO driver for: PCI enumeration finds it, reports it as unclaimed, and
+# the model can then read its config space and write a bring-up program for it in
+# the driver VM (include/dvm.h). That is the whole reason vm/ exists.
+#
+#   make run QEMU_EXTRA="-device AC97 -audiodev coreaudio,id=a0"
+#   make run QEMU_EXTRA="-device rtl8139,netdev=n0"     # a NIC we cannot drive
+#   make run QEMU_EXTRA="-device nvme,drive=d0,serial=1 -drive id=d0,file=disk.img,if=none"
+#
+# It goes AFTER $(NETFLAGS) so it can add devices without replacing the NIC, which
+# overriding NETFLAGS itself would do — taking networking, and therefore the model,
+# down with it.
+QEMU_EXTRA ?=
+
 run: kernel.bin
 	@$(RESIZE_WINDOW)
-	@$(KEY_ARGS) qemu-system-x86_64 -kernel kernel.bin $(NETFLAGS) -display $(QEMU_DISPLAY) -serial stdio "$$@"
+	@$(KEY_ARGS) qemu-system-x86_64 -kernel kernel.bin $(NETFLAGS) $(QEMU_EXTRA) -display $(QEMU_DISPLAY) -serial stdio "$$@"
 
 run-nox: kernel.bin
-	@$(KEY_ARGS) qemu-system-x86_64 -kernel kernel.bin $(NETFLAGS) -display none -serial stdio "$$@"
+	@$(KEY_ARGS) qemu-system-x86_64 -kernel kernel.bin $(NETFLAGS) $(QEMU_EXTRA) -display none -serial stdio "$$@"
 
 # ===========================================================================
 # Bootable media — GRUB, an ISO, and a USB stick
@@ -507,20 +570,58 @@ TESTSRC_test_gui := gui/wm.c gui/widgets.c gui/gui_demo.c tools/gui_tools.c \
                     drivers/input/mouse.c core/tool.c lib/trace.c net/json.c
 # tools/gui_tools.c is linked in unmodified so the golden transcript can press
 # the app's keys with gui_click, exactly as the model does.
-TESTSRC_test_app := apps/runtime.c apps/expr.c tools/app_tools.c \
+# apps/cap.c is the capability broker, so every suite that links the app runtime
+# links it — and it calls core/audio.c, which needs the driver VM (the DMA arena
+# the samples live in) and the device model (a sink is published there). That is a
+# real dependency and not test scaffolding: it is the same object file the kernel
+# links, so what these suites exercise is the path a document really takes to a
+# driver. See include/app.h DECISION 4.
+APPSRC := apps/runtime.c apps/expr.c apps/cap.c core/audio.c vm/dvm.c \
+          device/device.c core/kobject.c mm/heap.c
+TESTSRC_test_app := $(APPSRC) tools/app_tools.c \
                     tools/gui_tools.c gui/wm.c gui/widgets.c gui/gui_demo.c \
                     lib/fb.c lib/font.c lib/font_spleen8x16.c \
                     drivers/input/mouse.c core/tool.c lib/trace.c \
                     net/json.c net/model.c net/model_mock.c net/chat.c
+# test_app_format covers the format additions (tick, the time snapshot, rand, at,
+# round) and the shipped examples. No tools and no chat: it drives app_launch(),
+# app_tick() and gui_click_widget() directly, so it needs only the runtime and the
+# window manager.
+TESTSRC_test_app_format := $(APPSRC) gui/wm.c gui/widgets.c \
+                    lib/fb.c lib/font.c lib/font_spleen8x16.c \
+                    drivers/input/mouse.c net/json.c lib/trace.c
+# test_app_audio covers the capability call end to end: the statement compiles, a
+# bound is enforced, a synthetic sink receives real PCM, and a handler provably
+# does NOT reach the driver (only app_service() does). Same source list, plus the
+# window manager to click with and trace.c to read the ground-truth line back out.
+TESTSRC_test_app_audio := $(APPSRC) gui/wm.c gui/widgets.c \
+                    lib/fb.c lib/font.c lib/font_spleen8x16.c \
+                    drivers/input/mouse.c net/json.c lib/trace.c \
+                    core/tool.c tools/app_tools.c
 # calculator_json.h is generated from calculator.json (apps/examples/gen_header.py);
-# both the kernel object that embeds it and the test that diffs it must follow it.
+# both the kernel object that embeds it and the test that diffs it must follow it,
+# and examples_json.h is the same arrangement for the rest of apps/examples/.
 apps/runtime.o tests/build/test_app: apps/examples/calculator_json.h
+apps/runtime.o tests/build/test_app_format: apps/examples/examples_json.h
+# beeper.json is the worked example for a capability call; it reaches the kernel
+# through the same generated header, and the audio self-test embeds it.
+apps/app_audio_selftest.o tests/build/test_app_audio: apps/examples/examples_json.h
 TESTSRC_test_trace := lib/trace.c
 TESTSRC_test_dvm := vm/dvm.c lib/trace.c
 TESTSRC_test_dvm_ac97 := vm/dvm.c lib/trace.c
+# core/audio.c is here because driver_install calls audio_register_vm(): the tool
+# family that writes a driver is also the one that installs it as the audio sink,
+# so the suite that tests those tools has to link the service they install into.
 TESTSRC_test_dvm_tools := vm/dvm.c lib/trace.c core/tool.c core/kobject.c \
                           device/device.c mm/heap.c net/json.c net/model.c \
-                          net/model_mock.c net/chat.c
+                          net/model_mock.c net/chat.c core/audio.c
+# test_audio links the REAL driver VM, so the play path a model-authored driver
+# takes is exercised end to end against a synthetic device on the host: the suite
+# assembles a play program, registers it as the sink, plays a tone, and then reads
+# the PCM back out of the address the program handed its device. Without vm/dvm.c
+# that path would only be testable by booting.
+TESTSRC_test_audio := core/audio.c vm/dvm.c core/tool.c core/kobject.c \
+                      device/device.c mm/heap.c lib/trace.c net/json.c
 # A test that #includes a kernel .c (the REGISTER_TOOL / REGISTER_DRIVER linker
 # sections do not survive a Mach-O host link any other way) does not get that
 # file as a prerequisite from TESTSRC_*, so it needs one spelled out here.
@@ -530,6 +631,7 @@ TESTSRC_test_dvm_tools := vm/dvm.c lib/trace.c core/tool.c core/kobject.c \
 #   $ grep -n '#include "\.\./\.\./.*\.c"' tests/host/*.c
 tests/build/test_dev_tools: tools/dev_tools.c
 tests/build/test_e1000: drivers/net/e1000.c
+tests/build/test_audio: tools/audio_tools.c
 # test_dvm_tools.c #includes the tool source and the recorded session, so it
 # must follow both.
 tests/build/test_dvm_tools: tools/dvm_tools.c vm/transcripts/dvm_bringup.h
@@ -539,7 +641,9 @@ tests/build/test_dvm_tools: tools/dvm_tools.c vm/transcripts/dvm_bringup.h
 # build needs no python3, and drift is caught where it can be explained —
 # test_dvm_ac97.c diffs the two and fails with "run python3
 # vm/programs/gen_header.py". These two only need to follow the header itself.
-vm/programs/ac97_boot.o tests/build/test_dvm_ac97: vm/programs/ac97_bringup.h
+# (The .o is under tests/ because the caller that runs the program on real
+# hardware is a fixture, not kernel behaviour — see KERNEL_SRCS above.)
+tests/qemu/fixtures/ac97_boot.o tests/build/test_dvm_ac97: vm/programs/ac97_bringup.h
 TESTSRC_test_fault := arch/x86_64/fault.c tools/fault_tools.c core/tool.c \
                       lib/trace.c net/json.c
 TESTSRC_test_fault_diagnose := net/faultchat.c arch/x86_64/fault.c \
@@ -629,6 +733,9 @@ clean:
 	rm -f boot/boot.o $(ARCH_ASM_OBJS) $(KERNEL_OBJS) $(LWIP_OBJS) $(MBEDTLS_OBJS) kernel.elf kernel.bin
 	rm -f $(OBJS:.o=.d) .build-flags
 	rm -rf tests/build
+	# The AC'97 fixture object is only in $(KERNEL_OBJS) when the flag that
+	# builds it is set, so a plain `make clean` would leave it behind.
+	rm -f tests/qemu/fixtures/*.o tests/qemu/fixtures/*.d
 
 toolchain:
 	brew install nasm x86_64-elf-gcc qemu

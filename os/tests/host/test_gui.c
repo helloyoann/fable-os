@@ -358,7 +358,8 @@ static void test_window_open_and_clamp(void) {
 
     uint32_t huge = gui_window_open("h", -5000, -5000, 99999, 99999, 0);
     gui_window_t *H = gui_window(huge);
-    CHECK_EQ(H->frame.w, SW); CHECK_EQ(H->frame.h, SH);
+    CHECK_EQ(H->frame.w, SW);
+    CHECK_EQ(H->frame.h, SH - 16);              /* the prompt row is reserved */
     CHECK(H->frame.y >= 0);
     CHECK(H->frame.x + H->frame.w >= 48);       /* still grabbable */
 
@@ -366,6 +367,23 @@ static void test_window_open_and_clamp(void) {
     gui_window_t *O = gui_window(off);
     CHECK(O->frame.x <= SW - 48);
     CHECK(O->frame.y <= SH - (GUI_TITLE_H + 2 * GUI_BORDER));
+
+    /* DECISION 1: THE BOTTOM TEXT ROW IS NEVER COVERED, whatever a document
+     * asks for. The console scrolls, so the prompt lives on the last row for
+     * the life of the machine; a window over it hides `> ` and, worse, hides
+     * the "[typing into ...]" warning that says the operator's next sentence is
+     * going into a text field rather than to the model. Both a full-screen
+     * window and a window merely placed low must clear it. */
+    for (int k = 0; k < gui_window_count(); k++) {
+        gui_window_t *W2 = gui_window_at_z(k);
+        CHECK(W2->frame.y + W2->frame.h <= SH - 16);
+    }
+    uint32_t low = gui_window_open("low", 0, SH - 40, 300, 200, 0);
+    gui_window_t *L = gui_window(low);
+    CHECK(L->frame.y + L->frame.h <= SH - 16);
+    CHECK_EQ(L->frame.h, 200);                  /* slid up, not shortened */
+    CHECK_EQ(gui_window_at(10, SH - 1), 0u);    /* nothing owns the last row */
+    CHECK(gui_window_close(low) == 0);
 
     /* Ids are monotonic and never reused, so a stale id from an earlier turn
      * resolves to "no such window" instead of to whatever moved in. */
@@ -1257,6 +1275,36 @@ static void test_click_widget_api(void) {
      * disabled widget is. */
     gui_enable(gui_widget_by_id(W, 107), 0);
     CHECK_EQ(gui_click_widget(id, 107), -3);
+
+    /* -4: A WIDGET THAT IS NOT INSIDE ITS OWN WINDOW MAY NOT BE PRESSED.
+     *
+     * A rect is allowed to fall outside the client area — the compositor clips,
+     * so the widget is simply not drawn — but this function projects it into
+     * SCREEN space and presses that pixel, and gui_click_at() then re-resolves
+     * the pixel to whatever window is topmost there. Without this check, a
+     * button declared 400 wide inside a 200-wide window pressed a DIFFERENT
+     * window's widget, ran that app's handler and moved the keyboard grab, and
+     * the caller was told it had pressed its own button.
+     *
+     * The victim below is a second window sitting exactly where the escaped
+     * widget's centre lands: it must be untouched. */
+    uint32_t victim = gui_demo_calculator(600, 400);
+    gui_window_t *V = gui_window(victim);
+    gui_widget_t *v7 = gui_widget_by_id(V, 107);
+    gui_rect_t    vc = gui_client_rect(V);
+    int32_t       tx = vc.x + v7->r.x + v7->r.w / 2;
+    int32_t       ty = vc.y + v7->r.y + v7->r.h / 2;
+    CHECK_STR(calc_display(V), "0");
+
+    gui_rect_t    cl = gui_client_rect(W);
+    gui_widget_t *esc = gui_add_button(W, gui_rect(tx - cl.x - 4, ty - cl.y - 4,
+                                                   8, 8), "esc", 4242);
+    CHECK(esc != NULL);
+    uint32_t focus_before = gui_focused();
+    CHECK_EQ(gui_click_widget(id, 4242), -4);
+    CHECK_STR(calc_display(V), "0");             /* the other app never fired */
+    CHECK_EQ(gui_focused(), focus_before);       /* and focus did not move    */
+    CHECK(gui_window_close(victim) == 0);
 }
 
 /* ====================================================================== */
@@ -1732,6 +1780,98 @@ static void test_tools_without_a_framebuffer(void) {
     expect_error("gui_click", "{\"x\":1,\"y\":1}", "no window manager");
 }
 
+/* gui_click USED TO ASSERT A PRESS IT HAD NOT LANDED.
+ *
+ * It captured gui_click_at()'s return value, used it only as the trace line's
+ * number, and then unconditionally printed "clicked the button labelled X ...".
+ * So the two ways a document breaks its own layout — a widget outside the
+ * window, and a widget with no area — both produced a tool result that told the
+ * model the click happened. The model's only counter-evidence was the
+ * "window now shows:" tail, which for a button-only window reads "(no text
+ * widgets)", and the operator's only counter-evidence was a trailing "-> 0"
+ * that looks exactly like a click on a window with no handler. */
+static void test_gui_click_does_not_claim_a_press_it_did_not_land(void) {
+    fixture();
+    char in[256];
+
+    /* (a) A WIDGET OUTSIDE ITS OWN WINDOW. No hostile document is needed: this
+     *     is what an ordinary rect that is wider than the window produces. */
+    uint32_t id = gui_window_open("Oops", 100, 100, 200, 120, 0);
+    gui_window_t *W = gui_window(id);
+    CHECK(gui_add_button(W, gui_rect(10, 10, 400, 40), "Press", 1) != NULL);
+
+    snprintf(in, sizeof in, "{\"id\":%u,\"label\":\"Press\"}", (unsigned)id);
+    /* tool_dispatch() returns TOOL_OK whenever the HANDLER RAN (tool.h); the
+     * handler's own refusal is carried by is_error, which is what a caller
+     * checks. */
+    CHECK_EQ(call("gui_click", in), TOOL_OK);
+    CHECK_EQ(res.is_error, 1);
+    CHECK_CONTAINS(rbuf, "is not inside window");
+    CHECK_CONTAINS(rbuf, "Nothing was pressed");
+    CHECK_CONTAINS(rbuf, "make the window bigger");
+    CHECK_CONTAINS(kcap_text(), "off-window");
+
+    /* (b) A ZERO-AREA WIDGET. Inside the frame, so the old off-window guard
+     *     would not see it, and the press lands on the window but on no widget
+     *     at all — the trace read "-> 1" and the result claimed success. */
+    CHECK(gui_add_button(W, gui_rect(20, 60, 0, 0), "Nothing", 2) != NULL);
+    snprintf(in, sizeof in, "{\"id\":%u,\"label\":\"Nothing\"}", (unsigned)id);
+    CHECK_EQ(call("gui_click", in), TOOL_OK);
+    CHECK_EQ(res.is_error, 1);
+    CHECK_CONTAINS(rbuf, "zero area");
+    CHECK_CONTAINS(kcap_text(), "zero-area");
+
+    /* (c) A GOOD WIDGET STILL WORKS, and still says so. */
+    CHECK(gui_add_button(W, gui_rect(20, 60, 80, 24), "Fine", 3) != NULL);
+    snprintf(in, sizeof in, "{\"id\":%u,\"label\":\"Fine\"}", (unsigned)id);
+    CHECK_EQ(call("gui_click", in), TOOL_OK);
+    CHECK_EQ(res.is_error, 0);
+    CHECK_CONTAINS(rbuf, "clicked the button labelled \"Fine\"");
+    CHECK(strstr(rbuf, "NOTHING CONSUMED IT") == NULL);
+}
+
+/* A CLICK THAT DESTROYS A WINDOW MUST SAY SO, in the kernel's own line.
+ *
+ * gui_tools.c's header promises "the transcript shows which window was really
+ * closed and not which one the model said it closed". That held for
+ * gui_window action=close and not for this path — and this path is the ONLY
+ * route to a close box, because the id+x/y branch resolves client-relative
+ * coordinates through gui_widget_at() and can never reach the title bar. The
+ * whole record of closing every window the operator was using used to be
+ * "[gui_click at=390,108 -> 1]", with a result saying "a window took it" about
+ * a window that no longer existed. */
+static void test_clicking_a_close_box_is_named_in_the_trace(void) {
+    fixture();
+    uint32_t id = gui_window_open("Victim", 100, 100, 220, 140, 0);
+    gui_window_t *W = gui_window(id);
+    /* The close box, computed the way gui/wm.c's close_rect() does. */
+    int32_t cx = W->frame.x + W->frame.w - GUI_BORDER - 6 - 12 / 2;
+    int32_t cy = W->frame.y + GUI_BORDER + GUI_TITLE_H / 2;
+
+    char in[128];
+    snprintf(in, sizeof in, "{\"x\":%d,\"y\":%d}", (int)cx, (int)cy);
+    CHECK_EQ(call("gui_click", in), TOOL_OK);
+    CHECK_EQ(gui_window(id), NULL);                  /* it really is gone */
+    CHECK_CONTAINS(rbuf, "THE CLICK CLOSED IT");
+    CHECK_CONTAINS(rbuf, "Victim");
+    CHECK_CONTAINS(kcap_text(), "title=Victim");
+    CHECK_CONTAINS(kcap_text(), "CLOSED");
+
+    /* An ordinary click on a surviving window names it too, and does not
+     * claim a close. */
+    uint32_t keep = gui_window_open("Keeper", 300, 300, 200, 120, 0);
+    gui_window_t *K = gui_window(keep);
+    snprintf(in, sizeof in, "{\"x\":%d,\"y\":%d}",
+             (int)(K->frame.x + K->frame.w / 2),
+             (int)(K->frame.y + K->frame.h - 10));
+    CHECK_EQ(call("gui_click", in), TOOL_OK);
+    CHECK(gui_window(keep) != NULL);
+    CHECK_CONTAINS(rbuf, "Keeper");
+    CHECK(strstr(rbuf, "CLOSED IT") == NULL);
+    CHECK_CONTAINS(kcap_text(), "title=Keeper");
+    CHECK(strstr(kcap_text(), "CLOSED") == NULL);
+}
+
 static void test_result_buffer_is_never_overrun(void) {
     fixture();
     /* Twelve windows of 48 widgets is far more text than one result can hold.
@@ -1801,6 +1941,8 @@ int main(void) {
     RUN(test_tool_registry);
     RUN(test_tool_happy_path);
     RUN(test_tool_untrusted_input);
+    RUN(test_gui_click_does_not_claim_a_press_it_did_not_land);
+    RUN(test_clicking_a_close_box_is_named_in_the_trace);
     RUN(test_tools_without_a_framebuffer);
     RUN(test_result_buffer_is_never_overrun);
 

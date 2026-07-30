@@ -7,27 +7,27 @@
  *   again — with no C, no compiler and no reboot.
  *
  * ============================================================================
- * ONE TOOL, WITH AN `action` — AND THE REASON IS A HARD LIMIT, NOT TASTE
+ * ONE TOOL, WITH AN `action` — AND THE REASON IS A SHARED BUDGET, NOT TASTE
  * ============================================================================
- *   The assembled tool schema is a shared, EXHAUSTED resource. chat.h sets
- *   CHAT_TOOLS_BYTES to 32768 and refuses the whole array if it does not fit,
- *   which offers the model NO TOOLS AT ALL. Measured on this tree, with this file
- *   removed: 44 tools, 32330 bytes. That is 437 bytes for everything anyone adds
- *   next, and this file is what came next.
+ *   The assembled tool schema is a shared resource. chat.h sets
+ *   CHAT_TOOLS_BYTES and net/chat.c's tools_load() refuses the WHOLE array if it
+ *   does not fit, which offers the model NO TOOLS AT ALL — a total failure, so
+ *   the bound is respected rather than tested.
  *
  *   So launch / list / state / close / format are ONE tool with an `action`, the
  *   schema states no enum (the description lists the actions instead), x and y
  *   are accepted but documented in action=format's OUTPUT rather than in the
- *   schema, and the entire format specification — which is the thing a model most
- *   needs — is tool output too, because a result costs nothing from the schema
- *   budget. Cost of this file, computed by the same formula core/tool.c uses:
- *   432 bytes. It fits with FIVE BYTES to spare.
+ *   schema, and the FULL format specification is tool output too, because a
+ *   result costs nothing from the schema budget.
  *
- *   That is not a healthy state and it is not a state this file can fix from
- *   inside its own ownership: raising CHAT_TOOLS_BYTES also raises CHAT_REQ_BYTES
- *   and has to agree with net/net.c's HTTP framing buffer. It is reported rather
- *   than papered over, and tests/host/test_app.c pins the number so that a future
- *   edit to the description cannot silently push the machine over the edge.
+ *   HISTORICAL NOTE, because the old number here was quoted for a while after it
+ *   stopped being true: this comment used to say CHAT_TOOLS_BYTES was 32768 and
+ *   that the file fitted "with FIVE BYTES to spare". CHAT_TOOLS_BYTES is 40960
+ *   today. Measured on this tree the whole registry assembles to well under it
+ *   with kilobytes free, so the description below could afford to spend a few
+ *   hundred bytes buying discoverability. Do not re-derive that headroom from a
+ *   comment — tests/host/test_app.c measures the REAL assembled array and prints
+ *   both numbers.
  *
  * THE FEEDBACK LOOP IS THE PRODUCT
  *   A model gets a document wrong on the first try — a mistyped key, a widget
@@ -204,10 +204,65 @@ static void put_vars(tool_result_t *r, uint32_t id) {
  * is answered with the list of accepted keys, an unknown function with the list
  * of functions, and every bound with its number, so none of that has to be spent
  * here. */
+/* WHAT A LIVE RUN CHANGED HERE. apps/ grew round(), rand(), at() and the time
+ * leaves (now, clock, today, hour, minute, second) and NOTHING on the tool
+ * surface said so, which means the model could not have used them: it does not
+ * guess function names into a validator that rejects unknown ones. They are
+ * named in the list below, and the two idioms worth a sentence (money rounding
+ * and 0..n-1) are glossed there rather than in the description, which has to
+ * stay readable.
+ *
+ * WHAT PAID FOR THEM, and the honest cost: "(+rowspan/colspan)" came out. This
+ * text was 1005 of the 1023 usable bytes, so 60 bytes of new material had to
+ * come from somewhere. Spans are the safest thing to lose, because they are the
+ * one omission this file's own error path repairs for free: apps/runtime.c
+ * validates widget keys against a list and names every accepted key when one is
+ * unknown, so a model that reaches for a span is told it exists, whereas a
+ * function name it never sees is a function it never calls. rect:[x,y,w,h] also
+ * still covers any layout a span could express.
+ *
+ * "tick(ms 50+)" cost 16 bytes and was paid for by "round(x) nearest whole" ->
+ * "round(x) whole" (8) and by the compact spelling of the event itself. The
+ * text is measured, not estimated: tests/host/test_app.c prints its exact size
+ * and fails the suite at CHAT_TOOL_RESULT_CAP, so an edit here that overflows
+ * takes the last paragraph off the model's copy and is caught immediately.
+ *
+ * WHAT THE CAPABILITY STATEMENT COST, since this text is a zero-sum budget and
+ * the next person to add a line needs to know where the bytes came from. Adding
+ * {call,with,into} plus one clause naming what it is for spent about 70 bytes, and
+ * the spec was already 1005 of the 1023 the model ever sees. Three things paid:
+ *   - "round(x) whole; rand(n) 0..n-1; at(s,i) one char;" (48 bytes) came out. It
+ *     was DUPLICATE: the always-sent description above says "rand(n) is 0..n-1,
+ *     round(x*100)/100 is money, at(s,i) picks a character" in more words, and the
+ *     three names are still in the function list here, so nothing became
+ *     undiscoverable. This is the cheapest 48 bytes in the file for exactly that
+ *     reason — prefer duplicated bytes over unique ones when trimming.
+ *   - "title":"Counter" left the worked document (18 bytes). Also duplicated: the
+ *     description's own example carries "title":"Hi", and the key is optional, so
+ *     the document still launches — which a test proves by extracting and running
+ *     it. It is the only key in that example that is not load-bearing.
+ *   - four words of prose ("place by", "is", "gives"), which cost nothing.
+ * The full capability specification is NOT here: it is action=caps, a second page,
+ * because it needs ~800 bytes and no amount of trimming would have found those.
+ * put_caps() explains that split. tests/host/test_app.c measures this text and
+ * fails at CHAT_TOOL_RESULT_CAP, and the golden transcript in that suite pins two
+ * literal fragments of it ("Launch this document, then adapt it" and "iserr()
+ * finds it"), so an edit here is checked in three ways before it ships.
+ *
+ * "tick" IS NOW DOCUMENTED, and only because the pump exists. It was left out
+ * on purpose for as long as nothing called app_tick(): a tick handler was
+ * accepted, registered and never run, so advertising it would have made this
+ * tool lie about a window that says 0.0 s forever. kernel/main.c's
+ * wait_for_sentence() now calls app_tick() before gui_tick(), so the event is
+ * real and the line below says so. If that call is ever removed, this word
+ * comes out in the same commit - and note that removing it from here is not
+ * enough on its own, because apps/runtime.c's own rejection messages enumerate
+ * the accepted event keys, so a model that mistypes {"every":1000} is told
+ * "tick" exists whatever this text says. */
 static void put_format(tool_result_t *r) {
     tool_result_printf(r,
         "Launch this document, then adapt it:\n"
-        "{\"title\":\"Counter\",\"width\":180,\"height\":120,"
+        "{\"width\":180,\"height\":120,"
         "\"grid\":{\"rows\":2,\"cols\":1},\"vars\":{\"n\":0},"
         "\"widgets\":["
         "{\"kind\":\"field\",\"name\":\"out\",\"text\":\"0\","
@@ -218,16 +273,96 @@ static void put_format(tool_result_t *r) {
         "{\"set\":\"n\",\"to\":\"n + 1\"},"
         "{\"set\":\"out\",\"to\":\"text(n)\"}]}]}\n");
     tool_result_printf(r,
-        "kind: button label field panel; place by row/col (+rowspan/colspan) or "
-        "rect:[x,y,w,h]. name is unique and is how handlers and expressions reach "
-        "a widget; tag is shared, so one handler serves ten keys. Events: click, "
-        "submit. Statements: {set,to} {if,then,else} {stop:true}; no loops.\n"
-        "EXPRESSIONS are strings: numbers (6dp), 'quoted text', vars, a widget "
-        "name (its text), key (text of the widget that fired), + - * / %% == != "
-        "< <= > >= && || !, num text cat len digits has iserr abs min max. num(x) "
-        "reads a widget as a number, text(x) writes one back. 1/0 and overflow "
-        "give an error value: text() of it is \"error\" and iserr() finds it. "
-        "launch takes x,y too.\n");
+        "kind: button label field panel; row/col or rect:[x,y,w,h]. "
+        "name is unique and how a handler reaches it; tag is shared: "
+        "one handler serves ten keys. Events: click, submit, tick(ms 50+). "
+        "Statements: "
+        "{set,to} {if,then,else} {stop:true} {call,with,into}; no loops. "
+        "{call} asks the KERNEL for a sound: app action=caps.\n"
+        "EXPRESSIONS are strings: numbers (6dp), 'text', vars, a widget name "
+        "(its text), key (the firer's), + - * / %% == != < <= > >= && || !, "
+        "num text cat len digits has iserr abs min max round rand at. num(x) "
+        "reads a widget's number, text(x) writes back; now clock today hour "
+        "minute second are the time. 1/0 or overflow is an error: text() is "
+        "\"error\", iserr() finds it.\n");
+}
+
+/* ====================================================================== */
+/* action=caps — what a handler may ask the kernel to do                   */
+/* ====================================================================== */
+
+/* A SECOND PAGE RATHER THAN MORE OF action=format, for the reason the header
+ * gives: a tool RESULT is free and the schema is not. put_format() was already
+ * 1005 of the 1023 usable bytes, so the capability specification could not go
+ * there; what went into that text instead is the one line that says this page
+ * exists and shows the statement, because a model does not call for a page it has
+ * never heard of.
+ *
+ * THE ARGUMENT TABLE IS GENERATED, by app_cap_spec(), out of the same table
+ * apps/cap.c validates against. The bounds a model reads and the bounds that are
+ * enforced are therefore the same numbers, and a capability that gains an
+ * argument documents itself. Only the prose and the example below are written by
+ * hand — and the example is a document that provably launches (a host test runs
+ * it), because that is what a model copies.
+ *
+ * IT IS AT 994 OF THE 1023 BYTES THE MODEL SEES, with one capability in the
+ * table. So the NEXT capability does not fit, and the answer is not to trim this
+ * page again: it is to page it (action=caps with a name, or one line per
+ * capability and the arguments on request). tests/host/test_app_audio.c measures
+ * the real result through tool_dispatch() and fails at CHAT_TOOL_RESULT_CAP, so
+ * whoever adds fs.write or clock.alarm will be told this by a red test rather
+ * than by a model that read half a specification. */
+static void put_caps(tool_result_t *r) {
+    char spec[640];
+
+    tool_result_printf(r,
+        "A handler can ask the KERNEL for hardware. This launches and beeps:\n"
+        "{\"grid\":{\"rows\":2,\"cols\":1},"
+        "\"widgets\":[{\"kind\":\"label\",\"name\":\"s\",\"text\":\"-\","
+        "\"row\":0,\"col\":0},"
+        "{\"kind\":\"button\",\"text\":\"beep\",\"name\":\"b\",\"row\":1,"
+        "\"col\":0}],"
+        "\"on\":[{\"click\":\"b\",\"do\":[{\"call\":\"audio.tone\","
+        "\"with\":{\"hz\":\"440\"},\"into\":\"s\"}]}]}\n");
+    tool_result_printf(r,
+        "Each \"with\" value is an expression string like a \"to\": \"440\" or "
+        "\"num(key)\" (the button's text). Optional \"into\" is a var or widget "
+        "that gets \"ok\" when it really played, or why not.\n");
+    app_cap_spec(spec, sizeof spec);
+    tool_result_printf(r, "%s", spec);
+}
+
+/* ====================================================================== */
+/* the retry skeleton — what makes ATTEMPT TWO land                        */
+/* ====================================================================== */
+
+/* THE TWO-STEP DANCE IS A TRAP, SO IT IS NOT REQUIRED.
+ *   action=format used to be the only place the format existed, which meant a
+ *   model had to know it needed the spec BEFORE it could want it. Under any
+ *   pressure it skips that call, guesses, fails, and then has one error line to
+ *   guess again from. So every rejection carries a document that provably
+ *   launches, plus the handful of rules a first guess actually gets wrong
+ *   (which kinds exist, that placement is mandatory, that a handler may only
+ *   name widgets or vars that were declared).
+ *
+ *   IT IS DELIBERATELY NOT put_format(). That text is 1005 bytes and
+ *   CHAT_TOOL_RESULT_CAP is 1024, so appending it to an error would clip the
+ *   error, the spec, or both — and a spec that stops mid-sentence is worse than
+ *   a terse one that finishes (see put_format). This is the compact form, sized
+ *   so that even a maximum-length app_error_t (72-byte path + 224-byte msg)
+ *   leaves it intact; tests/host/test_app.c pins that worst case. */
+static void put_retry(tool_result_t *r) {
+    tool_result_printf(r,
+        "This document DOES launch - copy it and adapt:\n"
+        "{\"title\":\"Hi\",\"width\":200,\"height\":90,"
+        "\"grid\":{\"rows\":1,\"cols\":1},\"widgets\":[{\"kind\":\"label\","
+        "\"text\":\"hello\",\"row\":0,\"col\":0}]}\n");
+    tool_result_printf(r,
+        "Rules a first guess usually misses: kind is label, button, field or "
+        "panel; every widget needs row+col (or rect:[x,y,w,h]); each name is "
+        "unique; a handler in \"on\" may only name a widget or a var you "
+        "declared. Fix the one thing above and call app action=launch again "
+        "with the whole corrected document. Full spec: app action=format.\n");
 }
 
 /* ====================================================================== */
@@ -250,11 +385,13 @@ static int do_launch(const json_value_t *in, tool_result_t *r) {
                     "\"x\" and \"y\" must be whole numbers of pixels within "
                     "+/-%d when present", COORD_LIMIT);
 
-    if (json_get(in, "document", &doc) != JSON_OK)
-        return fail(r, TOOL_EINVAL, "action=launch",
-                    "\"document\" is required: the app document itself, as a "
-                    "JSON object. Call action=format for the format and a worked "
-                    "example");
+    if (json_get(in, "document", &doc) != JSON_OK) {
+        int e = fail(r, TOOL_EINVAL, "action=launch",
+                     "\"document\" is required: the app document itself, as a "
+                     "JSON object");
+        put_retry(r);
+        return e;
+    }
 
     const char *text = (const char *)0;
     size_t      len  = 0;
@@ -279,10 +416,12 @@ static int do_launch(const json_value_t *in, tool_result_t *r) {
         text = doc_buf;
         len  = n;
     } else {
-        return fail(r, TOOL_EINVAL, "action=launch",
-                    "\"document\" must be a JSON object (preferred), or a string "
-                    "containing the document's JSON - not a number, an array or "
-                    "a boolean");
+        int e = fail(r, TOOL_EINVAL, "action=launch",
+                     "\"document\" must be a JSON object (preferred), or a string "
+                     "containing the document's JSON - not a number, an array or "
+                     "a boolean");
+        put_retry(r);
+        return e;
     }
 
     uint32_t    id = 0;
@@ -304,8 +443,7 @@ static int do_launch(const json_value_t *in, tool_result_t *r) {
                               "repair.\n");
         if (e.path[0]) tool_result_printf(r, "where: %s\n", e.path);
         tool_result_printf(r, "problem: %s\n", e.msg);
-        tool_result_printf(r, "Fix that one thing and call app action=launch "
-                              "again with the whole corrected document.\n");
+        put_retry(r);
         trace_err(rc, "app", "%s", args);
         return rc == APP_ENOSPC ? TOOL_ENOSPC : TOOL_EINVAL;
     }
@@ -322,9 +460,18 @@ static int do_launch(const json_value_t *in, tool_result_t *r) {
     put_vars(r, id);
     put_widgets(r, id, "");
 
+    /* GEOMETRY BELONGS IN THE TRACE LINE, NOT ONLY IN THE MODEL'S RESULT.
+     * This is the one tool that can put a 1024x768 window at 0,0 - which covers
+     * the console, the banner, the prompt and every line above it - and its
+     * ground truth used to read exactly like a 200x90 hello window. gui_open,
+     * which can only open two fixed-size demos, has printed at=/size= all along.
+     * The values are free: `w` is dereferenced three lines up. Appended AFTER
+     * the existing fields on purpose - tests/host/test_app.c pins the prefix. */
     trace_ret((long)id, "app", "action=launch title=%s widgets=%d vars=%d "
-                               "bytes=%d",
-              app_title(id), (int)w->nwidgets, app_var_count(id), (int)len);
+                               "bytes=%d at=%d,%d size=%dx%d",
+              app_title(id), (int)w->nwidgets, app_var_count(id), (int)len,
+              (int)w->frame.x, (int)w->frame.y,
+              (int)w->frame.w, (int)w->frame.h);
     return TOOL_OK;
 }
 
@@ -344,14 +491,22 @@ static int t_app(const tool_call_t *c, tool_result_t *r) {
     int arc = f_str(&in, "action", act, sizeof act);
     if (arc <= 0)
         return fail(r, TOOL_EINVAL, "",
-                    "\"action\" is required: format, launch, list, state or "
-                    "close");
+                    "\"action\" is required: format, caps, launch, list, state "
+                    "or close");
 
     /* format needs no window manager: a model may read the spec on a machine
      * that cannot draw, and then be told why launching is impossible. */
     if (streq(act, "format")) {
         put_format(r);
         trace_ok("app", "%s", "action=format");
+        return TOOL_OK;
+    }
+
+    /* Like format, this needs no window manager: what a handler may ask the
+     * kernel for is worth knowing on a machine that cannot draw. */
+    if (streq(act, "caps")) {
+        put_caps(r);
+        trace_ok("app", "%s", "action=caps");
         return TOOL_OK;
     }
 
@@ -397,7 +552,9 @@ static int t_app(const tool_call_t *c, tool_result_t *r) {
     if (!streq(act, "state") && !streq(act, "close"))
         return fail(r, TOOL_EINVAL, args,
                     "unknown action \"%s\". Valid: format (the document format "
-                    "and a worked example), launch, list, state, close", act);
+                    "and a worked example), caps (what a handler may ask the "
+                    "kernel to do, e.g. play a sound), launch, list, state, "
+                    "close", act);
 
     if (has_id != 1) {
         r->is_error = 1;
@@ -451,16 +608,58 @@ static int t_app(const tool_call_t *c, tool_result_t *r) {
     return TOOL_OK;
 }
 
-/* EVERY BYTE OF THE TWO STRINGS BELOW IS SPENT FROM A SHARED BUDGET THAT HAS 5
- * BYTES LEFT. Read the header before editing them, and re-run
- * tests/host/test_app.c's test_schema_cost(), which fails if this grows. */
+/* THE TWO STRINGS BELOW ARE SPENT FROM A SHARED BUDGET. Read the header before
+ * editing them, and re-run tests/host/test_app.c's
+ * test_tool_registry_and_schema_cost(), which measures the REAL assembled array
+ * and fails if the headroom against CHAT_TOOLS_BYTES gets thin.
+ *
+ * "THE THREE MISTAKES THAT COST A ROUND" IS NOT PADDING - IT IS THE CHEAPEST
+ * BYTES IN THIS FILE. Two live sessions were transcribed while a real model
+ * authored a calculator and a stopwatch, and it made the same three format
+ * errors both times: handlers written inside the widget instead of in a
+ * top-level "on"; "span" instead of rowspan/colspan; and a C ternary inside an
+ * expression. Each one is recoverable - apps/runtime.c names the exact path and
+ * the accepted keys, and the model fixed every one on the next round - but a
+ * retry is not free: the rejected document stays in the conversation, so five
+ * attempts at a 2-4 KiB calculator exhausted CHAT_HISTORY_BYTES and the turn
+ * died with nothing on screen ("[chat: no room left to remember this turn]").
+ * Forty bytes of warning here is worth ~10 KiB of history and two paid rounds,
+ * and it is spent from schema headroom that has 6 KiB spare. If you find a
+ * fourth mistake in a transcript, put it here rather than in action=format:
+ * these bytes are read before the first attempt, and that text is not. */
 static const tool_t app_tool = {
     .name = "app",
     .description =
-        "Author and run a graphical app from a JSON document you write: this is "
-        "how \"I want a calculator\" becomes a real, clickable window. action: "
-        "format (the format and a worked example - read it first), launch (with "
-        "document), list, state (with id), close.",
+        "Build a graphical app from a JSON document you write and run it in a "
+        "real window. THIS IS THE ANSWER TO \"I want <anything>\" - a "
+        "stopwatch, a tip calculator, a window that only says hello: you author "
+        "it, so never tell the operator this machine has no such app (gui_open's "
+        "two demos are not the limit). action=launch with document, e.g. "
+        "{\"title\":\"Hi\",\"width\":200,\"height\":90,"
+        "\"grid\":{\"rows\":1,\"cols\":1},\"widgets\":[{\"kind\":\"label\","
+        "\"text\":\"hello\",\"row\":0,\"col\":0}]} - that document works as-is. "
+        "kind: label button field panel, each with row+col; add "
+        "\"vars\" and \"on\":[{\"click\":\"<widget name>\",\"do\":[{\"set\":\"<name>\","
+        "\"to\":\"<expression>\"}]}] for behaviour. Expressions also do chance "
+        "and time: rand(n) is 0..n-1, round(x*100)/100 is money, at(s,i) picks "
+        "a character, now is seconds since boot, and clock/today/hour/minute/"
+        "second read the time. APPS CAN RUN ON THEIR OWN: a handler written "
+        "{\"tick\":1000,\"do\":[...]} fires every 1000 ms with no click, so a "
+        "clock, a stopwatch or a countdown really do keep moving - do not offer "
+        "a Refresh button instead. AND THEY CAN REACH HARDWARE: a do statement "
+        "{\"call\":\"audio.tone\",\"with\":{\"hz\":\"440\"}} really makes a "
+        "sound (app action=caps for the bounds). Send it compact: a reply past "
+        "the output "
+        "limit loses the arguments. MISTAKES THAT COST A ROUND, seen live: "
+        "on is top-level, never inside a widget; click matches a widget's name "
+        "or shared tag, NEVER its visible text, so name every button a handler "
+        "fires; every to is a STRING holding an expression, with no ?: and no "
+        "if-object in it, because {if,then,else} is a statement in do; widen a "
+        "cell with rowspan/colspan, not span; at most 16 handlers, so give a "
+        "keypad one tag and branch on key. Otherwise guessing is safe: a "
+        "rejection names the exact fault and carries a working skeleton, so "
+        "attempt two lands. action=format is the full spec. "
+        "Also list, state (id), close (id).",
     .input_schema =
         "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\"},"
         "\"document\":{\"type\":\"object\"},\"id\":{\"type\":\"integer\"}},"

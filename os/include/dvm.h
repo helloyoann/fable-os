@@ -34,10 +34,55 @@
  *   Two flags, set by CMP and TEST, read by the six conditional branches.
  *   Comparisons are UNSIGNED: these are hardware values, not arithmetic.
  *
- *   No writable data memory. Device registers are the only mutable state a
- *   driver program needs, and leaving out a heap removes an entire class of
- *   containment problem. Registers plus the stack have been enough for every
- *   bring-up sequence this ISA was designed against.
+ *   No general writable data memory. Device registers, the stack, and ONE
+ *   caller-granted DMA scratch buffer (below) are the only mutable state a
+ *   driver program has. Leaving out a heap removes an entire class of
+ *   containment problem.
+ *
+ * THE DMA SCRATCH BUFFER — the one memory grant, and what it really costs
+ *   A driver that only pokes registers can reset a codec. It can never play a
+ *   sound, because every DMA engine on the machine is told where to work by
+ *   being handed a PHYSICAL ADDRESS, and a machine with no memory has no
+ *   address to give. So the VM has exactly one memory region:
+ *
+ *       dvm_dma_region()          -> the arena this module owns, once, forever
+ *       dvm_policy_allow_dma()    -> grant all or part of it to one run
+ *       on entry: DVM_ARG_DMA_BASE and DVM_ARG_DMA_SIZE hold base and bytes
+ *       ld8/ld16/ld32, st8/st16/st32 reach it, exactly as they reach MMIO
+ *
+ *   The arena is a single static, page-aligned DVM_DMA_SIZE-byte array inside
+ *   vm/dvm.c. It is not the heap, not the stack, and not part of any other
+ *   subsystem's memory; the low 4 GiB is identity-mapped, so its virtual
+ *   address IS its physical address and a 32-bit bus master can reach it.
+ *   dvm_policy_allow_dma() refuses any range that is not a subrange of THAT
+ *   array — the caller supplies no address of its own, so a caller bug cannot
+ *   open a window on kernel memory either. Accesses to it are bounds-checked,
+ *   alignment-checked and counted against their own budget (max_dma_ops), kept
+ *   separate from max_io so that filling a second of PCM does not consume the
+ *   device-access budget a bring-up needs.
+ *
+ *   THE HONEST PART. This is a real escalation of privilege and there is no
+ *   point pretending otherwise. The VM bounds what the PROGRAM touches. It
+ *   cannot bound what the HARDWARE does once the program has written an address
+ *   into a device's DMA register. There is no IOMMU on this machine. A device
+ *   handed a wrong physical address will DMA over kernel memory, and no
+ *   instruction check anywhere in this file can see it happen.
+ *
+ *   What is actually mitigated:
+ *     - only the ONE named target gets PCI bus mastering, and the C dispatcher
+ *       (tools/dvm_tools.c) sets that bit, not the program: there is still no
+ *       config-space WRITE in the ISA;
+ *     - the program is told exactly one valid buffer address and one size;
+ *     - the arena is its own object, far from the heap's live blocks, so a
+ *       device that overruns the buffer by a little damages only scratch;
+ *     - every value the program writes into a device register appears in the
+ *       access log, so the address it handed the device is on the record.
+ *
+ *   What is NOT mitigated: a determined program can compute any 32-bit number
+ *   and write it into a device's descriptor-base register. Nothing here stops
+ *   it. That is the same trust every real kernel extends to a driver it loads,
+ *   and it is the reason the buffer is granted per-run by a C caller that names
+ *   the device, rather than being a standing capability.
  *
  * THE INSTRUCTION SET (assembler syntax; `a`/`b` are register-or-immediate)
  *
@@ -59,8 +104,8 @@
  *   port I/O    out8/out16/out32 port, a
  *               in8/in16/in32   rd, port
  *
- *   MMIO        ld8/ld16/ld32 rd, [base+disp]
- *               st8/st16/st32 [base+disp], a
+ *   MMIO +      ld8/ld16/ld32 rd, [base+disp]
+ *   DMA buffer  st8/st16/st32 [base+disp], a
  *
  *   PCI         pcicfg rd, bdf, off      one 32-bit config-space READ
  *
@@ -94,6 +139,7 @@
  *       dvm_policy_allow_ports(&pol, 0xC000, 0xC03F);          // this BAR only
  *       dvm_policy_allow_mmio (&pol, 0xFEBC0000, 0x20000, DVM_MMIO_RW);
  *       dvm_policy_allow_pci  (&pol, 0, 4, 0);                 // one function
+ *       dvm_policy_allow_dma  (&pol, dma_base, dma_size);      // the scratch arena
  *
  *   On top of the allowlist there is a DENY list compiled into vm/dvm.c that no
  *   caller can override: the PICs, the PIT (millis() is calibrated against it),
@@ -111,10 +157,17 @@
  *   again on every access, so a bug in policy validation cannot become a poke at
  *   the PIC.
  *
+ *   The DMA arena is the ONE exception to "all memory below the kernel top is
+ *   denied", and it is not a hole in that rule so much as a different object:
+ *   the address is not supplied by the caller at all. dvm_policy_allow_dma()
+ *   compares the request against this module's own static array and refuses
+ *   anything else, so the only way to widen the grant is to edit vm/dvm.c.
+ *
  *   Everything else is a budget, all of them enforced per run:
  *     max_steps      instructions executed  (this is the cycle limit; a program
  *                    that loops forever stops here with DVM_TRAP_STEPS)
- *     max_io         port + MMIO + PCI accesses
+ *     max_io         port + MMIO + PCI accesses (NOT DMA-buffer accesses)
+ *     max_dma_ops    ld/st into the DMA scratch buffer
  *     max_delay_us   cumulative microseconds spent in DELAY
  *     max_single_delay_us  the largest one DELAY may request
  *     max_prints     PRINT lines
@@ -146,6 +199,8 @@
  *   dvm_disasm()            one instruction back to text, for listings
  *   dvm_policy_init()       deny-all policy + default budgets
  *   dvm_policy_allow_*()    open one port range / MMIO window / PCI function
+ *   dvm_dma_region()        the one DMA scratch arena this module owns
+ *   dvm_policy_allow_dma()  grant all or part of it to one run
  *   dvm_run()               execute; returns dvm_status_t, fills dvm_result_t
  *   dvm_status_name()       symbolic status for a message or a trace line
  *   dvm_io_hardware()       the real-hardware backend (NULL on a host build)
@@ -157,6 +212,10 @@
  *   a host against a synthetic device (tests/host/test_dvm.c).
  *
  * SIZE NOTE
+ *   The DMA arena adds DVM_DMA_SIZE bytes of .bss to any kernel that links this
+ *   file. It is static and always present, because a buffer that is sometimes
+ *   there is a buffer no program can rely on.
+ *
  *   dvm_program_t is ~12 KB (256 instructions plus the label and string tables).
  *   The kernel stack is 64 KiB and shared with lwIP and mbedTLS — make one
  *   static or kmalloc it, do not put it on the stack. dvm_policy_t (~300 bytes)
@@ -175,7 +234,17 @@
  *     opt-in flag with its own trace line, not a hole in the table.
  *   - Writes to PCI config space are absent for the same reason dev_tools.c
  *     refuses them; if they are ever added they belong behind a per-offset
- *     allowlist plus a restore path, as a new opcode with its own budget.
+ *     allowlist plus a restore path, as a new opcode with its own budget. The
+ *     ONE config write a DMA driver needs — the bus-master bit — is done by the
+ *     C dispatcher instead (tools/dvm_tools.c), which is why the ISA still has
+ *     no way to move a live BAR.
+ *   - An IOMMU (VT-d) is the only thing that would turn the DMA grant from
+ *     trust into containment: a domain whose only mapping is the arena would
+ *     make a wrong descriptor address a fault instead of corruption. Until then
+ *     the honest description of the DMA path is "trusted driver", not "sandbox".
+ *   - A second concurrent grant (two devices DMAing out of disjoint halves of
+ *     the arena) needs the policy to carry a list rather than one range. The
+ *     single-range shape is deliberate while exactly one program runs at a time.
  */
 #ifndef DVM_H
 #define DVM_H
@@ -196,6 +265,52 @@
 #define DVM_DSTACK           32     /* push/pop depth                         */
 #define DVM_CSTACK           16     /* call/ret depth                         */
 #define DVM_MSG_MAX          192    /* result / assembler message buffer      */
+
+/* ---- the DMA scratch arena ----
+ *
+ * SIZE. 48 kHz stereo 16-bit PCM — the format every PC audio codec since AC'97
+ * accepts without resampling — costs 48000 * 2 channels * 2 bytes = 187.5 KiB
+ * per second. 256 KiB is the next power of two above that: it holds 1.09 s of
+ * audio, which is long enough that a human hears a TONE rather than a click and
+ * long enough that a polled kernel can watch a position counter advance, and it
+ * still leaves ~68 KiB for whatever descriptor list, ring or command buffer the
+ * device wants alongside the samples. A power of two also means any aligned
+ * sub-buffer a program carves out of it stays inside it.
+ *
+ * ALIGNMENT. 4096 bytes. Alignment is not cosmetic to a DMA engine: hardware
+ * commonly ignores the low bits of a descriptor-base register instead of
+ * faulting on them, so an under-aligned buffer does not produce an error, it
+ * produces DMA at a *different address* — which on this machine means DMA into
+ * whatever is below the buffer. One page is the strongest alignment a PCI
+ * function's base-address register is architecturally permitted to require, and
+ * it is a multiple of every weaker one that real audio hardware asks for (8 for
+ * an AC'97 buffer-descriptor list, 128 for an HD Audio BDL/CORB/RIRB, 64 for a
+ * cache line, 32 for a scatter-gather entry). Being page-aligned also means the
+ * arena's physical address has 12 zero low bits, so a device that truncates the
+ * address it is given still lands on the buffer's start. */
+#define DVM_DMA_SIZE         0x40000ull   /* 256 KiB: 1.09 s of 48k/16/stereo  */
+#define DVM_DMA_ALIGN        4096u        /* one page; see above              */
+
+/* Poison either side of the arena, so that a DEVICE writing past the end of the
+ * buffer is a reported fact instead of silent corruption of whatever .bss object
+ * the linker put next. See dvm_dma_check(). This is the exact extent of the only
+ * DMA-bounds check that exists on a machine with no IOMMU: an overrun bigger than
+ * this, or a completely wrong address, is not caught by anything. */
+#define DVM_DMA_GUARD        0x10000ull   /* 64 KiB */
+
+/* ---- the entry argument vector ----
+ *
+ * dvm_run() preloads r0..r(nargs-1) from `args`, so the meaning of a register on
+ * entry is a convention between a caller and the program it runs. This is the
+ * convention tools/dvm_tools.c uses and driver_run's description publishes, and
+ * it is spelled out here so the two cannot drift apart. A caller with a
+ * different contract (vm/programs/ac97_boot.c has one) just passes its own
+ * vector; these constants oblige nobody. */
+#define DVM_ARG_BAR0         0            /* r0..r5: the target's BAR bases   */
+#define DVM_ARG_BDF          6            /* r6: bus<<8 | dev<<3 | fn         */
+#define DVM_ARG_DMA_BASE     7            /* r7: DMA buffer physical address  */
+#define DVM_ARG_DMA_SIZE     8            /* r8: its size in bytes            */
+#define DVM_NARGS            9
 
 /* ---- policy table sizes (inline, so a policy has no lifetime problem) ---- */
 #define DVM_MAX_PORT_RANGES  8
@@ -224,6 +339,7 @@ typedef enum {
     DVM_TRAP_BADOP,           /* corrupt program: unknown opcode/operand     */
     DVM_TRAP_NOIO,            /* backend has no hook for this access class   */
     DVM_TRAP_POLICY,          /* the caller's policy is itself invalid       */
+    DVM_TRAP_DMA_BUDGET,      /* too many ld/st into the DMA scratch buffer  */
     DVM_STATUS__COUNT
 } dvm_status_t;
 
@@ -359,8 +475,16 @@ typedef struct {
     dvm_pci_fn_t     pci[DVM_MAX_PCI_FNS];
     int              npci;
 
+    /* The DMA scratch grant. 0/0 means "this program has no memory", which is
+     * what dvm_policy_init() leaves behind and what every caller that does not
+     * need DMA should keep. Only dvm_policy_allow_dma() should set these: it is
+     * the function that checks the range against the arena. */
+    uint64_t         dma_base;
+    uint64_t         dma_size;
+
     uint64_t         max_steps;
     uint64_t         max_io;
+    uint64_t         max_dma_ops;
     uint64_t         max_delay_us;
     uint32_t         max_single_delay_us;
     uint32_t         max_prints;
@@ -368,9 +492,10 @@ typedef struct {
     dvm_trace_t      trace;
 } dvm_policy_t;
 
-/* Deny everything, with the default budgets:
- *   max_steps 100000, max_io 4096, max_delay_us 200000 (200 ms),
- *   max_single_delay_us 50000, max_prints 64, max_trace 512, trace = IO. */
+/* Deny everything — including the DMA buffer — with the default budgets:
+ *   max_steps 100000, max_io 4096, max_dma_ops 131072, max_delay_us 200000
+ *   (200 ms), max_single_delay_us 50000, max_prints 64, max_trace 512,
+ *   trace = IO. */
 void dvm_policy_init(dvm_policy_t *p);
 
 /* Open one window. Return 0, or -1 if the table is full or the request is
@@ -381,6 +506,42 @@ int dvm_policy_allow_ports(dvm_policy_t *p, uint16_t lo, uint16_t hi);
 int dvm_policy_allow_mmio (dvm_policy_t *p, uint64_t base, uint64_t size,
                            uint32_t flags);
 int dvm_policy_allow_pci  (dvm_policy_t *p, uint8_t bus, uint8_t dev, uint8_t fn);
+
+/* The single DMA scratch arena this module owns: a static, DVM_DMA_ALIGN-aligned
+ * DVM_DMA_SIZE-byte array. `base` is its address, which on this kernel is also
+ * its physical address (the low 4 GiB is identity-mapped by boot/boot.asm), so
+ * it is what a 32-bit bus master must be given. Either pointer may be NULL.
+ *
+ * The same call works on a host test build, where the "physical" address is just
+ * the array's address in the test process and a store through the VM is a store
+ * the test can read back. That is deliberate: it makes the buffer path the same
+ * code on both, so a host test proves the real one. */
+void dvm_dma_region(uint64_t *base, uint64_t *size);
+
+/* Grant [base, base+size) of the DMA arena to a run. Returns 0, or -1 — leaving
+ * the policy UNCHANGED — if the request is empty, wraps, or is not entirely
+ * inside dvm_dma_region(). That last check is the point: the caller does not get
+ * to name a location, only a subrange of one address this module published, so a
+ * miscomputed base in a caller cannot become a write into the heap.
+ *
+ * Once granted, ld8/ld16/ld32 and st8/st16/st32 reach the range with the same
+ * bounds and alignment rules as MMIO, and each access is counted against
+ * max_dma_ops rather than max_io. THE GRANT IS ALSO WHAT MAKES DEVICE DMA
+ * POSSIBLE, and the VM cannot police that half — see the header comment. */
+int dvm_policy_allow_dma  (dvm_policy_t *p, uint64_t base, uint64_t size);
+
+/* Did a DEVICE write outside the arena? The arena is embedded in a larger block
+ * with 64 KiB of poison either side, re-armed by every dvm_run() that carries a
+ * DMA grant. Returns 0 if both guard bands are intact, or 1 with a sentence in
+ * `msg` naming the direction and the byte offset — then re-arms, so one accident
+ * is reported once instead of for ever.
+ *
+ * Call it AFTER dvm_run(). This is the only mechanism on this machine that
+ * notices a bad DMA address at all, and it only notices near misses: an overrun
+ * of up to 64 KiB, or an underrun of the same. A device pointed somewhere else
+ * entirely corrupts that somewhere else silently. Do not read a clean result as
+ * "the DMA was correct"; read it as "it was not wrong in the usual way". */
+int dvm_dma_check(char *msg, size_t cap);
 
 /* Validate a policy against the compiled-in deny list and the structural rules.
  * dvm_run() does this before executing anything; exposed so a caller (or a tool)
@@ -426,6 +587,9 @@ typedef struct {
     uint32_t     n_port_rd, n_port_wr;
     uint32_t     n_mmio_rd, n_mmio_wr;
     uint32_t     n_pci_rd;
+    /* ld/st into the DMA scratch buffer. Their SUM is what max_dma_ops bounds;
+     * there is no third counter, so the budget and the report cannot disagree. */
+    uint32_t     n_dma_rd, n_dma_wr;
     uint32_t     trace_lines;
     uint32_t     trace_dropped;
     uint64_t     reg[DVM_NREGS];   /* final register file — the program's output */
@@ -433,8 +597,9 @@ typedef struct {
 } dvm_result_t;
 
 /* Run `p` under `pol` against `io`. r0..r(nargs-1) are preloaded from `args`
- * (pass NULL/0 for none); the rest start at zero. `res` must be non-NULL and is
- * always fully populated, including on refusal. Returns res->status.
+ * (pass NULL/0 for none); the rest start at zero. See DVM_ARG_* for the
+ * convention tools/dvm_tools.c uses. `res` must be non-NULL and is always fully
+ * populated, including on refusal. Returns res->status.
  *
  * The program cannot outlive this call: there is no yielding, no callback into
  * model code, and no state kept between runs. */

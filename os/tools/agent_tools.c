@@ -105,6 +105,8 @@
 #include "json.h"
 #include "chat.h"
 #include "kernel.h"
+#include "gui.h"        /* gui_tick: keep the compositor alive during a wait  */
+#include "app.h"        /* app_tick: and the periodic handlers of live apps   */
 
 #include <stdint.h>
 #include <stddef.h>
@@ -684,8 +686,39 @@ static int t_wait_ms(const tool_call_t *c, tool_result_t *r) {
                     "again if it really needs longer.",
                     left, (unsigned)WAIT_MS_PER_TURN, wait_spent);
 
+    /* WAIT, BUT KEEP THE MACHINE ALIVE WHILE WAITING.
+     *
+     * A flat mdelay() is a stopped world, and that turned out to matter the
+     * first time a model used this tool to CHECK ITS OWN WORK. The system
+     * prompt tells it to read every change back, so it launched a clock with a
+     * periodic handler, called wait_ms(1500), read the app's state — and found
+     * the clock frozen, because app_tick() is driven from the loop that waits
+     * for the operator's next sentence and that loop is not running inside a
+     * turn. The kernel's own verification path was reporting a working app as
+     * broken, and the model (correctly, on that evidence) started rebuilding
+     * it. Waiting is the one place in a turn where time is deliberately being
+     * spent, so it is exactly where periodic work belongs.
+     *
+     * Pumped in WAIT_SLICE_MS slices. app_tick() returns immediately when no
+     * app is periodic, gui_tick() when no window is open (gui.h), and both are
+     * bounded — so this stays a bounded wait, and the elapsed time is still
+     * MEASURED below rather than assumed.
+     *
+     * THE LOOP COUNTS SLICES, IT DOES NOT WATCH THE CLOCK. `while (millis() <
+     * deadline)` reads better and is wrong here: on the host mdelay() is a
+     * no-op shim while millis() is a real monotonic clock, so that spelling
+     * turns every wait_ms in the test suite into a real busy-spin — it added
+     * six seconds to `make test-host` for no coverage. A fixed slice count runs
+     * ms/WAIT_SLICE_MS iterations either way: the full wait on hardware, and
+     * the same number of app_tick() calls, instantly, on the host. */
+#define WAIT_SLICE_MS 10
     uint64_t before = millis();
-    mdelay((uint32_t)ms);
+    for (uint32_t done = 0; done < (uint32_t)ms; done += WAIT_SLICE_MS) {
+        (void)app_tick();
+        gui_tick();
+        uint32_t slice = (uint32_t)ms - done;
+        mdelay(slice > WAIT_SLICE_MS ? WAIT_SLICE_MS : slice);
+    }
     uint64_t after = millis();
 
     wait_spent += (unsigned)ms;

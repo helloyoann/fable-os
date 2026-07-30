@@ -1347,6 +1347,390 @@ static void test_no_backend(void) {
     }
 }
 
+/* ====================================================================== */
+/* the DMA scratch buffer                                                 */
+/* ====================================================================== */
+
+/* WHAT THESE PROVE
+ *   The buffer is the VM's one memory grant and the one thing that makes DMA
+ *   possible at all, so the claims made about it in include/dvm.h are checked
+ *   mechanically rather than believed:
+ *
+ *     - dvm_dma_region() reports a 256 KiB, page-aligned, low-4-GiB region;
+ *     - a grant may only ever name a subrange of THAT region, whatever a caller
+ *       passes, and a hand-built policy is re-checked at run time;
+ *     - a program's st really changes those bytes, verified by reading them back
+ *       through a plain pointer at the address dvm_dma_region() reported. That
+ *       is "the buffer is where you say it is", proved rather than asserted;
+ *     - the bounds, alignment and budget rules bite, and a buffer access costs
+ *       nothing from the DEVICE access budget;
+ *     - the guard band notices a write past the end, which is the only warning
+ *       this machine can give about a bad DMA address. */
+
+static uint64_t dma_base_of(void) {
+    uint64_t b = 0;
+    dvm_dma_region(&b, NULL);
+    return b;
+}
+
+static void dma_policy(void) {
+    std_policy();
+    uint64_t b = 0, n = 0;
+    dvm_dma_region(&b, &n);
+    CHECK_EQ(dvm_policy_allow_dma(&POL, b, n), 0);
+}
+
+/* Before any run has carried a DMA grant the guard band has never been poisoned,
+ * and .bss zeros are not the poison value. A naive check would read that as a
+ * 65536-byte overrun on a machine where no DMA has ever been possible. MUST run
+ * before every other DMA test, which is why it is first in main(). */
+static void test_dma_check_before_any_run(void) {
+    char msg[DVM_MSG_MAX];
+    msg[0] = 'x';
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 0);
+    CHECK_EQ((int)msg[0], 0);
+}
+
+static void test_dma_region_shape(void) {
+    uint64_t b = 0, n = 0;
+    dvm_dma_region(&b, &n);
+
+    CHECK(b != 0);
+    CHECK_EQ((int)n, (int)DVM_DMA_SIZE);
+    CHECK_EQ((int)(n / 1024), 256);                       /* 256 KiB */
+    CHECK_EQ((int)(b % DVM_DMA_ALIGN), 0);                /* page aligned */
+    CHECK_EQ((int)DVM_DMA_ALIGN, 4096);
+    /* NOT checkable here: that the arena is below 4 GiB. On the host it is an
+     * array in a 64-bit test process and its address means nothing to hardware.
+     * On the kernel it follows from being .bss in an image linked at 1 MiB, and
+     * dvm_policy_check() refuses every grant if it ever stops being true, which
+     * is the assertion that survives into the real build. */
+
+    /* Long enough for a second of 48 kHz stereo 16-bit PCM, which is the size
+     * argument in the header, with room left for a descriptor list. */
+    CHECK(n >= 48000ull * 2 * 2);
+    CHECK(n - 48000ull * 2 * 2 >= 32768ull);
+
+    /* Stable: a program that failed can be retried against the same address. */
+    uint64_t b2 = 0, n2 = 0;
+    dvm_dma_region(&b2, &n2);
+    CHECK_EQ((int)(b2 == b), 1);
+    CHECK_EQ((int)(n2 == n), 1);
+
+    /* Both pointers are optional. */
+    dvm_dma_region(NULL, NULL);
+    dvm_dma_region(&b2, NULL);
+    CHECK_EQ((int)(b2 == b), 1);
+}
+
+/* The grant may only ever be a subrange of the arena. This is the check that
+ * stops a caller's miscomputed base becoming a window on the heap. */
+static void test_dma_grant_is_bounded_to_the_arena(void) {
+    uint64_t b = 0, n = 0;
+    dvm_dma_region(&b, &n);
+
+    dvm_policy_init(&POL);
+    CHECK_EQ(dvm_policy_allow_dma(&POL, b, n), 0);              /* all of it */
+    CHECK_EQ((int)(POL.dma_base == b), 1);
+    CHECK_EQ((int)(POL.dma_size == n), 1);
+
+    dvm_policy_init(&POL);
+    CHECK_EQ(dvm_policy_allow_dma(&POL, b + 4096, 4096), 0);    /* part of it */
+    CHECK_EQ((int)(POL.dma_base == b + 4096), 1);
+
+    /* Everything else is refused, and a refusal leaves the policy alone. */
+    static const struct { long off; long size; const char *why; } bad[] = {
+        {  0,        0, "zero size"                    },
+        { -1,        1, "one byte below the arena"      },
+        { -4096,  8192, "straddles the low edge"        },
+        {  0,       -1, "size wraps"                    },
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        dvm_policy_init(&POL);
+        CHECK_EQ(dvm_policy_allow_dma(&POL, b + (uint64_t)bad[i].off,
+                                      (uint64_t)bad[i].size), -1);
+        CHECK_EQ((int)POL.dma_base, 0);
+        CHECK_EQ((int)POL.dma_size, 0);
+    }
+    /* One byte past the end. */
+    dvm_policy_init(&POL);
+    CHECK_EQ(dvm_policy_allow_dma(&POL, b, n + 1), -1);
+    CHECK_EQ(dvm_policy_allow_dma(&POL, b + n, 1), -1);
+    /* Somewhere else entirely: kernel memory, and the framebuffer. */
+    CHECK_EQ(dvm_policy_allow_dma(&POL, 0x1000, 0x1000), -1);
+    CHECK_EQ(dvm_policy_allow_dma(&POL, 0xB8000, 0x1000), -1);
+    CHECK_EQ(dvm_policy_allow_dma(&POL, 0, DVM_DMA_SIZE), -1);
+    CHECK_EQ(dvm_policy_allow_dma(NULL, b, n), -1);
+    CHECK_EQ((int)POL.dma_base, 0);
+
+    /* A HAND-BUILT policy that never went through the setter is refused at run
+     * time, so the setter is not the only thing standing in the way. */
+    char msg[DVM_MSG_MAX];
+    dvm_policy_init(&POL);
+    POL.dma_base = 0x1000;                 /* kernel memory */
+    POL.dma_size = 0x1000;
+    CHECK_EQ(dvm_policy_check(&POL, msg, sizeof msg), DVM_TRAP_POLICY);
+    CHECK_CONTAINS(msg, "not inside the VM's scratch arena");
+
+    dvm_policy_init(&POL);
+    POL.dma_base = b;
+    POL.dma_size = n + 0x1000;             /* runs off the end */
+    CHECK_EQ(dvm_policy_check(&POL, msg, sizeof msg), DVM_TRAP_POLICY);
+    CHECK_CONTAINS(msg, "scratch arena");
+
+    /* ...and the same thing reaches a program as a refusal to run. */
+    CHECK_EQ(assemble("halt\n"), 0);
+    CHECK_STATUS(dvm_run(&P, &POL, &DEV, NULL, 0, &R), DVM_TRAP_POLICY);
+
+    /* An MMIO window may not alias the buffer: it would make the same bytes
+     * reachable under the wrong budget and mislabel them in the trace. */
+    dvm_policy_init(&POL);
+    CHECK_EQ(dvm_policy_allow_dma(&POL, b, n), 0);
+    POL.nmmio = 1;                         /* by hand: allow_mmio refuses this */
+    POL.mmio[0].base  = b + 0x100;
+    POL.mmio[0].size  = 0x100;
+    POL.mmio[0].flags = DVM_MMIO_RW;
+    CHECK_EQ(dvm_policy_check(&POL, msg, sizeof msg), DVM_TRAP_POLICY);
+    CHECK_CONTAINS(msg, "overlaps the dma scratch buffer");
+}
+
+/* The load-bearing one: bytes a program writes are really in the arena, at the
+ * address the caller was told, and readable back by the C side — which is what
+ * a device fetching them would see. */
+static void test_dma_stores_land_in_the_arena(void) {
+    dma_policy();
+    uint64_t b = dma_base_of();
+    volatile uint8_t *mem = (volatile uint8_t *)(uintptr_t)b;
+
+    for (int i = 0; i < 64; i++) mem[i] = 0;
+
+    /* r0 = the buffer, as dvm_tools passes it. Write a recognisable pattern with
+     * each of the three widths, then read one back through the VM too. */
+    uint64_t args[1] = { b };
+    CHECK_STATUS(run_args("st32 [r0+0],  0x11223344\n"
+                          "st16 [r0+4],  0x5566\n"
+                          "st8  [r0+6],  0x77\n"
+                          "st8  [r0+7],  0x88\n"
+                          "st32 [r0+8],  0xdeadbeef\n"
+                          "ld32 r5, [r0+0]\n"
+                          "ld16 r6, [r0+4]\n"
+                          "ld8  r7, [r0+7]\n"
+                          "halt\n", args, 1), DVM_OK);
+
+    /* Read the bytes with a plain pointer: this is the proof that the address in
+     * r0 names real, writable memory and not something the VM emulated. */
+    CHECK_EQ((int)mem[0], 0x44);
+    CHECK_EQ((int)mem[1], 0x33);
+    CHECK_EQ((int)mem[2], 0x22);
+    CHECK_EQ((int)mem[3], 0x11);
+    CHECK_EQ((int)mem[4], 0x66);
+    CHECK_EQ((int)mem[5], 0x55);
+    CHECK_EQ((int)mem[6], 0x77);
+    CHECK_EQ((int)mem[7], 0x88);
+    CHECK_EQ((int)mem[8], 0xef);
+    CHECK_EQ((int)mem[11], 0xde);
+
+    /* ...and the VM reads back what it wrote. */
+    CHECK_EQ((int)R.reg[5], 0x11223344);
+    CHECK_EQ((int)R.reg[6], 0x5566);
+    CHECK_EQ((int)R.reg[7], 0x88);
+
+    /* Buffer traffic is counted separately and costs the device budget nothing:
+     * five stores, three loads, and not one device access. */
+    CHECK_EQ((int)R.n_dma_wr, 5);
+    CHECK_EQ((int)R.n_dma_rd, 3);
+    CHECK_EQ((int)R.io_ops, 0);
+    CHECK_EQ((int)R.n_mmio_wr, 0);
+    CHECK_EQ((int)R.n_mmio_rd, 0);
+    /* Nothing reached the device backend at all. */
+    CHECK_EQ(nalog, 0);
+
+    /* The last byte of the buffer is reachable; one past it is not. */
+    uint64_t n = 0;
+    dvm_dma_region(NULL, &n);
+    uint64_t a2[2] = { b, n };
+    CHECK_STATUS(run_args("sub r2, r1, 4\n"
+                          "add r2, r0, r2\n"
+                          "st32 [r2+0], 0xa5a5a5a5\n"
+                          "halt\n", a2, 2), DVM_OK);
+    CHECK_EQ((int)mem[n - 1], 0xa5);
+    CHECK_EQ((int)R.n_dma_wr, 1);
+}
+
+static void test_dma_bounds_alignment_and_budget(void) {
+    dma_policy();
+    uint64_t b = 0, n = 0;
+    dvm_dma_region(&b, &n);
+    uint64_t args[2] = { b, n };
+
+    /* An access that STRADDLES the end must not fall through to the MMIO
+     * allowlist. It lands in the buffer's own gate and says which buffer. */
+    CHECK_STATUS(run_args("add r2, r0, r1\n"
+                          "sub r2, r2, 2\n"
+                          "st32 [r2+0], 1\n"
+                          "halt\n", args, 2), DVM_TRAP_MMIO_DENIED);
+    CHECK_CONTAINS(R.msg, "runs off the end of the dma buffer");
+    CHECK_EQ((int)R.n_dma_wr, 0);
+
+    /* Straddling the START is the mirror image, and equally not a fallthrough. */
+    CHECK_STATUS(run_args("sub r2, r0, 2\n"
+                          "st32 [r2+0], 1\n"
+                          "halt\n", args, 2), DVM_TRAP_MMIO_DENIED);
+    CHECK_CONTAINS(R.msg, "dma buffer");
+
+    /* Wholly outside the buffer is refused as well, though which trap depends on
+     * where the arena sits: in the kernel these addresses are kernel memory, on
+     * the host they are above the mapped 4 GiB. What must hold everywhere is that
+     * the program is stopped and the buffer counters do not move. */
+    CHECK(run_args("add r2, r0, r1\nst8 [r2+0], 1\nhalt\n", args, 2) != DVM_OK);
+    CHECK_EQ((int)R.n_dma_wr, 0);
+    CHECK(run_args("sub r2, r0, 8\nst32 [r2+0], 1\nhalt\n", args, 2) != DVM_OK);
+    CHECK_EQ((int)R.n_dma_wr, 0);
+
+    /* Natural alignment, like a device register. */
+    CHECK_STATUS(run_args("st32 [r0+1], 1\nhalt\n", args, 2), DVM_TRAP_ALIGN);
+    CHECK_CONTAINS(R.msg, "dma buffer");
+    CHECK_STATUS(run_args("st16 [r0+3], 1\nhalt\n", args, 2), DVM_TRAP_ALIGN);
+    CHECK_STATUS(run_args("ld32 r5, [r0+2]\nhalt\n", args, 2), DVM_TRAP_ALIGN);
+    CHECK_STATUS(run_args("st8  [r0+1], 1\nhalt\n", args, 2), DVM_OK);   /* always ok */
+
+    /* Its own budget, which stops a runaway fill without touching max_io. */
+    POL.max_dma_ops = 4;
+    CHECK_STATUS(run_args("st8 [r0+0],1\nst8 [r0+1],1\nst8 [r0+2],1\n"
+                          "st8 [r0+3],1\nst8 [r0+4],1\nhalt\n", args, 2),
+                 DVM_TRAP_DMA_BUDGET);
+    CHECK_EQ((int)R.n_dma_wr, 4);
+    CHECK_CONTAINS(R.msg, "dma buffer access budget of 4");
+    CHECK_EQ((int)strcmp(dvm_status_name(DVM_TRAP_DMA_BUDGET), "DMA_LIMIT"), 0);
+
+    /* A device budget of zero does not stop buffer work: the two are separate. */
+    dma_policy();
+    POL.max_io = 0;
+    CHECK_STATUS(run_args("st32 [r0+0], 0x1234\nld32 r5,[r0+0]\nhalt\n", args, 2), DVM_OK);
+    CHECK_EQ((int)R.reg[5], 0x1234);
+    /* ...and a device access with that budget still fails. */
+    CHECK_STATUS(run_args("out8 0xc000, 1\nhalt\n", args, 2), DVM_TRAP_IO_BUDGET);
+
+    /* A budget above one access per byte of the arena is refused outright. */
+    char msg[DVM_MSG_MAX];
+    dma_policy();
+    POL.max_dma_ops = DVM_DMA_SIZE + 1;
+    CHECK_EQ(dvm_policy_check(&POL, msg, sizeof msg), DVM_TRAP_POLICY);
+    CHECK_CONTAINS(msg, "max_dma_ops");
+
+    /* With NO grant, the buffer is not reachable at all: the address falls back to
+     * the ordinary MMIO rules, which refuse it. */
+    std_policy();
+    CHECK(run_args("st32 [r0+0], 1\nhalt\n", args, 2) != DVM_OK);
+    CHECK_EQ((int)R.n_dma_wr, 0);
+    CHECK(run_args("ld32 r5, [r0+0]\nhalt\n", args, 2) != DVM_OK);
+    CHECK_EQ((int)R.n_dma_rd, 0);
+}
+
+/* The half the VM cannot police: a DEVICE writing outside the buffer. Nothing in
+ * the ISA can do this, so the test does it the way hardware would — with a raw
+ * store, behind the VM's back — and then asks whether the kernel noticed. */
+static void test_dma_guard_band_catches_a_device_overrun(void) {
+    dma_policy();
+    uint64_t b = 0, n = 0;
+    dvm_dma_region(&b, &n);
+    uint64_t args[2] = { b, n };
+    char msg[DVM_MSG_MAX];
+
+    /* A clean run leaves the guard armed and quiet. */
+    CHECK_STATUS(run_args("st32 [r0+0], 1\nhalt\n", args, 2), DVM_OK);
+    msg[0] = 'x';
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 0);
+    CHECK_EQ((int)msg[0], 0);
+
+    /* Writing right up to the last byte of the buffer is NOT an overrun: this is
+     * the boundary the guard has to get exactly right, so the loop runs to
+     * base+size-1 inclusive and the poison must still be intact afterwards.
+     * (Filling all 256 KiB byte-by-byte would cost ~1.5 M steps; the last 8 KiB
+     * is the part adjacent to the guard and so the part that matters.) */
+    POL.max_steps = 200000;
+    CHECK_STATUS(run_args("sub r2, r1, 8192\n"            /* r2 = first offset  */
+                          "loop:\n"
+                          "  add r3, r0, r2\n"
+                          "  st8 [r3+0], 0x5a\n"
+                          "  add r2, r2, 1\n"
+                          "  cmp r2, r1\n"
+                          "  blt loop\n"
+                          "halt\n", args, 2), DVM_OK);
+    CHECK_EQ((int)R.n_dma_wr, 8192);
+    CHECK_EQ((int)((volatile uint8_t *)(uintptr_t)b)[n - 1], 0x5a);
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 0);
+    dma_policy();
+
+    /* Now a "device" that was given a length one descriptor too long. */
+    CHECK_STATUS(run_args("st32 [r0+0], 1\nhalt\n", args, 2), DVM_OK);
+    ((volatile uint8_t *)(uintptr_t)(b + n))[0] = 0x01;      /* +0 past the end */
+    ((volatile uint8_t *)(uintptr_t)(b + n))[7] = 0x02;
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 1);
+    CHECK_CONTAINS(msg, "past the end");
+    CHECK_CONTAINS(msg, "+0");
+
+    /* Reported once, then re-armed: the next run does not inherit the verdict. */
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 0);
+
+    /* An address BELOW the buffer is the other common mistake, and reads as such. */
+    CHECK_STATUS(run_args("st32 [r0+0], 1\nhalt\n", args, 2), DVM_OK);
+    ((volatile uint8_t *)(uintptr_t)(b - 1))[0] = 0x03;
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 1);
+    CHECK_CONTAINS(msg, "BELOW the start");
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 0);
+
+    /* Both at once is reported as both. */
+    CHECK_STATUS(run_args("st32 [r0+0], 1\nhalt\n", args, 2), DVM_OK);
+    ((volatile uint8_t *)(uintptr_t)(b + n))[3] = 0x04;
+    ((volatile uint8_t *)(uintptr_t)(b - 8))[0] = 0x05;
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 1);
+    CHECK_CONTAINS(msg, "AND");
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 0);
+
+    /* A run with no DMA grant does not re-arm, so evidence from a device that is
+     * still mastering is not erased by an unrelated program. */
+    std_policy();
+    ((volatile uint8_t *)(uintptr_t)(b + n))[0] = 0x06;
+    CHECK_STATUS(run("halt\n"), DVM_OK);
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 1);
+    CHECK_EQ(dvm_dma_check(msg, sizeof msg), 0);
+}
+
+/* The grant is announced before the program runs, so the operator's transcript
+ * records that this run could have caused DMA. */
+static void test_dma_grant_is_traced(void) {
+    dma_policy();
+    uint64_t b = 0, nb = 0;
+    dvm_dma_region(&b, &nb);
+    uint64_t args[2] = { b, nb };
+
+    POL.trace = DVM_TRACE_IO;
+    kcap_reset();
+    CHECK_STATUS(run_args("st32 [r0+0], 0x99\nout8 0xc000, 1\nhalt\n", args, 2), DVM_OK);
+    CHECK_CONTAINS(kcap_text(), "[dvm.grant dma 0x");
+    CHECK_CONTAINS(kcap_text(), "master into it");
+    CHECK_CONTAINS(kcap_text(), "dma=1 (rd=0 wr=1)");
+    /* At trace=io the buffer stores themselves stay quiet, so a fill cannot
+     * spend the line budget and silence the device accesses that matter. */
+    CHECK(strstr(kcap_text(), "st32 dma+") == NULL);
+    CHECK_CONTAINS(kcap_text(), "out8 port=0xc000");
+
+    /* At trace=all they appear, with an offset rather than a raw address. */
+    POL.trace = DVM_TRACE_ALL;
+    kcap_reset();
+    CHECK_STATUS(run_args("st32 [r0+8], 0x99\nld32 r5,[r0+8]\nhalt\n", args, 2), DVM_OK);
+    CHECK_CONTAINS(kcap_text(), "st32 dma+0x8 val=0x99");
+    CHECK_CONTAINS(kcap_text(), "ld32 dma+0x8 r5=0x99");
+
+    /* No grant, and the trace says so in as many words. */
+    std_policy();
+    POL.trace = DVM_TRACE_IO;
+    kcap_reset();
+    CHECK_STATUS(run("halt\n"), DVM_OK);
+    CHECK_CONTAINS(kcap_text(), "[dvm.grant dma none -> ok]");
+}
+
 /* A program that never went through the assembler must not be able to escape:
  * the validator re-checks everything the assembler guarantees. */
 static void test_validator_rejects_handbuilt(void) {
@@ -1458,6 +1842,7 @@ static void test_trace_io_level(void) {
     CHECK_CONTAINS(t, "[dvm.grant ports 0xc000-0xc03f -> ok]");
     CHECK_CONTAINS(t, "[dvm.grant mmio 0xfebc0000+0x1000rw,0xfebd0000+0x100r -> ok]");
     CHECK_CONTAINS(t, "[dvm.grant pci 00:03.0,00:04.1 -> ok]");
+    CHECK_CONTAINS(t, "[dvm.grant dma none -> ok]");
     CHECK_CONTAINS(t, "[dvm.run insns=7 args=1");
 
     /* every device access, with the value that crossed the bus */
@@ -1816,6 +2201,9 @@ int main(void) {
     console_init();
     trace_set_enabled(1);
 
+    /* Must be first: it is the only chance to observe the never-armed guard. */
+    RUN(test_dma_check_before_any_run);
+
     RUN(test_assemble_basic);
     RUN(test_disasm);
     RUN(test_disasm_neutralises_string_bytes);
@@ -1849,6 +2237,14 @@ int main(void) {
     RUN(test_policy_refusals);
     RUN(test_bad_arguments);
     RUN(test_no_backend);
+
+    RUN(test_dma_region_shape);
+    RUN(test_dma_grant_is_bounded_to_the_arena);
+    RUN(test_dma_stores_land_in_the_arena);
+    RUN(test_dma_bounds_alignment_and_budget);
+    RUN(test_dma_guard_band_catches_a_device_overrun);
+    RUN(test_dma_grant_is_traced);
+
     RUN(test_validator_rejects_handbuilt);
 
     RUN(test_trace_io_level);

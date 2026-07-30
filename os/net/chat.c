@@ -21,6 +21,49 @@
 #include <stdio.h>      /* snprintf, via port/stdio.h when freestanding */
 
 /* ====================================================================== */
+/* the output budget — how much the model is allowed to SAY in one round    */
+/* ====================================================================== */
+
+/* THIS NUMBER DECIDES WHETHER THE MODEL CAN AUTHOR AN APP AT ALL, and it was
+ * 1024 tokens, which is why it could not.
+ *
+ * A live session found it the only way it can be found. "I want a window that
+ * says hello only" worked first try (a 128-byte document). "I want a calculator"
+ * then failed FIFTEEN rounds in a row, every one of them
+ * `[app action=launch -> EINVAL]`, with the model saying "I keep failing to
+ * attach the document" and attaching it every time. It was not lying and the
+ * tool was not wrong: a calculator document is ~4 KiB of dense JSON (see
+ * apps/examples/calculator.json, 4058 bytes), the API stopped generating at
+ * max_tokens while still inside the tool_use block, and a tool_use cut off
+ * mid-arguments comes back with `"input":{}`. The kernel then correctly reported
+ * that "document" was missing — an error the model could not act on, because
+ * from where it stood it had sent one. That is a money-burning infinite loop
+ * whose cause is invisible from both ends, and no mock can reproduce it.
+ *
+ * WHY 3072 AND NOT MORE. The reply lands in three fixed buffers:
+ *   - CHAT_RESP_BYTES (65536) holds the whole HTTP response: never the binding
+ *     constraint here.
+ *   - CHAT_HISTORY_BYTES (16384) must hold the assistant turn VERBATIM, because
+ *     a tool_use block has to be echoed back byte for byte next round. This is
+ *     the real ceiling. 3072 tokens cannot exceed 12288 bytes even at a
+ *     pessimistic 4 bytes per token, which still fits one turn in the history
+ *     with room for the tool_result that answers it. 4096 tokens does not carry
+ *     that guarantee.
+ *   - CHAT_REQ_BYTES (61440) is unaffected: what goes out is bounded by the
+ *     history arena, not by this number.
+ * It is also 3x the room the largest documented app document needs, so the
+ * headline case has slack rather than sitting on the edge.
+ *
+ * Raising it further is not free: it is the one constant that lets a single
+ * assistant turn stop fitting the history at all, which aborts the round
+ * (CHAT_EHISTORY) instead of merely truncating it. If you raise it, raise
+ * CHAT_HISTORY_BYTES in the same commit and re-check chat.h's request
+ * arithmetic. The paired safety net is in run_turn(): a turn that DOES get cut
+ * off mid-call is now named as such to the model instead of being reported as
+ * missing arguments. */
+#define CHAT_MAX_OUTPUT_TOKENS  3072u
+
+/* ====================================================================== */
 /* what the machine tells the model it is                                  */
 /* ====================================================================== */
 
@@ -64,7 +107,10 @@ static const char SYSTEM_PROMPT[] =
     "processes, no memory protection: every tool call runs in the kernel's own "
     "address space and finishes before the next one starts. Interrupts are "
     "masked and all hardware is polled, so nothing happens in the background "
-    "and nothing can be waited for. Memory is one heap in a fixed arena. The "
+    "and nothing can be waited for - with one exception, because the loop that "
+    "waits for the operator's next sentence also drives GUI apps, so an app's "
+    "periodic \"tick\" handler DOES keep running between turns. Memory is one "
+    "heap in a fixed arena. The "
     "filesystem is real but lives in RAM, so anything you write is gone on the "
     "next boot - say so when it matters. There is no package manager, no "
     "compiler, no network client beyond the one talking to you, and no way to "
@@ -77,6 +123,17 @@ static const char SYSTEM_PROMPT[] =
     "one wrong the kernel replies with the real list, so read it and correct "
     "yourself. Say plainly when a request is outside the surface, and name the "
     "closest thing you do have.\n"
+
+    "\nYOU CAN BUILD GUI APPS, AND THAT IS EASY TO MISS. If an app tool is "
+    "offered, this machine has no fixed catalogue of applications: you WRITE one "
+    "as a JSON document - labels, buttons, fields, and handlers with a small "
+    "expression language - and launch it into a real clickable window, so "
+    "\"I want a stopwatch\", \"a tip calculator\" or \"a window that just says "
+    "hello\" is something you author in one tool call rather than something this "
+    "machine lacks. Any built-in app list you see elsewhere is a couple of "
+    "prebuilt demos, NOT the limit; so offer to build the thing asked for "
+    "instead of substituting the nearest demo, and if the first document is "
+    "rejected the error carries a working skeleton - fix it and launch again.\n"
 
     "\nHOW TO WORK. Treat a request as a job to finish, not a question to "
     "answer. Look before you act: read the current state, then change one thing "
@@ -288,6 +345,60 @@ static int hist_drop_oldest_epoch(void) {
     return 1;
 }
 
+/* Forget the OLDEST FAILED ATTEMPT OF THE TURN IN FLIGHT, when there is nothing
+ * else left to forget. Returns 1 if anything was dropped.
+ *
+ * WHY THIS EXISTS. Raising the output budget so the model can write a real app
+ * document moved the wall rather than removing it: a live session authoring a
+ * calculator sent five documents of 1.5-4 KiB, each with its rejection, and
+ * CHAT_HISTORY_BYTES (16 KiB) ran out mid-turn. hist_drop_oldest_epoch() could
+ * not help — by then the in-flight turn was the only epoch left — so the turn
+ * died with "no room left to remember this turn". Twice that happened AFTER a
+ * successful launch: the window was on screen and the conversation that could
+ * say so was abandoned. That is the worst outcome this file can produce.
+ *
+ * WHAT IS SAFE TO DROP, exactly. The turn's messages are [the operator's
+ * sentence, then (assistant with tool_use, user with its tool_result) pairs].
+ * Dropping one WHOLE ADJACENT PAIR keeps every invariant the API needs: the
+ * first message is still the user's sentence, roles still alternate, and no
+ * tool_use is left without its tool_result (a dangling one is a 400 from the
+ * API, which would cost the operator the turn as surely as running out of room).
+ * The pair dropped is the oldest, which is the least useful: it is the attempt
+ * the model has already moved on from, while the errors it is actually working
+ * from are the most recent ones.
+ *
+ * It never touches hist[0], never crosses into an older epoch (those are
+ * cheaper to drop whole, and hist_drop_oldest_epoch runs first), and does
+ * nothing at all unless the two entries really are an assistant/user pair — so
+ * a history shaped in some way this reasoning did not anticipate is left alone
+ * and the old CHAT_EHISTORY path still catches it. */
+static int hist_drop_oldest_attempt(void) {
+    if (hist_n < 3)                     return 0;
+    if (hist[0].epoch != hist_epoch)    return 0;   /* older exchanges first */
+    if (hist[1].epoch != hist_epoch ||
+        hist[2].epoch != hist_epoch)    return 0;
+    if (hist[1].role != ROLE_ASSISTANT ||
+        hist[2].role != ROLE_USER)      return 0;
+
+    size_t off   = hist[1].off;
+    size_t bytes = (size_t)hist[1].len + hist[2].len;
+    memmove(hist_arena + off, hist_arena + off + bytes,
+            hist_used - off - bytes);
+    hist_used -= bytes;
+
+    for (size_t i = 3; i < hist_n; i++) {
+        hist[i - 2]      = hist[i];
+        hist[i - 2].off -= (uint32_t)bytes;
+    }
+    hist_n -= 2;
+    stat_evictions++;
+    /* The operator is watching a turn take many rounds; this says why it is
+     * still going and what it cost. No model-chosen bytes (include/trace.h). */
+    kprintf("[chat: this turn no longer fits its memory - forgot its oldest "
+            "failed attempt (%u bytes) and carried on]\n", (unsigned)bytes);
+    return 1;
+}
+
 /* Make room for `need` bytes of content, evicting whole old exchanges as
  * required. Returns where to write, or NULL when even an empty history cannot
  * hold this turn (CHAT_EHISTORY territory). */
@@ -295,7 +406,9 @@ static char *hist_reserve(size_t need) {
     for (;;) {
         if (hist_n < CHAT_HISTORY_MSGS && hist_used + need <= CHAT_HISTORY_BYTES)
             return hist_arena + hist_used;
-        if (!hist_drop_oldest_epoch()) return (char *)0;
+        if (hist_drop_oldest_epoch())  continue;
+        if (hist_drop_oldest_attempt()) continue;
+        return (char *)0;
     }
 }
 
@@ -442,7 +555,7 @@ static int build_request(size_t *out_len, int offer_tools) {
 
         model_request_t rq;
         rq.model         = (const char *)0;      /* model.c's compiled default */
-        rq.max_tokens    = 1024;
+        rq.max_tokens    = CHAT_MAX_OUTPUT_TOKENS;
         rq.system        = SYSTEM_PROMPT;
         rq.tools         = offer_len ? tools_buf : (const char *)0;
         rq.tools_len     = offer_len;
@@ -580,15 +693,52 @@ static void print_text_block(const json_value_t *v) {
  * like a complete answer on a console with no scrollback and no shell to check
  * with. Anything else (end_turn, tool_use, a reason this build has not heard of)
  * is silent: the operator should only be interrupted by facts they can act on. */
-static void print_stop_warning(const json_value_t *root) {
+static int hit_output_limit(const json_value_t *root) {
     char why[32];
-    if (json_msg_stop_reason(root, why, sizeof why) != JSON_OK) return;
+    if (json_msg_stop_reason(root, why, sizeof why) != JSON_OK) return 0;
     /* memcmp over the NUL, not strcmp: kernel.h declares the former and this
      * file must compile freestanding as well as against host libc. */
-    if (memcmp(why, "max_tokens", sizeof "max_tokens") != 0) return;
+    return memcmp(why, "max_tokens", sizeof "max_tokens") == 0;
+}
+
+static void print_stop_warning(const json_value_t *root) {
+    if (!hit_output_limit(root)) return;
     kputs("[chat: the model ran out of output budget - that answer is "
           "incomplete. Ask it to continue.]\n");
 }
+
+/* THE SAME FACT, ON A ROUND THAT CALLED TOOLS — where it is worse.
+ *
+ * stop_reason "max_tokens" used to be reported only on a round with no tool
+ * calls, on the argument that the operator should only be interrupted by facts
+ * they can act on. But generation stops wherever it stops, and the last block of
+ * a truncated reply is usually the tool_use itself: the API then hands back that
+ * block with `"input":{}`, because a half-written arguments object is not JSON.
+ * Every tool in this kernel then answers, correctly and uselessly, that its
+ * required argument is missing.
+ *
+ * A live session showed exactly what that costs: fifteen consecutive rounds of
+ * `[app action=launch -> EINVAL]` while the model insisted it was attaching a
+ * document it really was attaching, each round a paid API call. Neither end
+ * could see the truncation, because the one party that knew — the kernel, which
+ * had the stop_reason in its hand — was staying quiet.
+ *
+ * So a call whose arguments arrived empty on a truncated reply is NOT dispatched
+ * (dispatching it can only produce a misleading error, and for a mutating tool
+ * it could act on defaults nobody asked for). It is answered with the real
+ * reason, in words that name the remedy. The kernel prints its own line too, and
+ * that line contains no model-chosen bytes: the tool NAME is model-controlled
+ * and a '[' in column zero must stay unforgeable (include/trace.h), so the count
+ * is printed and the name is not. */
+#define CUT_OFF_RESULT                                                        \
+    "refused: nothing was run, and nothing on this machine changed. Your "    \
+    "previous message hit this machine's per-reply output limit while you "   \
+    "were still writing this call's arguments, so they never arrived - the "  \
+    "kernel received an empty object where your arguments should have been. " \
+    "This is not a schema error and repeating the same call unchanged will "  \
+    "fail the same way. Send it again, SHORTER: for an app document that "    \
+    "means fewer widgets, shorter names, and no indentation or newlines "     \
+    "inside the JSON."
 
 /* Whatever the API said when it did not say 200. The operator has no other way
  * to find out why the machine will not act.
@@ -911,11 +1061,17 @@ int chat_ask(const char *sentence) {
          * lengths, and a round that cannot be answered is refused untouched. */
         size_t ncalls   = 0;
         size_t answer_cost = 2 + BUDGET_NOTE_RESERVE;      /* "[" "]" + the note */
+        /* Which block a truncated reply can have cut off: generation stops at
+         * the end, so only the LAST tool_use can be missing its arguments.
+         * Anything earlier that arrived with `{}` really does mean `{}` — several
+         * tools take no arguments at all — and must still be dispatched. */
+        size_t last_use = nblocks;
         for (size_t i = 0; i < nblocks; i++) {
             json_value_t blk, type, id;
             if (json_at(&content, i, &blk) != JSON_OK)     continue;
             if (json_get(&blk, "type", &type) != JSON_OK)  continue;
             if (!json_str_eq(&type, "tool_use"))           continue;
+            last_use = i;
 
             char idbuf[TOOL_ID_MAX];
             if (json_get(&blk, "id", &id) != JSON_OK ||
@@ -955,6 +1111,8 @@ int chat_ask(const char *sentence) {
 
         size_t done   = 0;                 /* tool_use blocks answered so far */
         size_t failed = 0;                 /* of those, ones that did not act */
+        size_t cut    = 0;                 /* calls whose arguments never came */
+        int truncated_reply = hit_output_limit(&root);
         for (size_t i = 0; i < nblocks; i++) {
             json_value_t blk, type;
             if (json_at(&content, i, &blk) != JSON_OK)    continue;
@@ -997,9 +1155,28 @@ int chat_ask(const char *sentence) {
 
             const char *in_ptr = "{}";
             size_t      in_len = 2;
+            int         have_args = 0;
             if (json_get(&blk, "input", &input) == JSON_OK) {
                 in_ptr = input.start;
                 in_len = input.len;
+                /* An object with members, or anything that is not an empty
+                 * object, counts as arguments that arrived. json_count() is 0
+                 * for both `{}` and a non-container, which is exactly the set
+                 * that carries nothing a tool can read. */
+                have_args = json_count(&input) != 0;
+            }
+
+            /* Arguments lost to the output limit: say so, do not dispatch.
+             * See CUT_OFF_RESULT above for why this is not a schema error. */
+            if (truncated_reply && !have_args && i == last_use) {
+                put_tool_result(&w, done == 0, ncalls - done, idbuf,
+                                CUT_OFF_RESULT, 1);
+                journal_record(namebuf, "not run: arguments cut off by the "
+                                        "output limit", 1);
+                done++;
+                failed++;
+                cut++;
+                continue;
             }
 
             tool_call_t call;
@@ -1038,6 +1215,14 @@ int chat_ask(const char *sentence) {
             print_stop_warning(&root);
             return CHAT_OK;
         }
+
+        /* The operator watches a window not appear and has no shell to ask why.
+         * One line, printed from the kernel's own count, names the cause. No
+         * model-chosen byte goes into it (see CUT_OFF_RESULT). */
+        if (cut)
+            kprintf("[chat: the model's reply hit its output limit while writing "
+                    "arguments - %u call(s) arrived empty and were NOT run; it "
+                    "was told to send a shorter one]\n", (unsigned)cut);
 
         put_budget_note(&w, stat_rounds, max_rounds, (unsigned)done,
                         (unsigned)failed);

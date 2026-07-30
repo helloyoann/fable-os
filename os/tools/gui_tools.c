@@ -397,14 +397,19 @@ static int t_gui_open(const tool_call_t *c, tool_result_t *r) {
 static const tool_t gui_open_tool = {
     .name = "gui_open",
     .description =
-        "Open an application window. This is how \"I want a calculator\" becomes "
-        "a real window: it appears at once, focused, on top, and is clickable "
-        "with the mouse or with gui_click. Apps: calculator (a working "
-        "fixed-point calculator) and notes (a field you can type one line into). "
-        "The position is chosen for you unless you give x and y.",
+        "Open one of the two demo apps a human already compiled into this kernel: "
+        "calculator (a working fixed-point calculator) or notes (a field you can "
+        "type one line into). Those two are all THIS tool has, and they are not "
+        "the limit of what this machine can put on screen - for any other window, "
+        "including a differently-behaved calculator, author one with the `app` "
+        "tool instead of reporting that it does not exist. Opens at once, "
+        "focused, on top, clickable with the mouse or gui_click; the position is "
+        "chosen for you unless you give x and y.",
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
-        "\"app\":{\"type\":\"string\",\"description\":\"calculator or notes\"},"
+        "\"app\":{\"type\":\"string\",\"description\":\"a built-in demo name: "
+        "calculator or notes. Not an enum of what this machine can display - "
+        "anything else is the `app` tool\"},"
         "\"x\":{\"type\":\"integer\",\"description\":\"left edge, pixels\"},"
         "\"y\":{\"type\":\"integer\",\"description\":\"top edge, pixels\"}"
         "},\"required\":[\"app\"]}",
@@ -628,12 +633,45 @@ static int t_gui_click(const tool_call_t *c, tool_result_t *r) {
     /* Screen coordinates: no window needed, and the click goes wherever the
      * pointer would have gone — including onto a title bar or a close box. */
     if (!has_id && !has_label && !has_wid && has_x == 1 && has_y == 1) {
-        int hit = gui_click_at((int32_t)x, (int32_t)y);
+        /* This branch can DESTROY a window: the close box is chrome, so the only
+         * route to it is a screen coordinate. Resolve and remember which window
+         * is under the point BEFORE the press, so the one trace line this call
+         * emits can name the window that was really hit and say whether it
+         * survived. Without this the entire kernel record of closing every
+         * window the operator was using is "[gui_click at=390,108 -> 1]", and
+         * the result text says "a window took it" about a window that no longer
+         * exists. gui_window action=close has named its target since it was
+         * written; this path is the asymmetry. */
+        uint32_t      before_id = gui_window_at((int32_t)x, (int32_t)y);
+        gui_window_t *bw        = before_id ? gui_window(before_id) : (gui_window_t *)0;
+        char          btitle[GUI_TITLE_MAX];
+        size_t        ti = 0;
+        if (bw) { for (; bw->title[ti] && ti < sizeof btitle - 1; ti++) btitle[ti] = bw->title[ti]; }
+        btitle[ti] = '\0';
+
+        int hit    = gui_click_at((int32_t)x, (int32_t)y);
+        int closed = before_id && !gui_window(before_id);
         gui_sync();
-        tool_result_printf(r, "clicked at %d,%d - %s\n", (int)x, (int)y,
-                           hit ? "a window took it" : "the desktop (no window "
-                                 "is there, so nothing happened)");
-        trace_ret((long)hit, "gui_click", "at=%d,%d", (int)x, (int)y);
+
+        if (!before_id)
+            tool_result_printf(r,
+                "clicked at %d,%d - the desktop (no window is there, so nothing "
+                "happened).\n", (int)x, (int)y);
+        else if (closed)
+            tool_result_printf(r,
+                "clicked at %d,%d - that was window %u \"%s\", and THE CLICK "
+                "CLOSED IT. The window and its app are gone; %d window(s) "
+                "remain.\n", (int)x, (int)y, (unsigned)before_id, btitle,
+                gui_window_count());
+        else
+            tool_result_printf(r,
+                "clicked at %d,%d - window %u \"%s\" %s.\n", (int)x, (int)y,
+                (unsigned)before_id, btitle,
+                hit ? "took it" : "is there but nothing consumed the press");
+
+        trace_ret((long)hit, "gui_click", "at=%d,%d window=%u title=%s%s",
+                  (int)x, (int)y, (unsigned)before_id,
+                  before_id ? btitle : "-", closed ? " CLOSED" : "");
         return TOOL_OK;
     }
 
@@ -692,13 +730,65 @@ static int t_gui_click(const tool_call_t *c, tool_result_t *r) {
     gui_rect_t cl = gui_client_rect(w);
     int32_t    cx = cl.x + target->r.x + target->r.w / 2;
     int32_t    cy = cl.y + target->r.y + target->r.h / 2;
-    int        hit = gui_click_at(cx, cy);
+
+    /* A widget's rect is allowed to fall outside the client area - the
+     * compositor clips it, so it simply is not drawn. Pressing its centre is a
+     * different matter: gui_click_at() re-resolves the pixel to whatever window
+     * is topmost there, so an escaped rect presses SOMEBODY ELSE'S widget and
+     * runs their handler, while this result would happily say we pressed our
+     * own. That needs no malice to reach: a button declared 400 wide inside a
+     * 200-wide window does it, and so does resizing a window smaller after
+     * launch (gui_window action=resize deliberately does not re-lay out). */
+    if (!gui_rect_contains(w->frame, cx, cy)) {
+        r->is_error = 1;
+        tool_result_printf(r,
+            "error: the %s labelled \"%s\" (widget id=%u) is not inside window "
+            "%u. Its centre works out at screen %d,%d, and that window covers "
+            "%d,%d to %d,%d - so the widget is off the window, invisible (the "
+            "window manager clips to the client area) and unclickable. Nothing "
+            "was pressed. Its rect is [%d,%d %dx%d] relative to a client area "
+            "only %dx%d: give it a smaller rect, use grid row/col placement, or "
+            "make the window bigger.\n",
+            kindname(target->kind), was, (unsigned)target->id, (unsigned)id64,
+            (int)cx, (int)cy,
+            (int)w->frame.x, (int)w->frame.y,
+            (int)(w->frame.x + w->frame.w - 1), (int)(w->frame.y + w->frame.h - 1),
+            (int)target->r.x, (int)target->r.y, (int)target->r.w, (int)target->r.h,
+            (int)cl.w, (int)cl.h);
+        trace_err(TOOL_EINVAL, "gui_click", "id=%u widget=%u off-window at=%d,%d",
+                  (unsigned)id64, (unsigned)target->id, (int)cx, (int)cy);
+        return TOOL_EINVAL;
+    }
+
+    /* A zero-area widget is inside the frame but cannot be hit: the click lands
+     * on the window, some other window chrome takes it, and the handler never
+     * runs. Catch it here rather than reporting a press that did not happen. */
+    if (target->r.w <= 0 || target->r.h <= 0) {
+        r->is_error = 1;
+        tool_result_printf(r,
+            "error: the %s labelled \"%s\" (widget id=%u) in window %u has zero "
+            "area (rect [%d,%d %dx%d]), so there is no pixel to press and "
+            "nothing was clicked. This happens when a grid has more rows or "
+            "columns than the window has room for. Relaunch the app with a "
+            "taller or wider window, or fewer grid cells.\n",
+            kindname(target->kind), was, (unsigned)target->id, (unsigned)id64,
+            (int)target->r.x, (int)target->r.y, (int)target->r.w, (int)target->r.h);
+        trace_err(TOOL_EINVAL, "gui_click", "id=%u widget=%u zero-area",
+                  (unsigned)id64, (unsigned)target->id);
+        return TOOL_EINVAL;
+    }
+
+    int hit = gui_click_at(cx, cy);
     gui_sync();
 
     tool_result_printf(r,
         "clicked the %s labelled \"%s\" (widget id=%u) in window %u at screen "
         "%d,%d.\n", kindname(target->kind), was, (unsigned)target->id,
         (unsigned)id64, (int)cx, (int)cy);
+    if (!hit)
+        tool_result_printf(r,
+            "But NOTHING CONSUMED IT: the press reached the desktop, so no "
+            "handler ran and nothing changed.\n");
 
     /* What the click actually did, read back out of the window rather than
      * asserted: this is the difference between "I pressed 7" and "the display

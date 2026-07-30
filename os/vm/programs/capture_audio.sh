@@ -3,7 +3,17 @@
 # analyse it. This is the objective half of the driver-VM proof: the serial log
 # says the program drove the registers, this says the hardware made sound.
 #
+#   make EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE      <-- REQUIRED FIRST
 #   vm/programs/capture_audio.sh [seconds]      (run from os/, or anywhere)
+#
+# THE DEFAULT KERNEL MAKES NO SOUND, ON PURPOSE. talk-os must know nothing about
+# an attached sound card — the model is supposed to write that driver at run time
+# — so the reference bring-up this script listens to is a test fixture
+# (tests/qemu/fixtures/ac97_boot.c) that only exists in a kernel built with
+# -DTALKOS_AC97_REFERENCE. Rather than rebuild someone's tree behind their back,
+# this script checks kernel.bin for that fixture and says what to run. It does
+# not tell you whether a MODEL-written driver made sound; for that, run this
+# against a kernel the model has driven and read the WAV the same way.
 #
 # Outputs (override with OUT_PREFIX):
 #   $OUT_PREFIX.wav   everything the emulated codec was fed
@@ -31,6 +41,24 @@ OUT_PREFIX="${OUT_PREFIX:-/tmp/talkos-audio-$$}"
 WAV="${OUT_PREFIX}.wav"
 LOG="${OUT_PREFIX}.log"
 QEMU="${TALKOS_TEST_QEMU:-qemu-system-x86_64}"
+
+if [ ! -f "$DIR/kernel.bin" ]; then
+    echo "error: $DIR/kernel.bin does not exist. Build the fixture kernel first:" >&2
+    echo "         make -C $DIR EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE" >&2
+    exit 1
+fi
+# Every line the fixture prints starts with "ac97:", so its absence from the
+# image is exactly the absence of the bring-up. Checking the binary beats
+# checking .build-flags: the stamp says what the last `make` was ASKED for, this
+# says what is actually in the kernel about to boot.
+if ! LC_ALL=C grep -q "ac97:" "$DIR/kernel.bin" 2>/dev/null; then
+    echo "error: this kernel has no audio driver in it, so it will make no sound." >&2
+    echo "       That is the DEFAULT and it is deliberate: talk-os ships knowing" >&2
+    echo "       nothing about sound cards. To capture the reference bring-up:" >&2
+    echo "         make -C $DIR EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE" >&2
+    echo "       ...and afterwards, 'make -C $DIR' to get the normal kernel back." >&2
+    exit 1
+fi
 
 rm -f "$WAV" "$LOG"
 

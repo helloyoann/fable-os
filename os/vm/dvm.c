@@ -43,6 +43,11 @@
 #define CEIL_SINGLE_US    1000000u
 #define CEIL_PRINTS       4096u
 #define CEIL_TRACE        100000u
+/* One access per byte of the arena is the most a program can usefully make: a
+ * byte-at-a-time fill of the whole buffer. Anything above that is a loop bug, so
+ * it is the ceiling. The default (dvm_policy_init) is half of it, which still
+ * covers writing the entire buffer 16 bits at a time. */
+#define CEIL_DMA_OPS      DVM_DMA_SIZE
 
 /* Only the low 4 GiB is mapped (boot.asm maps 2 MiB huge pages up to 4 GiB), so
  * an MMIO access above this would fault instead of being refused. */
@@ -235,6 +240,7 @@ const char *dvm_status_name(dvm_status_t s) {
         case DVM_TRAP_BADOP:        return "BAD_PROGRAM";
         case DVM_TRAP_NOIO:         return "NO_BACKEND";
         case DVM_TRAP_POLICY:       return "BAD_POLICY";
+        case DVM_TRAP_DMA_BUDGET:   return "DMA_LIMIT";
         default:                    return "?";
     }
 }
@@ -1174,16 +1180,135 @@ static uint64_t kernel_top(void) {
 #endif
 }
 
+/* ---- the DMA scratch arena ----
+ *
+ * ONE static array, and the only memory a driver program can ever write. It is
+ * deliberately NOT heap-allocated: a device keeps DMAing out of it after
+ * dvm_run() has returned (that is the whole point of starting playback), so a
+ * buffer that could be freed and handed to another allocation would be live DMA
+ * memory in somebody else's object. .bss is the only lifetime that is honest
+ * here, and it also means the address never changes between runs, so a program
+ * that failed can be retried against the same buffer.
+ *
+ * Alignment and size are argued in include/dvm.h. `volatile` because a device
+ * reads it behind the compiler's back, so the stores a program makes must not be
+ * elided or reordered past the register write that starts the transfer.
+ *
+ * On a host test build this is just an array in the test process, and the VM's
+ * ld/st reach it through exactly the same code path — which is what makes the
+ * host suite a real proof of the kernel behaviour rather than a model of it.
+ *
+ * THE GUARD BANDS. The arena sits in the middle of a larger block with
+ * DVM_DMA_GUARD bytes of poison either side. The VM itself can never reach them
+ * (dma_gate bounds every access to the granted range), so they exist for the
+ * half of the threat model the VM cannot police: a DEVICE that was handed a
+ * length in the wrong units, or a descriptor list one entry too long, DMAs past
+ * the end of the buffer. Without the guard that is silent corruption of whatever
+ * .bss object the linker happened to place next. With it, dvm_dma_check() turns
+ * the commonest form of the accident into a reported fact, with a byte offset,
+ * which is also exactly the diagnostic the model needs to fix its descriptors.
+ *
+ * One array rather than three, so C guarantees the guards are adjacent to the
+ * arena; three objects would be at the linker's discretion. DVM_DMA_GUARD is a
+ * multiple of DVM_DMA_ALIGN, so the arena inside it stays page-aligned.
+ *
+ * Stated plainly: this catches an overrun of up to DVM_DMA_GUARD bytes. A device
+ * pointed at a completely wrong address writes there and the guard never sees
+ * it. Only an IOMMU fixes that. */
+#define DVM_DMA_POISON   0xA5
+
+static volatile uint8_t dvm_dma_block[DVM_DMA_GUARD + DVM_DMA_SIZE + DVM_DMA_GUARD]
+    __attribute__((aligned(DVM_DMA_ALIGN)));
+
+static volatile uint8_t *dma_arena(void) { return dvm_dma_block + DVM_DMA_GUARD; }
+
+void dvm_dma_region(uint64_t *base, uint64_t *size) {
+    if (base) *base = (uint64_t)(uintptr_t)dma_arena();
+    if (size) *size = DVM_DMA_SIZE;
+}
+
+/* Re-poison both guard bands. .bss starts zeroed, so an unarmed guard would read
+ * as "0 != 0xa5" and report a false overrun on the very first check; arming is
+ * therefore not optional and dvm_dma_check() does it for the caller. */
+static int dma_guard_armed;
+
+static void dma_guard_arm(void) {
+    for (uint64_t i = 0; i < DVM_DMA_GUARD; i++) {
+        dvm_dma_block[i] = DVM_DMA_POISON;
+        dvm_dma_block[DVM_DMA_GUARD + DVM_DMA_SIZE + i] = DVM_DMA_POISON;
+    }
+    dma_guard_armed = 1;
+}
+
+int dvm_dma_check(char *msg, size_t cap) {
+    sb_t s;
+    sb_init(&s, msg, cap);
+
+    /* Never armed means no run has carried a DMA grant, so there is nothing to
+     * report — and reporting anything would be a lie: .bss starts at zero, which
+     * is not the poison value, so an unguarded check would read as a huge overrun
+     * on a machine where no DMA has ever been possible. Arm and say nothing. */
+    if (!dma_guard_armed) { dma_guard_arm(); return 0; }
+
+    /* Report the FIRST damaged byte on each side and how far out it was: "12
+     * bytes past the end" is actionable, "the guard is dirty" is not. */
+    int64_t over = -1, under = -1;
+    for (uint64_t i = 0; i < DVM_DMA_GUARD; i++)
+        if (dvm_dma_block[DVM_DMA_GUARD + DVM_DMA_SIZE + i] != DVM_DMA_POISON) {
+            over = (int64_t)i; break;
+        }
+    for (uint64_t i = DVM_DMA_GUARD; i > 0; i--)
+        if (dvm_dma_block[i - 1] != DVM_DMA_POISON) {
+            under = (int64_t)(DVM_DMA_GUARD - i + 1); break;
+        }
+
+    if (over < 0 && under < 0) return 0;
+
+    if (over >= 0 && under >= 0)
+        sb_addf(&s, "a device wrote %lu byte(s) past the end of the dma buffer AND "
+                    "%lu byte(s) before its start",
+                (unsigned long)over + 1, (unsigned long)under);
+    else if (over >= 0)
+        sb_addf(&s, "a device wrote past the end of the dma buffer: the guard band is "
+                    "damaged from +%lu, so a descriptor length or count was too big",
+                (unsigned long)over);
+    else
+        sb_addf(&s, "a device wrote %lu byte(s) BELOW the start of the dma buffer, so "
+                    "an address handed to it was under the buffer base",
+                (unsigned long)under);
+
+    dma_guard_arm();          /* re-arm, or every later run inherits this verdict */
+    return 1;
+}
+
+int dvm_policy_allow_dma(dvm_policy_t *p, uint64_t base, uint64_t size) {
+    if (!p || !size) return -1;
+    if (base + size < base) return -1;                 /* wraps */
+
+    uint64_t abase, asize;
+    dvm_dma_region(&abase, &asize);
+    /* The load-bearing line in this function: the grant must be a subrange of
+     * the arena this file owns. A caller passes a number, but it cannot pass a
+     * number that means anything except "part of dvm_dma_arena". */
+    if (base < abase || base + size > abase + asize) return -1;
+
+    p->dma_base = base;
+    p->dma_size = size;
+    return 0;
+}
+
 void dvm_policy_init(dvm_policy_t *p) {
     if (!p) return;
     dz(p, sizeof *p);
     p->max_steps           = 100000;
     p->max_io              = 4096;
+    p->max_dma_ops         = DVM_DMA_SIZE / 2;   /* the whole buffer as st16 */
     p->max_delay_us        = 200000;     /* 200 ms */
     p->max_single_delay_us = 50000;      /* 50 ms  */
     p->max_prints          = 64;
     p->max_trace           = 512;
     p->trace               = DVM_TRACE_IO;
+    /* dma_base/dma_size stay 0: deny-all includes the buffer. */
 }
 
 int dvm_policy_allow_ports(dvm_policy_t *p, uint16_t lo, uint16_t hi) {
@@ -1247,6 +1372,54 @@ dvm_status_t dvm_policy_check(const dvm_policy_t *p, char *msg, size_t cap) {
             }
     }
 
+    /* The DMA grant, re-checked here and not only in dvm_policy_allow_dma(), for
+     * the same reason the port deny list is applied twice: a policy that was
+     * hand-built, memcpy'd or corrupted never went through the setter. Every run
+     * therefore re-proves that the granted range is inside this file's own arena
+     * before a single st8 can reach it. */
+    if (p->dma_base || p->dma_size) {
+        uint64_t abase, asize;
+        dvm_dma_region(&abase, &asize);
+        if (!p->dma_size || p->dma_base + p->dma_size < p->dma_base ||
+            p->dma_base < abase || p->dma_base + p->dma_size > abase + asize) {
+            sb_addf(&s, "dma window 0x%lx+0x%lx is not inside the VM's scratch arena "
+                        "(0x%lx+0x%lx); a program's only memory is that arena",
+                    (unsigned long)p->dma_base, (unsigned long)p->dma_size,
+                    (unsigned long)abase, (unsigned long)asize);
+            return DVM_TRAP_POLICY;
+        }
+#ifndef TALKOS_HOSTTEST
+        /* Only the low 4 GiB is mapped, and a 32-bit bus master cannot address
+         * anything else, so an arena that landed higher would be a buffer no
+         * device could reach — silence, with no error anywhere. It is placed in
+         * .bss of an image linked at 1 MiB so this cannot currently happen; the
+         * check is here because "cannot currently happen" is a property of the
+         * linker script, not of this file. Host builds are exempt: the arena is
+         * an array in a 64-bit test process and its address means nothing to any
+         * hardware. */
+        if (abase + asize > MMIO_TOP) {
+            sb_addf(&s, "the dma scratch arena is at 0x%lx+0x%lx, above the 4 GiB a "
+                        "32-bit bus master can address; no device could reach it",
+                    (unsigned long)abase, (unsigned long)asize);
+            return DVM_TRAP_POLICY;
+        }
+#endif
+        /* An MMIO window that overlaps the arena would make the same bytes
+         * reachable under the device-access budget as well, and would make the
+         * trace lie about which of the two a given access was. It cannot happen
+         * through dvm_policy_allow_mmio (the arena is below kernel_top, so that
+         * path already refuses it), so this is a belt on a brace. */
+        for (int i = 0; i < p->nmmio; i++)
+            if (p->mmio[i].base < p->dma_base + p->dma_size &&
+                p->dma_base < p->mmio[i].base + p->mmio[i].size) {
+                sb_addf(&s, "mmio window 0x%lx+0x%lx overlaps the dma scratch buffer "
+                            "0x%lx+0x%lx; the two may not alias",
+                        (unsigned long)p->mmio[i].base, (unsigned long)p->mmio[i].size,
+                        (unsigned long)p->dma_base, (unsigned long)p->dma_size);
+                return DVM_TRAP_POLICY;
+            }
+    }
+
     uint64_t ktop = kernel_top();
     for (int i = 0; i < p->nmmio; i++) {
         const dvm_mmio_win_t *w = &p->mmio[i];
@@ -1297,6 +1470,12 @@ dvm_status_t dvm_policy_check(const dvm_policy_t *p, char *msg, size_t cap) {
     }
     if (p->max_io > CEIL_IO) {
         sb_addf(&s, "max_io %lu exceeds %lu", (unsigned long)p->max_io, (unsigned long)CEIL_IO);
+        return DVM_TRAP_POLICY;
+    }
+    if (p->max_dma_ops > CEIL_DMA_OPS) {
+        sb_addf(&s, "max_dma_ops %lu exceeds %lu, which is one access per byte of "
+                    "the scratch buffer",
+                (unsigned long)p->max_dma_ops, (unsigned long)CEIL_DMA_OPS);
         return DVM_TRAP_POLICY;
     }
     if (p->max_delay_us > CEIL_DELAY_US) {
@@ -1501,6 +1680,68 @@ static dvm_status_t port_gate(run_t *st, uint64_t rawport, uint32_t width,
                     (unsigned long)st->pol->max_io, what);
     st->res->io_ops++;
     return DVM_OK;
+}
+
+/* ---- the DMA scratch buffer ----
+ *
+ * ld/st inside the granted arena range are NOT device accesses: no bus cycle
+ * happens, nothing is clear-on-read, and a program filling a second of PCM makes
+ * tens of thousands of them. So they are gated, counted and traced separately
+ * from MMIO, and they are performed here rather than through dvm_io_t. Routing
+ * them through the backend would buy nothing (on hardware the hook would do
+ * exactly this store) and would cost the one property that makes the buffer
+ * testable: on a host build the arena is real memory, so a test can read back
+ * the bytes the VM wrote through the same code the kernel runs. */
+
+/* 1 when the access touches ANY byte of the granted buffer, even partially. A
+ * straddling access must land here and be refused, never silently fall through
+ * to the MMIO allowlist. */
+static int dma_touches(const dvm_policy_t *p, uint64_t addr, uint32_t width) {
+    if (!p->dma_size) return 0;
+    return addr < p->dma_base + p->dma_size && addr + width > p->dma_base;
+}
+
+static dvm_status_t dma_gate(run_t *st, uint64_t addr, uint32_t width,
+                             const char *what) {
+    const dvm_policy_t *p = st->pol;
+    if (addr < p->dma_base || addr + width > p->dma_base + p->dma_size)
+        return trap(st, DVM_TRAP_MMIO_DENIED,
+                    "%s: 0x%lx+%lu runs off the end of the dma buffer "
+                    "(0x%lx+0x%lx); an access must be wholly inside it",
+                    what, (unsigned long)addr, (unsigned long)width,
+                    (unsigned long)p->dma_base, (unsigned long)p->dma_size);
+    if (addr % width)
+        return trap(st, DVM_TRAP_ALIGN,
+                    "%s: address 0x%lx is not %lu-byte aligned; the dma buffer is "
+                    "accessed at natural alignment, like a device register",
+                    what, (unsigned long)addr, (unsigned long)width);
+    if ((uint64_t)st->res->n_dma_rd + st->res->n_dma_wr >= p->max_dma_ops)
+        return trap(st, DVM_TRAP_DMA_BUDGET,
+                    "dma buffer access budget of %lu reached at %s; fill the buffer "
+                    "with wider stores or write less of it",
+                    (unsigned long)p->max_dma_ops, what);
+    return DVM_OK;
+}
+
+/* The gate has already proved the address is inside the arena and naturally
+ * aligned, so these two are the only unchecked pointer casts in the file and
+ * they are three lines away from the check that licenses them. */
+static uint32_t dma_load(uint64_t addr, uint32_t width) {
+    volatile void *p = (volatile void *)(uintptr_t)addr;
+    switch (width) {
+        case 1:  return *(volatile uint8_t  *)p;
+        case 2:  return *(volatile uint16_t *)p;
+        default: return *(volatile uint32_t *)p;
+    }
+}
+
+static void dma_store(uint64_t addr, uint32_t width, uint32_t val) {
+    volatile void *p = (volatile void *)(uintptr_t)addr;
+    switch (width) {
+        case 1:  *(volatile uint8_t  *)p = (uint8_t)val;  break;
+        case 2:  *(volatile uint16_t *)p = (uint16_t)val; break;
+        default: *(volatile uint32_t *)p = val;           break;
+    }
 }
 
 static dvm_status_t mmio_gate(run_t *st, uint64_t addr, uint32_t width, int write,
@@ -1773,6 +2014,22 @@ static dvm_status_t execute(run_t *st) {
             uint32_t width = in->op == DVM_LD8 ? 1 : in->op == DVM_LD16 ? 2 : 4;
             const char *mn = dvm_op_name(in->op);
             uint64_t addr = a + b;
+            if (dma_touches(pol, addr, width)) {
+                dvm_status_t rc = dma_gate(st, addr, width, mn);
+                if (rc != DVM_OK) return rc;
+                v = dma_load(addr, width);
+                res->n_dma_rd++;
+                is_alu = 1;
+                /* DMA-buffer traffic traces only at TRACE_ALL: at TRACE_IO a
+                 * buffer fill would spend the whole line budget and silence the
+                 * device accesses that actually explain the run. */
+                if (tracing(st, DVM_TRACE_ALL))
+                    tline(st, "pc=%03lu ln=%lu %s dma+0x%lx r%u=0x%lx",
+                          (unsigned long)st->pc, (unsigned long)st->line, mn,
+                          (unsigned long)(addr - pol->dma_base), in->dst,
+                          (unsigned long)v);
+                break;
+            }
             dvm_status_t rc = mmio_gate(st, addr, width, 0, mn);
             if (rc != DVM_OK) return rc;
             if (!st->io->mmio_read)
@@ -1792,12 +2049,23 @@ static dvm_status_t execute(run_t *st) {
             uint32_t width = in->op == DVM_ST8 ? 1 : in->op == DVM_ST16 ? 2 : 4;
             const char *mn = dvm_op_name(in->op);
             uint64_t addr = a + b;
+            uint32_t val = (uint32_t)(width == 1 ? (c & 0xFF) : width == 2 ? (c & 0xFFFF)
+                                                              : (c & 0xFFFFFFFFu));
+            if (dma_touches(pol, addr, width)) {
+                dvm_status_t rc = dma_gate(st, addr, width, mn);
+                if (rc != DVM_OK) return rc;
+                dma_store(addr, width, val);
+                res->n_dma_wr++;
+                if (tracing(st, DVM_TRACE_ALL))
+                    tline(st, "pc=%03lu ln=%lu %s dma+0x%lx val=0x%lx",
+                          (unsigned long)st->pc, (unsigned long)st->line, mn,
+                          (unsigned long)(addr - pol->dma_base), (unsigned long)val);
+                break;
+            }
             dvm_status_t rc = mmio_gate(st, addr, width, 1, mn);
             if (rc != DVM_OK) return rc;
             if (!st->io->mmio_write)
                 return trap(st, DVM_TRAP_NOIO, "%s: this VM has no MMIO backend", mn);
-            uint32_t val = (uint32_t)(width == 1 ? (c & 0xFF) : width == 2 ? (c & 0xFFFF)
-                                                              : (c & 0xFFFFFFFFu));
             st->io->mmio_write(st->io->ctx, addr, (uint8_t)width, val);
             res->n_mmio_wr++;
             if (tracing(st, DVM_TRACE_IO))
@@ -1983,12 +2251,30 @@ dvm_status_t dvm_run(const dvm_program_t *p, const dvm_policy_t *pol,
         res->trace_lines++;
         trace_ok("dvm.grant", "pci %s", g);
 
+        /* The DMA grant is stated as loudly as the others, and it says what it
+         * is: writable memory, and the hardware's route into it. This line is
+         * the operator's only notice that a run could have caused DMA. */
+        res->trace_lines++;
+        if (pol->dma_size)
+            trace_ok("dvm.grant", "dma 0x%lx+0x%lx rw (scratch buffer; a device "
+                                  "pointed at it will master into it)",
+                     (unsigned long)pol->dma_base, (unsigned long)pol->dma_size);
+        else
+            trace_ok("dvm.grant", "dma none");
+
         res->trace_lines++;
         trace_ok("dvm.run", "insns=%lu args=%d steps<=%lu io<=%lu delay<=%lu us trace=%d",
                  (unsigned long)p->ninsn, nargs, (unsigned long)pol->max_steps,
                  (unsigned long)pol->max_io, (unsigned long)pol->max_delay_us,
                  (int)pol->trace);
     }
+
+    /* Arm the guard bands here, so a caller cannot forget to and so damage found
+     * by dvm_dma_check() after this call belongs to THIS run. A device that keeps
+     * mastering after the run returns can still dirty the guard between the check
+     * and the next run's arming, in which case the next run is blamed — that is
+     * the honest limit of attribution without an IOMMU. */
+    if (pol->dma_size) dma_guard_arm();
 
     dvm_status_t s = execute(&st);
 
@@ -2001,13 +2287,16 @@ dvm_status_t dvm_run(const dvm_program_t *p, const dvm_policy_t *pol,
         res->trace_lines++;
         if (s == DVM_OK)
             trace_ok("dvm.halt", "pc=%03lu ln=%lu steps=%lu io=%lu (pr=%lu pw=%lu mr=%lu "
-                                 "mw=%lu pci=%lu) delay=%lu us prints=%lu",
+                                 "mw=%lu pci=%lu) dma=%lu (rd=%lu wr=%lu) delay=%lu us "
+                                 "prints=%lu",
                      (unsigned long)res->pc, (unsigned long)res->line,
                      (unsigned long)res->steps, (unsigned long)res->io_ops,
                      (unsigned long)res->n_port_rd, (unsigned long)res->n_port_wr,
                      (unsigned long)res->n_mmio_rd, (unsigned long)res->n_mmio_wr,
-                     (unsigned long)res->n_pci_rd, (unsigned long)res->delay_us,
-                     (unsigned long)res->prints);
+                     (unsigned long)res->n_pci_rd,
+                     (unsigned long)res->n_dma_rd + res->n_dma_wr,
+                     (unsigned long)res->n_dma_rd, (unsigned long)res->n_dma_wr,
+                     (unsigned long)res->delay_us, (unsigned long)res->prints);
         else
             trace_err(DVM_TRACE_ERR, "dvm.stop", "%s steps=%lu io=%lu delay=%lu us",
                       dvm_status_name(s), (unsigned long)res->steps,

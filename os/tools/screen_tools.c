@@ -610,14 +610,11 @@ static const tool_t read_screen_tool = {
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
         "\"first_row\":{\"type\":\"integer\",\"description\":\"first row to read, "
-        "0 = the top line of the screen (default 0). This screen's size is NOT "
-        "fixed - it is 128x48 on a framebuffer and 80x25 on the VGA fallback. Call "
-        "screen_info for the real numbers, or omit both bounds to read all of "
-        "it.\"},"
+        "0 = the top line (default 0). Omit both bounds to read all of it.\"},"
         "\"last_row\":{\"type\":\"integer\",\"description\":\"last row to read, "
         "inclusive. Defaults to the BOTTOM row, which is the most recent output - "
-        "leave it out rather than guessing a number, because guessing 24 on a "
-        "48-row screen reads the oldest half.\"},"
+        "leave it out rather than guessing, because guessing 24 on a 48-row screen "
+        "reads the oldest half.\"},"
         "\"line_numbers\":{\"type\":\"boolean\",\"description\":\"prefix each "
         "line with its row number as \\\"NN|\\\" (default true). Keep it on if you "
         "intend to paint at coordinates afterwards.\"}"
@@ -713,6 +710,40 @@ static int t_write_screen(const tool_call_t *c, tool_result_t *r) {
                               "columns 0-%d (left to right). Nothing was painted",
                               cols - 1);
 
+    /* ---- THE COLUMN-ZERO BRACKET RULE (trace.h's invariant, defended here) ----
+     *
+     * A kernel trace line is a '[' in column zero. lib/trace.c escapes brackets
+     * inside every argument, and net/chat.c space-prefixes model prose, both so
+     * that no model-authored byte can ever open one. This tool is the fourth
+     * path to those same cells: screen_fb() IS console_fb(), and lib/base.c
+     * rasterises what we poke with the same font and the same palette as real
+     * kernel output. A painted "[vfs_write /etc/shadow bytes=9999 -> ok]" at
+     * col 0 is not similar to a trace line, it is byte-identical to one.
+     *
+     * So refuse it, rather than shifting it silently: a status bar that begins
+     * with '[' is a real (if rare) thing to want, and a tool that quietly moved
+     * the operator's text one column right would be lying about its output in a
+     * smaller way. The message names the one-column fix, so attempt two lands.
+     * Only column zero is restricted; brackets anywhere else are untouched. */
+    if (col == 0 && tlen > 0 && text[0] == '[')
+        return fail(r, TOOL_EINVAL, "write_screen", "",
+                    "\"text\" starts with '[' and \"col\" is 0. A '[' in column "
+                    "zero is this kernel's mark for a line IT printed about what "
+                    "it really did, so text painted there would be "
+                    "indistinguishable from kernel ground truth. Nothing was "
+                    "painted. Paint from col 1 (or start the text with any other "
+                    "character); brackets are fine at any other column");
+
+    /* Painting at column zero over a row that currently begins with '[' erases
+     * a kernel line. That is legitimate - the console is scratch space and it
+     * scrolls - but it must not be silent, so the trace line below carries it.
+     * Read before anything is written. */
+    int over_trace = 0;
+    if (col == 0) {
+        volatile uint16_t *peek = screen_fb();
+        over_trace = ((uint8_t)(peek[(size_t)row * (size_t)cols] & 0xFF) == '[');
+    }
+
     /* ---- colours ---- */
     uint8_t fg = FG_DEFAULT, bg = BG_DEFAULT;
     if (want_colour(&in, r, "write_screen", "fg", 0, &fg) != 0) return TOOL_EINVAL;
@@ -770,11 +801,19 @@ static int t_write_screen(const tool_call_t *c, tool_result_t *r) {
 
     put_transience(r, rows, cur_row, cur_col, (int)row);
 
+    if (over_trace)
+        tool_result_printf(r,
+            "NOTE: row %d began with '[', so this paint covered a line the "
+            "kernel had printed about what it really did. The transcript records "
+            "that it was overwritten.\n", (int)row);
+
     trace_ret((long)painted, "write_screen",
-              "row=%d col=%d len=%lu fg=%s bg=%s attr=0x%02x fill=%d clipped=%lu",
+              "row=%d col=%d len=%lu fg=%s bg=%s attr=0x%02x fill=%d clipped=%lu"
+              "%s",
               (int)row, (int)col, (unsigned long)tlen,
               colour_name(fg), colour_name(bg),
-              (unsigned)((bg << 4) | fg), fill, (unsigned long)dropped);
+              (unsigned)((bg << 4) | fg), fill, (unsigned long)dropped,
+              over_trace ? " erased-kernel-line=1" : "");
     return TOOL_OK;
 }
 
@@ -784,8 +823,9 @@ static const tool_t write_screen_tool = {
         "Paint text directly into the console framebuffer at a given row and "
         "column, in a chosen foreground and background colour. This is how you "
         "give this machine a user interface: a status bar, a header, a coloured "
-        "banner. The screen is 80 columns by 25 rows, row 0 at the top, column 0 "
-        "at the left. Text is clipped at the right edge, never wrapped, and "
+        "banner. Row 0 is the top, column 0 the left, and screen_info reports how "
+        "many of each this display has (128x48 on the framebuffer console, 80x25 "
+        "on the VGA fallback). Text is clipped at the right edge, never wrapped, and "
         "out-of-range coordinates are refused rather than adjusted. Only "
         "printable ASCII is accepted. IMPORTANT: this does not move the kernel's "
         "output cursor and does not reserve the area, so anything you paint is "
@@ -795,16 +835,14 @@ static const tool_t write_screen_tool = {
         "cursor at any time.",
     .input_schema =
         "{\"type\":\"object\",\"properties\":{"
-        "\"row\":{\"type\":\"integer\",\"description\":\"row to paint on, 0 = top "
-        "line. The bottom row is 47 on a framebuffer console and 24 on the VGA "
-        "fallback; screen_info reports which, and out-of-range is refused with the "
-        "real extents.\"},"
+        "\"row\":{\"type\":\"integer\",\"description\":\"row to paint on, 0 = top. "
+        "Out of range is refused with the real extents.\"},"
         "\"col\":{\"type\":\"integer\",\"description\":\"starting column, 0 = "
-        "leftmost (default 0). The rightmost is 127 on a framebuffer console and 79 "
-        "on the VGA fallback - ask screen_info.\"},"
+        "leftmost (default 0).\"},"
         "\"text\":{\"type\":\"string\",\"description\":\"printable ASCII to paint "
         "(0x20-0x7E). No newlines or tabs: one call paints one row. Anything past the "
-        "last column is clipped.\"},"
+        "last column is clipped. Text starting with '[' is refused at col 0 only - "
+        "that position is reserved for the kernel's own [...] lines.\"},"
         "\"fg\":{\"type\":\"string\",\"description\":\"text colour, one of: black "
         "blue green cyan red magenta brown light_grey dark_grey light_blue "
         "light_green light_cyan light_red light_magenta yellow white (default "

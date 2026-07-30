@@ -442,7 +442,19 @@ int  gui_post_key(int ch);
  * consumed it, 0 if it landed on the desktop. */
 int  gui_click_at(int32_t x, int32_t y);
 /* Click the centre of a widget by id. -1 unknown window, -2 unknown widget,
- * -3 the widget is disabled or not hit-testable. */
+ * -3 the widget is disabled or not hit-testable, -4 the widget's centre is not
+ * inside `win` at all.
+ *
+ * -4 exists because a widget's rect is not required to lie inside the client
+ * area. That is deliberate for DRAWING (the compositor clips, so a widget may
+ * hang off an edge) but it is not safe for a SYNTHESISED CLICK: this function
+ * projects the rect into screen space and presses that pixel, and the pixel is
+ * then re-resolved to whatever window is topmost there. Without the check, a
+ * button declared 400px wide inside a 200px-wide window presses a DIFFERENT
+ * window's widget, runs that app's handler, and moves the keyboard grab - while
+ * the caller is told it pressed its own button. Refusing is right rather than
+ * clamping: the widget genuinely is not where the caller thinks it is, and a
+ * clamped press would be a different lie. */
 int  gui_click_widget(uint32_t win, uint32_t widget_id);
 
 /* Service the GUI: drain the pointer, notice what the console wrote, repaint

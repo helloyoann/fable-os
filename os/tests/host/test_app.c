@@ -1260,25 +1260,69 @@ static int trace_lines(void) {
     return n;
 }
 
+/* Bytes one tool really spends in the assembled array, counting the JSON
+ * escaping core/tool.c applies to the description. The old version of this test
+ * used strlen(description), which UNDERCOUNTS every description containing a
+ * quote — and the `app` description now embeds a worked JSON example, so the
+ * undercount would have been ~40 bytes of invisible slack. */
+static size_t wire_cost(const tool_t *t) {
+    /* {"name":"","description":"","input_schema":} plus the two quoted values */
+    size_t n = 41 + strlen(t->name) + 2 + strlen(t->input_schema);
+    for (const char *p = t->description; p && *p; p++)
+        n += (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20) ? 2 : 1;
+    return n + 2;
+}
+
 static void test_tool_registry_and_schema_cost(void) {
     CHECK_EQ(tool_count(), 5);
     const tool_t *t = tool_find("app");
     CHECK(t != NULL);
     if (!t) return;
 
-    /* THE SHARED BUDGET. chat.h gives the whole machine CHAT_TOOLS_BYTES (32768)
-     * for every tool's schema together and offers the model NOTHING if that is
-     * exceeded. Measured with this file removed, this tree already spends 32330
-     * bytes on 44 tools — 437 left. This asserts what this file costs, by the
-     * same formula core/tool.c uses, so an innocent-looking edit to the
-     * description cannot silently take the machine over the edge. If this fails,
-     * do not raise the number: read the header of tools/app_tools.c. */
-    size_t cost = 41 + strlen(t->name) + 2 + strlen(t->description) + 2 +
-                  strlen(t->input_schema);
-    if (cost > 437)
-        printf("    (schema cost %zu bytes; the budget for this file is 437)\n",
-               cost);
-    CHECK(cost <= 437);
+    /* THE SHARED BUDGET, STATED HONESTLY.
+     *
+     * chat.h gives the whole machine CHAT_TOOLS_BYTES for every tool's schema
+     * together, and net/chat.c's tools_load() offers the model NOTHING if that
+     * is exceeded — a total failure, which is why this is pinned at all.
+     *
+     * THE NUMBER THIS TEST USED TO ASSERT WAS STALE AND IT MATTERED. It capped
+     * this file at 437 bytes because CHAT_TOOLS_BYTES was 32768 and 44 tools
+     * cost 32330. CHAT_TOOLS_BYTES is 40960 today and the full 45-tool registry
+     * assembles to CHAT_REGISTRY_BYTES. That stale 437 was the reason the `app`
+     * description had to stay too terse to be discoverable, which is the defect
+     * this change fixes: the description now costs ~1.8 KiB and buys a worked
+     * example the model can copy blind.
+     *
+     * The replacement literal went stale too, 699 bytes' worth, in this exact
+     * printf. So it is a constant now, in chat.h, and `make test-qemu` fails if
+     * the kernel's own banner disagrees with it — see CHAT_REGISTRY_BYTES.
+     *
+     * So the ceiling below is deliberately generous, and it is checked against
+     * the REAL wire cost including escaping. It exists to catch a description
+     * that runs away by kilobytes, not to shave bytes. Before raising it, get
+     * the true registry total from the banner rather than from a comment.
+     *
+     * RAISED 1800 -> 2100 once, and this is the whole justification. A live run
+     * showed the model refusing to build a ticking clock — "this machine can't
+     * tick on its own" — because the description still said "a clock with a
+     * Refresh button", written when app_tick() had no caller. kernel/main.c now
+     * calls it, so that sentence had become false, and the correction costs
+     * 150 bytes. Checked against the numbers, not against a feeling: the
+     * registry is CHAT_REGISTRY_BYTES of CHAT_TOOLS_BYTES=40960, and the
+     * CHAT_REQ_BYTES assertion below covers the second bound. Do not treat 2100
+     * as a target either. */
+    size_t cost = wire_cost(t);
+    printf("    (app tool wire cost %zu bytes; ceiling 2100, and the whole "
+           "45-tool registry is %d of CHAT_TOOLS_BYTES=%d)\n",
+           cost, CHAT_REGISTRY_BYTES, CHAT_TOOLS_BYTES);
+    CHECK(cost <= 2100);
+    CHECK(CHAT_REGISTRY_BYTES < CHAT_TOOLS_BYTES);
+
+    /* The headroom the banner reports must be real headroom, not a rounding
+     * error: a full history and this schema still have to share CHAT_REQ_BYTES
+     * with the system prompt (see chat.h's cliff note). */
+    CHECK((size_t)CHAT_REGISTRY_BYTES + CHAT_HISTORY_BYTES +
+          strlen(chat_system_prompt()) + 1400u < CHAT_REQ_BYTES);
 
     /* The advertised schema is valid JSON and really is an object, or
      * tool_usable() would drop the tool from the array without a word. */
@@ -1292,6 +1336,247 @@ static void test_tool_registry_and_schema_cost(void) {
     CHECK(need < sizeof buf);
     CHECK_EQ(json_parse(buf, need, &v), JSON_OK);
     CHECK_CONTAINS(buf, "\"name\":\"app\"");
+}
+
+/* ====================================================================== */
+/* THE DEFECT THIS FILE EXISTS TO PREVENT COMING BACK                      */
+/* ====================================================================== */
+
+/* WHAT WENT WRONG, so nobody re-introduces it by "tidying" a description.
+ *
+ * Asked for "a window that says hello", the live model answered that the two
+ * apps this kernel ships are calculator and notes, that there is no generic
+ * custom-window app, and that the closest it could do was open notes. Then it
+ * called gui_open app=notes. Every word of that was a faithful reading of the
+ * tool surface — and the machine could already do exactly what was asked.
+ *
+ * The cause was two tools claiming ONE headline use case in nearly identical
+ * words: gui_open said 'This is how "I want a calculator" becomes a real window'
+ * and listed two apps, and `app` said 'this is how "I want a calculator" becomes
+ * a real, clickable window'. gui_open read as a closed list of two, so the model
+ * believed it.
+ *
+ * These assertions are about WORDING, which is unusual for a kernel test and is
+ * the point: the wording IS the interface the model programs against, so it is
+ * as load-bearing as a struct layout and it regresses just as silently. */
+static void test_the_two_tools_do_not_claim_the_same_job(void) {
+    const tool_t *ga = tool_find("gui_open");
+    const tool_t *ap = tool_find("app");
+    CHECK(ga && ap);
+    if (!ga || !ap) return;
+
+    /* 1. THE COLLIDING CLAIM IS GONE FROM gui_open. It no longer presents itself
+     *    as the route from a wish to a window. */
+    CHECK(strstr(ga->description, "I want a calculator") == NULL);
+
+    /* 2. gui_open SAYS ITS LIST IS NOT THE LIMIT, and names where to go. This is
+     *    the exact sentence whose absence produced the apology. */
+    /* "not the limit", one needle, not two. CHECK_CONTAINS is a bare strstr, so
+     * the "not" this used to look for was found inside "notes" — a word the
+     * clause five lines down REQUIRES to be present. It therefore could not
+     * fail, and it passed on the pre-change description this whole test exists
+     * to reject. A guard that cannot fail is worse than no guard: it is a line
+     * of evidence that is really a tautology. */
+    CHECK_CONTAINS(ga->description, "not the limit");
+    CHECK_CONTAINS(ga->description, "`app`");
+    /* including in the property description, which is what a model reads when it
+     * is filling the argument in and used to see a bare "calculator or notes" */
+    CHECK_CONTAINS(ga->input_schema, "`app`");
+    CHECK(strstr(ga->input_schema, "\"description\":\"calculator or notes\"")
+          == NULL);
+    /* and it is still honest about what IT can open */
+    CHECK_CONTAINS(ga->description, "calculator");
+    CHECK_CONTAINS(ga->description, "notes");
+
+    /* 3. `app` READS AS THE GENERAL ANSWER, in the operator's own words rather
+     *    than in the format's words. */
+    CHECK_CONTAINS(ap->description, "I want <anything>");
+    CHECK_CONTAINS(ap->description, "stopwatch");
+    CHECK_CONTAINS(ap->description, "says hello");
+
+    /* 4. AND IT PRE-EMPTS THE APOLOGY ITSELF. */
+    CHECK_CONTAINS(ap->description, "never tell the operator");
+
+    /* 5. NEITHER TOOL IS THE OTHER'S ORPHAN: each names the other, so a model
+     *    that lands on the wrong one is one hop from the right one.
+     *
+     *    The needle is the BACKTICKED name. A bare "app" matched inside
+     *    "application" and inside "Apps:", so this clause also passed on the
+     *    old description — and it was already implied by clause 2's `app`
+     *    check, which makes it doubly dead. What is actually load-bearing is
+     *    the imperative next to the name, so assert that instead: gui_open must
+     *    tell the model to GO to the other tool, not merely mention it. */
+    CHECK_CONTAINS(ga->description, "with the `app` tool");
+    CHECK(strstr(ap->description, "gui_open") != NULL);
+}
+
+/* The happy path must not require action=format first. A model under pressure
+ * skips a "read the docs" call, so the description has to carry a document that
+ * REALLY LAUNCHES — asserted by extracting it from the description and running
+ * it, exactly as test_tool_format_teaches_the_format does for the full spec. */
+static void test_description_carries_a_document_that_launches(void) {
+    fixture();
+    const tool_t *ap = tool_find("app");
+    CHECK(ap != NULL);
+    if (!ap) return;
+
+    /* the description promises the example works as-is; hold it to that */
+    CHECK_CONTAINS(ap->description, "works as-is");
+
+    const char *s = strstr(ap->description, "{\"title\"");
+    CHECK(s != NULL);
+    if (!s) return;
+    /* the example ends at the last '}' of the widgets array + object */
+    const char *e = strstr(s, "\"col\":0}]}");
+    CHECK(e != NULL);
+    if (!e) return;
+    size_t n = (size_t)(e - s) + strlen("\"col\":0}]}");
+
+    char doc[512];
+    CHECK(n < sizeof doc);
+    memcpy(doc, s, n);
+    doc[n] = '\0';
+
+    uint32_t id = 0;
+    int rc = app_launch(doc, n, GUI_POS_AUTO, GUI_POS_AUTO, &id, &g_err);
+    if (rc != APP_OK)
+        printf("    (the description's example was rejected at %s: %s)\n",
+               g_err.path, g_err.msg);
+    CHECK_EQ(rc, APP_OK);
+    CHECK(id != 0);
+    /* and it is the window the operator asked for */
+    CHECK_STR(app_title(id), "Hi");
+}
+
+/* A model that guesses and fails must be able to fix itself on attempt two from
+ * the ERROR ALONE — no extra round spent on action=format. */
+static void test_a_failed_launch_teaches_the_format(void) {
+    fixture();
+
+    /* the archetypal guess: plausible shape, wrong in three ways at once
+     * (no placement, a kind that does not exist, a handler naming nothing) */
+    CHECK(call("{\"action\":\"launch\",\"document\":{\"title\":\"Hello\","
+               "\"widgets\":[{\"kind\":\"text\",\"text\":\"hello\"}]}}")
+          != TOOL_OK);
+    CHECK_EQ(res.is_error, 1);
+    CHECK_EQ(app_count(), 0);
+    CHECK_EQ(gui_window_count(), 0);
+
+    /* it says nothing was made... */
+    CHECK_CONTAINS(rbuf, "NOT launched");
+    /* ...names the fault... */
+    CHECK_CONTAINS(rbuf, "where:");
+    CHECK_CONTAINS(rbuf, "problem:");
+    /* ...AND hands over a document that launches, plus the rules a guess misses */
+    CHECK_CONTAINS(rbuf, "DOES launch");
+    CHECK_CONTAINS(rbuf, "\"kind\":\"label\"");
+    CHECK_CONTAINS(rbuf, "row+col");
+    CHECK_CONTAINS(rbuf, "call app action=launch again");
+    /* and where the rest of the spec is, for the case it needs more */
+    CHECK_CONTAINS(rbuf, "action=format");
+    CHECK_EQ(trace_lines(), 1);
+
+    /* THE WHOLE THING REACHES THE MODEL. chat.c clips a result at
+     * CHAT_TOOL_RESULT_CAP, and a skeleton that stops mid-document is worse than
+     * no skeleton: the model would copy a truncated example. */
+    if (res.len >= CHAT_TOOL_RESULT_CAP)
+        printf("    (rejection is %d bytes; the model only sees %d)\n",
+               (int)res.len, CHAT_TOOL_RESULT_CAP - 1);
+    CHECK(res.len < CHAT_TOOL_RESULT_CAP);
+    CHECK_EQ(res.truncated, 0);
+
+    /* ATTEMPT TWO ACTUALLY LANDS: the skeleton is lifted out of the error text
+     * and launched verbatim, which is the whole claim being made. */
+    const char *s = strchr(strstr(rbuf, "DOES launch"), '{');
+    CHECK(s != NULL);
+    if (!s) return;
+    const char *nl = strchr(s, '\n');
+    CHECK(nl != NULL);
+    if (!nl) return;
+    char doc[512];
+    size_t n = (size_t)(nl - s);
+    CHECK(n < sizeof doc);
+    memcpy(doc, s, n);
+    doc[n] = '\0';
+
+    uint32_t id = 0;
+    int rc = app_launch(doc, n, GUI_POS_AUTO, GUI_POS_AUTO, &id, &g_err);
+    if (rc != APP_OK)
+        printf("    (the skeleton in the error was rejected at %s: %s)\n",
+               g_err.path, g_err.msg);
+    CHECK_EQ(rc, APP_OK);
+    CHECK(id != 0);
+}
+
+/* THE WORST CASE, because this is where a helpful skeleton would silently eat
+ * the error it was supposed to explain. app_error_t carries a 72-byte path and a
+ * 224-byte msg; with both at full length the reply must STILL fit
+ * CHAT_TOOL_RESULT_CAP with the skeleton intact. */
+static void test_rejection_plus_skeleton_fits_the_result_cap(void) {
+    fixture();
+
+    /* A real rejection whose path and msg are both long: a handler naming a
+     * widget that does not exist makes the runtime append the known-name list,
+     * which is the wordiest message it produces. */
+    CHECK(call("{\"action\":\"launch\",\"document\":{"
+               "\"vars\":{\"averyveryverylongvariablename\":0},"
+               "\"widgets\":[{\"kind\":\"button\",\"text\":\"x\","
+               "\"name\":\"abutton\",\"rect\":[0,0,40,20]},"
+               "{\"kind\":\"field\",\"name\":\"anotherlongwidgetname\","
+               "\"rect\":[0,20,40,20]}],"
+               "\"on\":[{\"click\":\"aputton\",\"do\":[]}]}}") != TOOL_OK);
+    CHECK_CONTAINS(rbuf, "problem:");
+    CHECK_CONTAINS(rbuf, "DOES launch");
+    CHECK_CONTAINS(rbuf, "action=format");
+    CHECK(res.len < CHAT_TOOL_RESULT_CAP);
+    CHECK_EQ(res.truncated, 0);
+
+    /* NOW PROVE THE BOUND INSTEAD OF SAMPLING IT. Any observed rejection is one
+     * point; what matters is that the LONGEST one the runtime can emit still
+     * fits. The reply is a fixed preamble, then "where: <path>", then
+     * "problem: <msg>", then the fixed skeleton — so the maximum is computable
+     * from app_error_t's own field sizes, whatever message the runtime chooses.
+     *
+     * Both halves are measured out of the live reply rather than hardcoded, so
+     * editing either string keeps this honest. */
+    const char *where = strstr(rbuf, "where: ");
+    const char *skel  = strstr(rbuf, "This document DOES launch");
+    CHECK(where != NULL);
+    CHECK(skel != NULL);
+    if (!where || !skel) return;
+
+    size_t preamble = (size_t)(where - rbuf);
+    size_t skeleton = strlen(skel);
+    size_t path_max = sizeof ((app_error_t *)0)->path - 1;   /* 72 - NUL  */
+    size_t msg_max  = sizeof ((app_error_t *)0)->msg  - 1;   /* 224 - NUL */
+
+    /* "where: " + path + "\n" + "problem: " + msg + "\n" */
+    size_t worst = preamble + 7 + path_max + 1 + 9 + msg_max + 1 + skeleton;
+
+    printf("    (observed %d bytes; computable worst case %zu of %d "
+           "[preamble %zu + path %zu + msg %zu + skeleton %zu])\n",
+           (int)res.len, worst, CHAT_TOOL_RESULT_CAP,
+           preamble, path_max, msg_max, skeleton);
+    CHECK(worst < CHAT_TOOL_RESULT_CAP);
+}
+
+/* The system prompt must volunteer this capability, or the model never looks for
+ * the tool in the first place. Asserted here (not only in test_agency) because
+ * this suite links chat.c and owns the app surface. */
+static void test_system_prompt_offers_to_build_apps(void) {
+    const char *p = chat_system_prompt();
+    CHECK(p != NULL);
+    CHECK_CONTAINS(p, "BUILD GUI APPS");
+    /* it is specific about the mechanism, not vague encouragement */
+    CHECK_CONTAINS(p, "JSON document");
+    CHECK_CONTAINS(p, "no fixed catalogue");
+    /* it names the requests the model previously refused */
+    CHECK_CONTAINS(p, "stopwatch");
+    CHECK_CONTAINS(p, "says hello");
+    /* it says the built-in list is not the limit, which is what it got wrong */
+    CHECK_CONTAINS(p, "NOT the limit");
+    /* and it tells the model retrying is cheap */
+    CHECK_CONTAINS(p, "skeleton");
 }
 
 static void test_tool_format_teaches_the_format(void) {
@@ -1658,6 +1943,11 @@ int main(void) {
     RUN(test_submit_event_and_field_editing);
 
     RUN(test_tool_registry_and_schema_cost);
+    RUN(test_the_two_tools_do_not_claim_the_same_job);
+    RUN(test_description_carries_a_document_that_launches);
+    RUN(test_a_failed_launch_teaches_the_format);
+    RUN(test_rejection_plus_skeleton_fits_the_result_cap);
+    RUN(test_system_prompt_offers_to_build_apps);
     RUN(test_tool_format_teaches_the_format);
     RUN(test_tool_launch_list_state_close);
     RUN(test_tool_rejects_hostile_input_legibly);

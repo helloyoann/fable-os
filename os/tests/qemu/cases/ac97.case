@@ -1,6 +1,18 @@
 # =========================================================================
 # A driver written in the driver VM's ISA, driving real hardware.
 #
+# THIS CASE BOOTS A KERNEL THE OPERATOR DOES NOT GET. talk-os must know nothing
+# about an attached sound card — that is the premise, and a shipped AC'97 driver
+# would both contradict it and pre-empt the experiment by claiming the device
+# before anyone can type a sentence. So the reference bring-up lives in
+# tests/qemu/fixtures/ac97_boot.c and is linked only by the `build-cflags:` line
+# below; the default kernel contains no audio code at all, which is what
+# cases/audio-unclaimed.case asserts with the same device attached.
+#
+# Everything this case proves is therefore a claim about the VM, not about the
+# shipped kernel: that an `out16` in the ISA reaches real silicon on this
+# machine, so when a MODEL's driver fails, the failure is the model's.
+#
 # This is the case that makes a model-written driver's failures attributable.
 # The VM (include/dvm.h) was verified against a synthetic device on the host, and
 # the reference AC'97 program (vm/programs/ac97_bringup.dvm) against a
@@ -36,6 +48,10 @@ description: a hand-written .dvm program resets the codec, unmutes it, sets 48 k
 timeout: 60
 nic: user,model=e1000
 qemu-extra: -audiodev none,id=snd0 -device AC97,audiodev=snd0
+
+# The fixture build. Without this the kernel has no audio driver whatsoever and
+# every assertion below is absent, which is exactly the point of the flag.
+build-cflags: -DTALKOS_AC97_REFERENCE
 
 ready: ^> 
 ready [offline]: \[net init failed
@@ -85,7 +101,13 @@ expect-re: ^\[dvm\.print picb now = 0x[0-9a-f]+ -> ok\]$
 # The whole list drained (DCH set again) and the driver stopped the engine.
 expect-re: ^\[dvm\.print drained po_sr = 0x[0-9a-f]*[13579bdf] -> ok\]$
 expect: [dvm.print stopped po_cr = 0x0 -> ok]
-expect-re: ^\[dvm\.halt pc=\d+ ln=\d+ steps=\d+ io=\d+ \(pr=\d+ pw=\d+ mr=0 mw=0 pci=1\) delay=\d+ us prints=\d+ -> ok\]$
+# mr=0 mw=0 is the load-bearing part: the program reached no memory at all. The
+# dma= group is optional because the VM's DMA scratch grant is newer than this
+# case — but if the counters are printed they must be zero for the same reason.
+# This program's buffers belong to the C caller, so it needs no memory grant and
+# takes none, and a future non-zero here would mean the reference program had
+# quietly changed what it touches.
+expect-re: ^\[dvm\.halt pc=\d+ ln=\d+ steps=\d+ io=\d+ \(pr=\d+ pw=\d+ mr=0 mw=0 pci=1\)( dma=0 \(rd=0 wr=0\))? delay=\d+ us prints=\d+ -> ok\]$
 
 # ---- the kernel's summary ------------------------------------------------
 expect-re: ^ac97: played 500 ms of PCM through the driver VM \(\d+ instructions, \d+ device accesses, \d+ us of waiting\)$

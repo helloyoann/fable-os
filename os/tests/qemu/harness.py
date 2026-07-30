@@ -106,6 +106,14 @@ atexit.register(_reap_all)
 
 def _on_signal(signum, _frame):
     _reap_all()
+    # Re-raising below means atexit handlers never run, and one of them is
+    # load-bearing: a Ctrl-C in the middle of a `build-cflags:` case would
+    # otherwise leave the tree built with test-only flags. Do it here instead.
+    # (_restore_tree is a no-op unless a variant build is actually outstanding.)
+    try:
+        _restore_tree()
+    except Exception:                                        # noqa: BLE001
+        pass
     # Re-raise with the default handler so the exit status is honest.
     signal.signal(signum, signal.SIG_DFL)
     os.kill(os.getpid(), signum)
@@ -132,7 +140,7 @@ ASSERTIONS = {
     "check",          # named semantic check, see CHECKS
 }
 SETTINGS = {"name", "timeout", "ready", "nic", "qemu-extra", "description",
-            "send"}
+            "send", "build-cflags"}
 
 ESCAPES = {"\\n": "\n", "\\r": "\r", "\\t": "\t", "\\\\": "\\"}
 
@@ -200,6 +208,8 @@ class Case:
         self.ready = []          # (tags, regex-source)
         self.nic = "user,model=e1000"
         self.qemu_extra = []
+        self.build_cflags = ""   # see `build-cflags` in _setting()
+        self.kernel = KERNEL     # set per run; a build-cflags case gets its own
         self.assertions = []
         self.sends = []
         self._parse()
@@ -264,6 +274,23 @@ class Case:
             self.nic = arg.strip()
         elif kind == "qemu-extra":
             self.qemu_extra += shlex.split(arg)
+        elif kind == "build-cflags":
+            # EXTRA_CFLAGS for a case that cannot use the default kernel.bin.
+            # Only for things that must NOT be in a shipped image (the AC'97
+            # reference bring-up, the fault-injection self-test); everything a
+            # normal build has is asserted against the normal kernel. See
+            # variant_kernel() for what it costs and how the tree is restored.
+            #
+            # Restricted on purpose: this string is passed to make, and a case
+            # file must not be able to run a shell. No quotes, no $, no
+            # backticks, no semicolons — just -D/-U/-f/-W words.
+            spec = arg.strip()
+            if not re.fullmatch(r"[-A-Za-z0-9_=./ ]*", spec):
+                raise SyntaxError(
+                    "%s:%d: build-cflags %r may only contain flag characters "
+                    "([-A-Za-z0-9_=./ ]); it is handed to make, not to a shell"
+                    % (self.path, lineno, spec))
+            self.build_cflags = (self.build_cflags + " " + spec).strip()
         elif kind == "send":
             trig, sep, text = arg.partition("=>")
             if not sep:
@@ -451,9 +478,36 @@ def _http_response(log, args, r):
 TOOLS_RE = re.compile(
     r"^\s*tools\s*: (\d+) registered \((\d+) bytes of schema\)$", re.MULTILINE)
 
-# net/chat.c: CHAT_TOOLS_BYTES. The whole schema has to fit this buffer or
-# chat.c throws it away and offers the model no tools at all.
-CHAT_TOOLS_BYTES = 32768
+# include/chat.h owns these two, and they are READ FROM IT rather than copied.
+#
+#   CHAT_TOOLS_BYTES    the buffer the whole schema has to fit, or chat.c throws
+#                       it away and offers the model no tools at all.
+#   CHAT_REGISTRY_BYTES what the registry actually assembles to today.
+#
+# The copy that used to live here said 32768 while the header said 40960, and
+# the registry total was written down as a literal in three other files and
+# drifted 699 bytes below the truth with every suite still green. A number that
+# describes the kernel belongs in one place, and the place it belongs is the
+# header the kernel compiles. If the parse fails the checks below degrade to
+# their old lower-bound behaviour rather than inventing a value.
+def _chat_h_defines():
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "..", "..", "include", "chat.h")
+    out  = {}
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                m = re.match(r"\s*#define\s+(CHAT_\w+)\s+(\d+)\s*$", line)
+                if m:
+                    out[m.group(1)] = int(m.group(2))
+    except OSError:
+        pass
+    return out
+
+
+_CHAT_H = _chat_h_defines()
+CHAT_TOOLS_BYTES    = _CHAT_H.get("CHAT_TOOLS_BYTES", 40960)
+CHAT_REGISTRY_BYTES = _CHAT_H.get("CHAT_REGISTRY_BYTES")
 
 
 @check("tool_registry")
@@ -470,8 +524,16 @@ def _tool_registry(log, args, r):
     the schema (`the tool schema does not fit ... the model will be offered no
     tools at all`) — the machine boots and talks but can never act.
 
+    expect_schema_bytes=header additionally asserts the banner's M against
+    include/chat.h's CHAT_REGISTRY_BYTES. That is not a size limit, it is an
+    anti-drift latch: no host test links all 45 tools, so the header's number is
+    the only written-down copy of the real total, and three files once printed a
+    699-bytes-too-small copy of it as a measured fact while staying green. A
+    description that grows now fails HERE, with both numbers, instead of
+    silently making the next agent believe in headroom that is not there.
+
     args: min_tools=N  max_tools=N  min_schema_bytes=N  max_schema_bytes=N
-          min_bytes_per_tool=N
+          min_bytes_per_tool=N  expect_schema_bytes=header|N
     """
     min_tools = int(args.get("min_tools", 1))
     max_tools = int(args.get("max_tools", 4096))
@@ -512,6 +574,24 @@ def _tool_registry(log, args, r):
                "%d bytes of schema for %d tools is %d bytes each (expected "
                ">=%d) — the definitions look truncated"
                % (nbytes, ntools, nbytes // ntools, min_per))
+
+    want = args.get("expect_schema_bytes")
+    if want:
+        exact = CHAT_REGISTRY_BYTES if want == "header" else int(want)
+        if want == "header" and exact is None:
+            r.need(False, "expect_schema_bytes=header but CHAT_REGISTRY_BYTES "
+                          "could not be read out of include/chat.h")
+        else:
+            r.need(nbytes == exact,
+                   "the registry assembles to %d bytes but include/chat.h's "
+                   "CHAT_REGISTRY_BYTES says %d. One of them is stale, and it "
+                   "is almost certainly the header: a tool description grew. "
+                   "Set CHAT_REGISTRY_BYTES to %d. Do NOT adjust it by "
+                   "arithmetic on the old value — reading the banner is the "
+                   "whole point of this check. Real headroom is now %d bytes "
+                   "of CHAT_TOOLS_BYTES=%d."
+                   % (nbytes, exact, nbytes, CHAT_TOOLS_BYTES - nbytes,
+                      CHAT_TOOLS_BYTES))
 
 
 @check("occurrences")
@@ -719,6 +799,119 @@ def qemu_diagnosis(errpath, early, hit):
     return "\n".join(lines).strip()
 
 
+# --------------------------------------------------------------------------
+# per-case kernels
+#
+# Almost every case boots the tree's kernel.bin, and that is the point: the
+# assertions are about the kernel an operator actually gets. A few things must
+# be assertable and must NOT be in that kernel — the reference AC'97 bring-up
+# (tests/qemu/fixtures/ac97_boot.c) is one, because talk-os is supposed to know
+# nothing about the sound card someone attaches. Those cases name the flags they
+# need with `build-cflags:` and get their own kernel.
+#
+# It has to be built IN THE TREE: EXTRA_CFLAGS is recorded in .build-flags and a
+# change to it discards every kernel object (see os/Makefile), so there is no
+# out-of-tree object directory to build into. The rules that follow from that:
+#
+#   * the result is SNAPSHOTTED into the scratch dir and QEMU boots the snapshot,
+#     so no case can ever boot another case's kernel;
+#   * the tree is put back to the flags it was built with — whatever they were,
+#     read from .build-flags, not assumed to be empty — before any case runs, and
+#     again from atexit and from the signal handler. Leaving an operator's tree
+#     holding a kernel with a hand-written audio driver in it is precisely the
+#     state this project must not be in;
+#   * a flag flip costs two ~1s rebuilds for the whole suite, not per case.
+# --------------------------------------------------------------------------
+
+BUILD_STAMP = os.path.join(OSDIR, ".build-flags")
+
+
+class BuildError(Exception):
+    pass
+
+
+_base_cflags = None       # what the tree was built with when we started
+_tree_dirty = False       # True while the tree holds something else
+
+
+def base_cflags():
+    global _base_cflags
+    if _base_cflags is None:
+        try:
+            with open(BUILD_STAMP, "r", encoding="utf-8") as fh:
+                stamp = fh.read()
+        except OSError:
+            stamp = ""
+        _, sep, rest = stamp.partition("EXTRA_CFLAGS=")
+        _base_cflags = rest.strip() if sep else ""
+    return _base_cflags
+
+
+def _make(cflags, what):
+    """make -C os/ with an exact EXTRA_CFLAGS. No shell: the flags come from a
+    case file, and `subprocess` with a list argv gives them no way to become
+    commands even if the character filter in _setting() were wrong."""
+    proc = subprocess.run(["make", "-C", OSDIR, "-j8", "EXTRA_CFLAGS=" + cflags],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        tail = proc.stdout.decode("utf-8", "replace").strip().splitlines()[-25:]
+        raise BuildError("%s failed: make EXTRA_CFLAGS='%s' exited %d\n%s"
+                         % (what, cflags, proc.returncode,
+                            "\n".join("        " + t for t in tail)))
+
+
+def _restore_tree():
+    global _tree_dirty
+    if not _tree_dirty:
+        return
+    _tree_dirty = False
+    try:
+        _make(base_cflags(), "putting the tree's own kernel back")
+    except BuildError as e:
+        print(RED("warning: the tree is left built with test flags — "
+                  "run `make` before trusting kernel.bin\n%s" % e))
+
+
+atexit.register(_restore_tree)
+
+
+def build_variant_kernels(cases, workdir):
+    """Build a kernel for every distinct `build-cflags:` among `cases`.
+
+    Sets case.kernel / case.build_error on each one and leaves the tree exactly
+    as it was found. Returns the number of extra kernels built."""
+    global _tree_dirty
+    wanted = {}
+    for case in cases:
+        case.kernel = KERNEL
+        case.build_error = None
+        if case.build_cflags:
+            wanted.setdefault(case.build_cflags, []).append(case)
+    if not wanted:
+        return 0
+    try:
+        for cflags, group in sorted(wanted.items()):
+            full = (base_cflags() + " " + cflags).strip()
+            slug = re.sub(r"[^A-Za-z0-9]+", "-", cflags).strip("-") or "variant"
+            dest = os.path.join(workdir, "kernel-%s.bin" % slug)
+            print("  %-28s %s" % (DIM("building"),
+                                  DIM("EXTRA_CFLAGS=%s for %s" %
+                                      (cflags, ", ".join(c.name for c in group)))))
+            _tree_dirty = True
+            try:
+                _make(full, "building the kernel this case needs")
+                shutil.copy2(os.path.join(OSDIR, "kernel.bin"), dest)
+            except (BuildError, OSError) as e:
+                for c in group:
+                    c.build_error = str(e)
+                continue
+            for c in group:
+                c.kernel = dest
+    finally:
+        _restore_tree()
+    return len(wanted)
+
+
 def qemu_args(case, serial):
     """`serial` is a -serial chardev spec: file:<path> or unix:<sock>,...
 
@@ -730,8 +923,8 @@ def qemu_args(case, serial):
     nic = case.nic or "none"
     if nic != "none":
         nic = os.environ.get("TALKOS_TEST_NIC") or nic
-    return ([QEMU, "-kernel", KERNEL, "-display", "none", "-no-reboot",
-             "-serial", serial, "-nic", nic] + case.qemu_extra +
+    return ([QEMU, "-kernel", case.kernel or KERNEL, "-display", "none",
+             "-no-reboot", "-serial", serial, "-nic", nic] + case.qemu_extra +
             shlex.split(os.environ.get("TALKOS_TEST_QEMU_EXTRA", "")))
 
 
@@ -1038,6 +1231,10 @@ def main(argv):
     print("  cases  : %d" % len(cases))
     print()
 
+    # Cases that cannot use the tree's kernel get theirs now, so the tree is
+    # back to normal before the first boot and stays that way for the run.
+    build_variant_kernels(cases, workdir)
+
     results = []
     for case in cases:
         timeout = float(override_timeout) if override_timeout else case.timeout
@@ -1053,9 +1250,25 @@ def main(argv):
             sys.stdout.flush()
 
         t0 = time.time()
-        log, waited, hit_ready, qerr = boot(case, logpath, timeout, offline)
-        failures, notes, skipped = evaluate(case, log, offline, waited,
-                                            hit_ready)
+        qerr = ""
+        if getattr(case, "build_error", None):
+            # Its kernel could not be built, so there is nothing to boot. A
+            # failure, never a skip: the case exists to assert something.
+            failures = [Failure("could not build the kernel this case needs "
+                                "(build-cflags: %s)" % case.build_cflags,
+                                "      " + case.build_error)]
+            notes, skipped = [], 0
+        else:
+            log, waited, hit_ready, qerr = boot(case, logpath, timeout, offline)
+            failures, notes, skipped = evaluate(case, log, offline, waited,
+                                                hit_ready)
+            if case.kernel != KERNEL:
+                # Say so unprompted. A case that passes against a kernel the
+                # operator does not have must never look like a claim about the
+                # kernel the operator does have.
+                notes = ["not the tree's kernel: %s, built with EXTRA_CFLAGS=%s"
+                         % (os.path.basename(case.kernel),
+                            case.build_cflags)] + notes
         dt = time.time() - t0
 
         if failures:

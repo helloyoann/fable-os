@@ -54,14 +54,25 @@
 #include "json.h"
 #include "gui.h"
 #include "widgets.h"
+#include "kernel.h"      /* millis(): the default monotonic source            */
 
 #include <stdint.h>
 #include <stddef.h>
 #include <stdarg.h>
 #include <stdio.h>       /* vsnprintf / snprintf; port/stdio.h freestanding */
 
-/* The document as a C string, generated from apps/examples/calculator.json. */
+#ifndef TALKOS_HOSTTEST
+#include "rtc.h"         /* the default wall clock; see wall_default() below  */
+/* The machine's entropy source, already used to seed TLS (lib/libc_shim.c). It
+ * is declared here rather than through an mbedTLS header because this file must
+ * not depend on the TLS library's configuration to roll a die. */
+int mbedtls_hardware_poll(void *data, unsigned char *output, size_t len,
+                          size_t *olen);
+#endif
+
+/* The documents as C strings, generated from the .json files in apps/examples. */
 #include "examples/calculator_json.h"
+#include "examples/examples_json.h"
 
 /* ====================================================================== */
 /* small helpers                                                          */
@@ -98,6 +109,107 @@ static app_stats_t  stats;
 void app_note_err_value(void) { stats.err_values++; }
 
 const app_stats_t *app_stats(void) { return &stats; }
+
+/* ====================================================================== */
+/* the environment: time and randomness                                   */
+/* ====================================================================== */
+
+/* THREE FUNCTION POINTERS ARE THE WHOLE OF THIS RUNTIME'S CONTACT WITH THE
+ * MACHINE, and each has a default that is the real thing. The seam is not for
+ * abstraction's sake: without it, "the stopwatch counts up" and "the die shows 1
+ * to 6" would be claims about screenshots, and apps/ would drag the RTC driver
+ * into every host test that wants to run a calculator. */
+static app_ms_fn   src_ms;
+static app_wall_fn src_wall;
+static app_rand_fn src_rand;
+
+#ifndef TALKOS_HOSTTEST
+static int wall_default(app_wall_t *out) {
+    rtc_time_t t;
+    if (rtc_read(&t) != RTC_OK) return -1;
+    out->year   = (int32_t)t.year;
+    out->month  = (uint8_t)t.month;
+    out->day    = (uint8_t)t.day;
+    out->hour   = (uint8_t)t.hour;
+    out->minute = (uint8_t)t.minute;
+    out->second = (uint8_t)t.second;
+    return 0;
+}
+
+static uint64_t rand_default(void) {
+    uint64_t      v = 0;
+    size_t        got = 0;
+    unsigned char b[8];
+    if (mbedtls_hardware_poll((void *)0, b, sizeof b, &got) != 0 ||
+        got != sizeof b)
+        return 0;                    /* total, like everything else here */
+    for (int i = 0; i < 8; i++) v = (v << 8) | b[i];
+    return v;
+}
+#else
+/* On the host there is no CMOS, so the wall clock is honestly unavailable and
+ * every wall-clock leaf is ERR until a test installs a source. Randomness falls
+ * back to a splitmix64 over the monotonic clock: enough that rand() is not a
+ * constant in a test that has not pinned it, and never used in the kernel. */
+static int wall_default(app_wall_t *out) { (void)out; return -1; }
+
+static uint64_t rand_default(void) {
+    static uint64_t st;
+    st += 0x9E3779B97F4A7C15ull ^ millis();
+    uint64_t z = st;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+#endif
+
+static void env_begin(void);
+
+/* Installing a source discards the snapshot and takes a new one immediately: a
+ * reading that came from the source being replaced must not survive it. */
+void app_set_time_source(app_ms_fn ms, app_wall_fn wall) {
+    src_ms   = ms;
+    src_wall = wall;
+    env_begin();
+}
+
+void app_set_random_source(app_rand_fn fn) { src_rand = fn; }
+
+/* The snapshot. `ms` is refreshed once per event (a click, a submit, or an
+ * app_tick() that has something to do); the wall clock is read LAZILY, at most
+ * once per event, and only if an expression actually asks for it — a document
+ * that never says `clock` never touches the CMOS. */
+static uint64_t   env_ms;
+static app_wall_t env_wall;
+static int        env_wall_state;    /* 0 unsampled, 1 valid, -1 unavailable */
+
+static void env_begin(void) {
+    env_ms         = src_ms ? src_ms() : millis();
+    env_wall_state = 0;
+}
+
+/* `wall` NULL means "monotonic only, do not touch the CMOS". Without that the
+ * laziness this file documents was not lazy at all: expr.c's `now` leaf asked
+ * for both and discarded the wall clock, so a stopwatch — the one document
+ * whose only time leaf is `now`, and the one that needs no calendar — drove an
+ * rtc_read() on every single event. On a chip whose UIP bit never clears that
+ * read burns RTC_UIP_WAIT_MS = 20 ms, which against a 50 ms tick is 40% of a
+ * single-threaded polled kernel spent on a device the document never mentioned.
+ * Returns 1 only when a wall reading is available AND was asked for. */
+int app_env_now(uint64_t *ms, app_wall_t *wall) {
+    if (ms) *ms = env_ms;
+    if (!wall) return 0;
+    if (env_wall_state == 0) {
+        app_wall_fn fn = src_wall ? src_wall : wall_default;
+        env_wall_state = (fn(&env_wall) == 0) ? 1 : -1;
+    }
+    if (env_wall_state == 1 && wall) *wall = env_wall;
+    return env_wall_state == 1;
+}
+
+uint64_t app_env_random(void) {
+    return src_rand ? src_rand() : rand_default();
+}
 
 static app_inst_t *inst_of(uint32_t id) {
     if (!id) return (app_inst_t *)0;
@@ -215,9 +327,14 @@ static int f_scaled(const json_value_t *v, int64_t *out) {
 /* names                                                                  */
 /* ====================================================================== */
 
+/* Every name an expression already means something by. A var or widget called
+ * one of these would be unreachable (the compiler resolves the built-in first),
+ * so it is refused at load time with the word named — a silent shadow would be an
+ * app whose display never updates for no visible reason. */
 static const char *const reserved[] = {
     "key", "num", "text", "cat", "len", "digits", "has", "iserr",
-    "abs", "min", "max", 0
+    "abs", "min", "max", "round", "rand", "at",
+    "now", "clock", "today", "hour", "minute", "second", 0
 };
 
 /* A name must be usable as an identifier in an expression, or the app would
@@ -356,6 +473,164 @@ static int compile_expr_field(app_inst_t *in, const json_value_t *obj,
     return APP_OK;
 }
 
+/* Resolve a name a statement assigns to: a var or a named widget. Shared by
+ * "set" and by a call's "into", so the two cannot disagree about what a target
+ * is. 1 on success, 0 when the name is neither. */
+static int resolve_target(const app_inst_t *in, const char *name,
+                          uint8_t *kind, uint16_t *idx) {
+    for (uint16_t i = 0; i < in->nvar; i++)
+        if (a_eq(name, in->vname[i])) { *kind = AT_VAR; *idx = i; return 1; }
+    for (uint16_t i = 0; i < in->nwidget; i++)
+        if (in->wname[i][0] && a_eq(name, in->wname[i])) {
+            *kind = AT_WIDGET; *idx = i; return 1;
+        }
+    return 0;
+}
+
+/* ====================================================================== */
+/* compiling {"call":...} — the capability statement (app.h DECISION 4)     */
+/* ====================================================================== */
+
+/* The keys this capability accepts inside "with", named in the refusal an
+ * unknown one earns. Built from apps/cap.c's table, so a capability that gains
+ * an argument gains it here too with no edit. */
+static int check_with_keys(const json_value_t *obj, const char *path, int cap,
+                           app_error_t *err) {
+    size_t n = json_count(obj);
+    for (size_t i = 0; i < n; i++) {
+        json_value_t k;
+        char         key[APP_NAME_MAX + 8];
+        size_t       kl = 0;
+        if (json_member(obj, i, &k, (json_value_t *)0) != JSON_OK) continue;
+        if (json_str(&k, key, sizeof key, &kl) != JSON_OK)
+            return rej(err, APP_EINVAL, path, "has a key longer than %d bytes",
+                       (int)sizeof key - 1);
+        if (a_eq(key, "note")) continue;
+        int ok = 0;
+        for (int j = 0; j < app_cap_nargs(cap) && !ok; j++)
+            ok = a_eq(key, app_cap_arg(cap, j)->name);
+        if (!ok) {
+            char list[120];
+            size_t o = 0;
+            list[0] = '\0';
+            for (int j = 0; j < app_cap_nargs(cap); j++) {
+                const char *nm = app_cap_arg(cap, j)->name;
+                size_t need = a_len(nm) + (o ? 2 : 0);
+                if (o + need + 1 >= sizeof list) break;
+                if (o) { list[o++] = ','; list[o++] = ' '; }
+                a_cpy(list + o, sizeof list - o, nm);
+                o += a_len(nm);
+            }
+            return rej(err, APP_EINVAL, path,
+                       "unknown argument \"%s\" for %s (nothing would read it). "
+                       "Accepted: %s", key, app_cap_name(cap), list);
+        }
+    }
+    return APP_OK;
+}
+
+static int compile_call(app_inst_t *in, const json_value_t *st,
+                        const char *path, app_stmt_t *out, app_error_t *err) {
+    char         name[APP_NAME_MAX + 16];
+    char         p[72];
+    json_value_t with;
+    int          rc = f_str(st, "call", name, sizeof name);
+
+    pathf(p, sizeof p, "%s.call", path);
+    if (rc == 0 || rc == -1)
+        return rej(err, APP_EINVAL, p,
+                   "must be the name of a capability, as a string");
+    if (rc == -2 || rc == -3) {
+        char known[96];
+        app_cap_names(known, sizeof known);
+        return rej(err, APP_EINVAL, p,
+                   "is not a capability this kernel offers. Available: %s",
+                   known);
+    }
+
+    int cap = app_cap_lookup(name);
+    if (cap < 0) {
+        char known[96];
+        app_cap_names(known, sizeof known);
+        return rej(err, APP_EINVAL, p,
+                   "\"%s\" is not a capability this kernel offers. Available: "
+                   "%s. An app cannot name a driver or a device - only one of "
+                   "these", name, known);
+    }
+    if (in->ncall >= APP_MAX_CALLS)
+        return rej(err, APP_ENOSPC, p,
+                   "this app has more than %d \"call\" statements; one handler "
+                   "with a shared \"tag\" can serve many widgets",
+                   APP_MAX_CALLS);
+
+    app_call_t *cl = &in->call[in->ncall];
+    out->kind = AS_CALL;
+    out->tgt  = in->ncall;
+    cl->cap   = (uint8_t)cap;
+
+    /* ---- with ---- */
+    int has_with = (json_get(st, "with", &with) == JSON_OK &&
+                    with.type != JSON_NULL);
+    char wp[72];
+    pathf(wp, sizeof wp, "%s.with", path);
+    if (has_with) {
+        if (with.type != JSON_OBJECT)
+            return rej(err, APP_EINVAL, wp,
+                       "must be an object of argument -> expression string, e.g. "
+                       "{\"hz\":\"440\",\"ms\":\"120\"}");
+        int krc = check_with_keys(&with, wp, cap, err);
+        if (krc != APP_OK) return krc;
+    }
+
+    for (int k = 0; k < app_cap_nargs(cap); k++) {
+        const app_cap_arg_t *a = app_cap_arg(cap, k);
+        json_value_t         probe;
+        int present = has_with && json_get(&with, a->name, &probe) == JSON_OK &&
+                      probe.type != JSON_NULL;
+        if (!present) {
+            if (a->required) {
+                char ap[72];
+                pathf(ap, sizeof ap, "%s.%s", wp, a->name);
+                return rej(err, APP_EINVAL, ap,
+                           "%s needs \"%s\": an expression string%s%s",
+                           app_cap_name(cap), a->name,
+                           a->choices ? " - " : "",
+                           a->choices ? a->choices : "");
+            }
+            continue;
+        }
+        /* Every argument is an expression string, exactly like a "set"'s "to",
+         * so its VALUE is only known when the handler runs — which is where the
+         * bounds are enforced (apps/cap.c). What is checked here is that it is a
+         * string and that it compiles. */
+        int crc = compile_expr_field(in, &with, a->name, wp, &cl->expr[k], err);
+        if (crc != APP_OK) return crc;
+        cl->argmask |= (uint8_t)(1u << k);
+    }
+
+    /* ---- into ---- */
+    char into[APP_NAME_MAX];
+    rc = f_str(st, "into", into, sizeof into);
+    if (rc == 1) {
+        char ip[72];
+        pathf(ip, sizeof ip, "%s.into", path);
+        if (!resolve_target(in, into, &cl->into_kind, &cl->into))
+            return rej(err, APP_EINVAL, ip,
+                       "\"%s\" is not a var or a named widget. \"into\" is where "
+                       "the outcome goes: declare it in \"vars\", or give the "
+                       "widget you mean a \"name\"", into);
+        cl->has_into = 1;
+    } else if (rc < 0) {
+        char ip[72];
+        pathf(ip, sizeof ip, "%s.into", path);
+        return rej(err, APP_EINVAL, ip,
+                   "must be the name of a var or widget to put the outcome in");
+    }
+
+    in->ncall++;
+    return APP_OK;
+}
+
 static int compile_stmt(app_inst_t *in, const json_value_t *st,
                         const char *path, int depth, uint16_t slot,
                         app_error_t *err) {
@@ -363,27 +638,32 @@ static int compile_stmt(app_inst_t *in, const json_value_t *st,
     app_stmt_t  *out = &in->stmt[slot];
 
     static const char *const skeys[] = {
-        "set", "to", "if", "then", "else", "stop", 0
+        "set", "to", "if", "then", "else", "stop", "call", "with", "into", 0
     };
 
     if (st->type != JSON_OBJECT)
         return rej(err, APP_EINVAL, path,
                    "a statement must be a JSON object: {\"set\":...,\"to\":...}, "
-                   "{\"if\":...,\"then\":[...]} or {\"stop\":true}");
+                   "{\"if\":...,\"then\":[...]}, {\"call\":...,\"with\":{...}} or "
+                   "{\"stop\":true}");
     if (check_keys(st, path, skeys, err) != APP_OK) return APP_EINVAL;
 
     int has_set  = json_get(st, "set",  &v) == JSON_OK;
     int has_if   = json_get(st, "if",   &v) == JSON_OK;
     int has_stop = json_get(st, "stop", &v) == JSON_OK;
-    if (has_set + has_if + has_stop == 0)
+    int has_call = json_get(st, "call", &v) == JSON_OK;
+    if (has_set + has_if + has_stop + has_call == 0)
         return rej(err, APP_EINVAL, path,
                    "no known verb. A statement is {\"set\":\"<name>\",\"to\":"
                    "\"<expr>\"}, {\"if\":\"<expr>\",\"then\":[...],\"else\":"
-                   "[...]} or {\"stop\":true}");
-    if (has_set + has_if + has_stop > 1)
+                   "[...]}, {\"call\":\"<capability>\",\"with\":{...}} or "
+                   "{\"stop\":true}");
+    if (has_set + has_if + has_stop + has_call > 1)
         return rej(err, APP_EINVAL, path,
                    "a statement must carry exactly one verb, but it has more "
-                   "than one of \"set\", \"if\" and \"stop\"");
+                   "than one of \"set\", \"if\", \"call\" and \"stop\"");
+
+    if (has_call) return compile_call(in, st, path, out, err);
 
     if (has_stop) {
         int on = 0;
@@ -409,17 +689,7 @@ static int compile_stmt(app_inst_t *in, const json_value_t *st,
             return rej(err, APP_EINVAL, p, "contains an embedded NUL character");
 
         out->kind = AS_SET;
-        int found = 0;
-        for (uint16_t i = 0; i < in->nvar; i++)
-            if (a_eq(target, in->vname[i])) {
-                out->tgt_kind = AT_VAR; out->tgt = i; found = 1; break;
-            }
-        if (!found)
-            for (uint16_t i = 0; i < in->nwidget; i++)
-                if (in->wname[i][0] && a_eq(target, in->wname[i])) {
-                    out->tgt_kind = AT_WIDGET; out->tgt = i; found = 1; break;
-                }
-        if (!found)
+        if (!resolve_target(in, target, &out->tgt_kind, &out->tgt))
             return rej(err, APP_EINVAL, p,
                        "\"%s\" is not a var or a named widget. Declare it in "
                        "\"vars\", or give the widget you mean a \"name\"", target);
@@ -809,20 +1079,29 @@ static uint64_t select_mask(const app_inst_t *in, const char *sel) {
     return mask;
 }
 
-/* Names and tags that exist, for the error a mistyped selector earns. */
+/* Names and tags that exist, for the error a mistyped selector earns.
+ *
+ * BOTH, not one per widget. This used to prefer a widget's name and fall back
+ * to its tag, so a keypad whose buttons each have a name AND the shared tag
+ * "digit" - the exact shape the tool description recommends, because one
+ * handler is supposed to serve ten keys - listed k1, k2, k3 ... and never
+ * mentioned "digit" at all. A model that mistyped the tag was handed a list
+ * that omitted the only word it could have wanted, and there is no other way to
+ * see a tag: tags are compile-time-only (they live in descs[], not in
+ * app_inst_t), so app_describe() cannot show them either. Duplicates are
+ * suppressed, so a tag shared by ten buttons still appears once. */
 static void put_selectors(const app_inst_t *in, char *dst, size_t cap) {
     size_t o = 0;
     if (!cap) return;
     dst[0] = '\0';
-    for (uint16_t i = 0; i < in->nwidget; i++) {
-        const char *n = in->wname[i][0] ? in->wname[i]
-                      : (descs[i].tag[0] ? descs[i].tag : (const char *)0);
-        if (!n) continue;
+    for (uint16_t i = 0; i < in->nwidget * 2; i++) {
+        uint16_t    wi = (uint16_t)(i / 2);
+        const char *n  = (i & 1) ? descs[wi].tag : in->wname[wi];
+        if (!n[0]) continue;
         int dup = 0;
         for (uint16_t k = 0; k < i && !dup; k++) {
-            const char *m = in->wname[k][0] ? in->wname[k]
-                          : (descs[k].tag[0] ? descs[k].tag : (const char *)0);
-            if (m && a_eq(m, n)) dup = 1;
+            const char *m = (k & 1) ? descs[k / 2].tag : in->wname[k / 2];
+            if (m[0] && a_eq(m, n)) dup = 1;
         }
         if (dup) continue;
         size_t need = a_len(n) + (o ? 2 : 0);
@@ -867,9 +1146,24 @@ static int parse_selectors(app_inst_t *in, const json_value_t *sel,
         if (!m) {
             char known[160];
             put_selectors(in, known, sizeof known);
+            /* THE MOST REPEATED MISTAKE IN THE LIVE TRANSCRIPTS, by a distance:
+             * the model writes the button's visible text here. Saying so costs
+             * a clause and saves a whole round, so check whether that is what
+             * happened and name the fix instead of just listing what exists. */
+            int is_text = 0;
+            for (uint16_t k = 0; k < in->nwidget && !is_text; k++)
+                if (a_eq(one, descs[k].text)) is_text = 1;
+            if (is_text)
+                return rej(err, APP_EINVAL, path,
+                           "\"%s\" is a widget's VISIBLE TEXT, not a selector. A "
+                           "handler reaches a widget by its \"name\" (unique) or "
+                           "its \"tag\" (shared), never by what it displays - so "
+                           "give that widget a \"name\" and use that. Selectors "
+                           "that exist now: %s", one, known);
             return rej(err, APP_EINVAL, path,
-                       "no widget has the name or tag \"%s\". Available: %s",
-                       one, known);
+                       "no widget has the name or tag \"%s\" (a selector is a "
+                       "widget's \"name\" or \"tag\", never its visible text). "
+                       "Available: %s", one, known);
         }
         mask |= m;
     }
@@ -892,10 +1186,12 @@ static int parse_handlers(app_inst_t *in, const json_value_t *root,
         return rej(err, APP_ENOSPC, "on", "%d handlers; the limit is %d",
                    (int)n, APP_MAX_HANDLERS);
 
+    int nticks = 0;
+
     for (size_t i = 0; i < n; i++) {
         json_value_t h, sel, doarr;
         char         p[72];
-        static const char *const hkeys[] = { "click", "submit", "do", 0 };
+        static const char *const hkeys[] = { "click", "submit", "tick", "do", 0 };
 
         pathf(p, sizeof p, "on[%d]", (int)i);
         if (json_at(&arr, i, &h) != JSON_OK || h.type != JSON_OBJECT)
@@ -904,23 +1200,49 @@ static int parse_handlers(app_inst_t *in, const json_value_t *root,
 
         int has_click  = json_get(&h, "click",  &sel) == JSON_OK;
         int has_submit = json_get(&h, "submit", &sel) == JSON_OK;
-        if (has_click && has_submit)
+        int has_tick   = json_get(&h, "tick",   &sel) == JSON_OK;
+        if (has_click + has_submit + has_tick > 1)
             return rej(err, APP_EINVAL, p,
-                       "a handler carries exactly one event: \"click\" or "
-                       "\"submit\", not both");
-        if (!has_click && !has_submit)
+                       "a handler carries exactly one event: \"click\", "
+                       "\"submit\" or \"tick\", not more than one");
+        if (!has_click && !has_submit && !has_tick)
             return rej(err, APP_EINVAL, p,
                        "needs an event key: \"click\" (a button or field was "
-                       "pressed) or \"submit\" (a line was typed into a field)");
+                       "pressed), \"submit\" (a line was typed into a field) or "
+                       "\"tick\" (every N milliseconds, by itself)");
 
         app_handler_t *out = &in->handler[in->nhandler];
-        out->ev = has_click ? AE_CLICK : AE_SUBMIT;
-        json_get(&h, has_click ? "click" : "submit", &sel);
-
         char sp[72];
-        pathf(sp, sizeof sp, "%s.%s", p, has_click ? "click" : "submit");
-        int src = parse_selectors(in, &sel, sp, &out->mask, err);
-        if (src != APP_OK) return src;
+
+        out->ev     = has_click ? AE_CLICK : (has_submit ? AE_SUBMIT : AE_TICK);
+        out->mask   = 0;
+        out->period = 0;
+        out->due    = 0;
+
+        if (has_tick) {
+            /* A period, not a selector: nothing was clicked, so the handler
+             * belongs to the app rather than to a widget. `due` stays 0, which
+             * means "as soon as app_tick() is next called" — a clock that showed
+             * nothing for its first second would look broken. */
+            int64_t ms = 0;
+            pathf(sp, sizeof sp, "%s.tick", p);
+            if (++nticks > APP_MAX_TICKS)
+                return rej(err, APP_ENOSPC, sp,
+                           "an app may have at most %d \"tick\" handlers (this "
+                           "is the bound on how much work a document can ask for "
+                           "per period)", APP_MAX_TICKS);
+            if (f_int(&h, "tick", APP_TICK_MIN_MS, APP_TICK_MAX_MS, &ms) != 1)
+                return rej(err, APP_EINVAL, sp,
+                           "must be a whole number of milliseconds between %d "
+                           "and %d: how often this handler runs. 1000 is once a "
+                           "second", APP_TICK_MIN_MS, APP_TICK_MAX_MS);
+            out->period = (uint32_t)ms;
+        } else {
+            json_get(&h, has_click ? "click" : "submit", &sel);
+            pathf(sp, sizeof sp, "%s.%s", p, has_click ? "click" : "submit");
+            int src = parse_selectors(in, &sel, sp, &out->mask, err);
+            if (src != APP_OK) return src;
+        }
 
         pathf(sp, sizeof sp, "%s.do", p);
         if (json_get(&h, "do", &doarr) != JSON_OK || doarr.type != JSON_ARRAY)
@@ -946,6 +1268,27 @@ static void note(app_inst_t *in, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* Put a value into a var or a widget. The one write path for both AS_SET and a
+ * capability's "into", so an outcome delivered a moment after the handler ran
+ * lands exactly where an assignment would have. Marking damage is enough: the
+ * compositor paints it on the next gui_tick(), which is the same pass that will
+ * ask for the sound. */
+static void put_value(app_inst_t *in, gui_window_t *win, uint8_t tgt_kind,
+                      uint16_t tgt, const app_val_t *v) {
+    if (tgt_kind == AT_VAR) {
+        if (tgt < in->nvar) in->var[tgt] = *v;
+        return;
+    }
+    if (!win || tgt >= win->nwidgets) return;
+
+    char          txt[APP_TEXT_MAX];
+    gui_widget_t *w = &win->widgets[tgt];
+    app_val_text(v, txt, sizeof txt);
+    gui_set_text(w, txt);
+    if (w->kind == GUI_FIELD) w->caret = (uint16_t)a_len(txt);
+    gui_invalidate_widget(win->id, w);
+}
+
 /* Returns 1 when the block asked to stop. */
 static int exec_block(app_inst_t *in, gui_window_t *win, const app_val_t *key,
                       uint16_t first, uint16_t count, int depth, int *budget) {
@@ -966,19 +1309,60 @@ static int exec_block(app_inst_t *in, gui_window_t *win, const app_val_t *key,
         if (s->kind == AS_SET) {
             app_val_t v = app_expr_eval(in, s->expr, key, win);
             stats.sets++;
-            if (s->tgt_kind == AT_VAR) {
-                if (s->tgt < in->nvar) in->var[s->tgt] = v;
-            } else if (win && s->tgt < win->nwidgets) {
-                char         txt[APP_TEXT_MAX];
-                gui_widget_t *w = &win->widgets[s->tgt];
-                app_val_text(&v, txt, sizeof txt);
-                if (v.kind == AV_ERR)
-                    note(in, "an expression produced an error value, so \"%s\" "
-                             "now reads \"error\"",
-                         in->wname[s->tgt][0] ? in->wname[s->tgt] : "a widget");
-                gui_set_text(w, txt);
-                if (w->kind == GUI_FIELD) w->caret = (uint16_t)a_len(txt);
-                gui_invalidate_widget(win->id, w);
+            if (s->tgt_kind == AT_WIDGET && v.kind == AV_ERR && win &&
+                s->tgt < win->nwidgets)
+                note(in, "an expression produced an error value, so \"%s\" now "
+                         "reads \"error\"",
+                     in->wname[s->tgt][0] ? in->wname[s->tgt] : "a widget");
+            put_value(in, win, s->tgt_kind, s->tgt, &v);
+            continue;
+        }
+
+        /* AS_CALL — ask the kernel for something the app cannot do itself.
+         *
+         * NOTHING HERE TOUCHES A DEVICE, and that is the whole design: the
+         * arguments are evaluated (arithmetic, exactly as bounded as any other
+         * expression) and handed to the broker, which validates them and QUEUES
+         * the call for app_service(). So a click costs the same time whether or
+         * not it makes a noise, and a document cannot reach a driver while the
+         * runtime is halfway through executing it. See app.h DECISION 4. */
+        if (s->kind == AS_CALL) {
+            if (s->tgt >= in->ncall) continue;      /* cannot happen; total anyway */
+            const app_call_t *cl = &in->call[s->tgt];
+            app_val_t         av[APP_CAP_MAX_ARGS];
+            app_cap_req_t     rq;
+            /* why[] is sized to lasterr[]: a refusal must reach the model
+             * whole, and audio.h's own no-sink sentence is 155 bytes of it. */
+            char              why[224], brief[APP_TEXT_MAX];
+
+            for (int k = 0; k < APP_CAP_MAX_ARGS; k++)
+                av[k] = ((cl->argmask >> k) & 1)
+                            ? app_expr_eval(in, cl->expr[k], key, win)
+                            : app_val_num(0);
+
+            rq.app       = in->win;
+            rq.cap       = cl->cap;
+            rq.now_ms    = env_ms;
+            rq.arg       = av;
+            rq.argmask   = cl->argmask;
+            rq.has_into  = cl->has_into;
+            rq.into_kind = cl->into_kind;
+            rq.into      = cl->into;
+
+            int crc = app_cap_request(&rq, why, sizeof why, brief, sizeof brief);
+            if (crc == APP_OK) {
+                stats.calls++;
+            } else {
+                /* A refusal is the app's to display: the short verdict goes to
+                 * "into" now (the outcome of an accepted call arrives later,
+                 * from app_service), and the full sentence becomes this app's
+                 * note, which app action=state prints for the model. */
+                stats.calls_refused++;
+                note(in, "%s", why);
+                if (cl->has_into) {
+                    app_val_t v = app_val_str(brief);
+                    put_value(in, win, cl->into_kind, cl->into, &v);
+                }
             }
             continue;
         }
@@ -1020,6 +1404,10 @@ static int app_event(gui_window_t *win, gui_widget_t *w, const gui_event_t *ev) 
     int idx = gui_widget_index(win, w);
     if (idx < 0 || idx >= APP_MAX_WIDGETS) return 0;
 
+    /* One time reading for the whole event, taken before any handler runs: a
+     * stopwatch's "start" and the display it writes must agree about `now`. */
+    env_begin();
+
     uint8_t   want = (ev->kind == GUI_EV_CLICK) ? AE_CLICK : AE_SUBMIT;
     app_val_t key  = app_val_str(w->text);
     int       ran  = 0;
@@ -1037,6 +1425,107 @@ static int app_event(gui_window_t *win, gui_widget_t *w, const gui_event_t *ev) 
         (void)exec_block(in, win, &key, h->first, h->count, 0, &budget);
     }
     return ran;
+}
+
+/* ====================================================================== */
+/* app_tick — the periodic event                                          */
+/* ====================================================================== */
+
+/* WHY THIS CANNOT RUN AWAY, in the terms the idle loop needs:
+ *   - it is O(APP_MAX_INSTANCES * APP_MAX_HANDLERS) comparisons when nothing is
+ *     due, and it does not even read the clock unless some app declared a tick;
+ *   - a due handler runs ONCE and its next due time is computed from the reading
+ *     just taken. There is no catch-up loop, so a handler that was late by ten
+ *     minutes runs once, not twelve thousand times — the classic way a periodic
+ *     timer wedges a single-threaded machine;
+ *   - each run gets its own APP_MAX_STEPS budget, exactly like a click, and at
+ *     most APP_MAX_TICKS handlers per app can be periodic at all;
+ *   - a clock that jumps BACKWARDS (a suspend/resume, or a test installing
+ *     another source) would otherwise silence an app until the old due time came
+ *     round again, so a due time further away than one period is pulled back.
+ * The only thing a tick handler can do is what a click handler can do: assign to
+ * its own vars and its own widgets, and ask the kernel for a capability — which
+ * is queued, not performed, so a tick cannot block either (app.h DECISION 4). It
+ * cannot open, close or reach another window, and it cannot print. */
+static int run_ticks(void) {
+    int ran = 0, any = 0;
+
+    for (int i = 0; i < APP_MAX_INSTANCES && !any; i++) {
+        if (!pool[i].used) continue;
+        for (uint16_t k = 0; k < pool[i].nhandler; k++)
+            if (pool[i].handler[k].ev == AE_TICK) { any = 1; break; }
+    }
+    if (!any) return 0;
+
+    env_begin();
+
+    for (int i = 0; i < APP_MAX_INSTANCES; i++) {
+        app_inst_t   *in  = &pool[i];
+        gui_window_t *win;
+        if (!in->used) continue;
+        win = gui_window(in->win);
+        if (!win) continue;
+
+        for (uint16_t k = 0; k < in->nhandler; k++) {
+            app_handler_t *h = &in->handler[k];
+            if (h->ev != AE_TICK || h->period == 0) continue;
+            if (h->due > env_ms + h->period) h->due = env_ms;   /* clock went back */
+            if (env_ms < h->due) continue;
+
+            h->due = env_ms + h->period;
+
+            app_val_t key    = app_val_str("");
+            int       budget = APP_MAX_STEPS;
+            stats.events++;
+            stats.ticks++;
+            (void)exec_block(in, win, &key, h->first, h->count, 0, &budget);
+            ran++;
+        }
+    }
+    return ran;
+}
+
+/* The idle loop's one call, and it stays one call: the periodic handlers first
+ * (they may ask for a sound), then the pump that performs at most one request.
+ * The return value is still the number of TICK HANDLERS that ran — a caller that
+ * counts ticks must not start counting sounds — and app_service() is public for a
+ * loop that would rather call it itself. */
+int app_tick(void) {
+    int ran = run_ticks();
+    (void)app_service();
+    return ran;
+}
+
+/* ====================================================================== */
+/* app_service — the capability pump                                      */
+/* ====================================================================== */
+
+/* Called at the END of app_tick(), so a request a tick handler just made is
+ * performed on the same pass and the loop in kernel/main.c needs no edit. The
+ * clock is read only when something is actually waiting: with nothing queued this
+ * is one flag test, which is what makes it safe to call as often as the idle loop
+ * likes. */
+int app_service(void) {
+    if (!app_cap_pending()) return 0;
+    uint64_t ms = src_ms ? src_ms() : millis();
+    return app_cap_service(ms);
+}
+
+/* ---- what apps/cap.c calls back into ---- */
+
+void app_note_sound(void) { stats.hw_actions++; }
+
+void app_cap_note(uint32_t id, const char *text) {
+    app_inst_t *in = inst_of(id);
+    if (in) note(in, "%s", text ? text : "");
+}
+
+void app_cap_deliver(uint32_t id, uint8_t tgt_kind, uint16_t tgt,
+                     const char *text) {
+    app_inst_t *in = inst_of(id);
+    if (!in) return;                 /* the app closed while the sound played */
+    app_val_t v = app_val_str(text ? text : "");
+    put_value(in, gui_window(in->win), tgt_kind, tgt, &v);
 }
 
 /* ====================================================================== */
@@ -1059,12 +1548,76 @@ static int instantiate(app_inst_t *in, int32_t x, int32_t y,
                    "be open); close one and try again", GUI_MAX_WINDOWS);
 
     gui_window_t *win = gui_window(id);
-    gui_rect_t    area = gui_inset(gui_client_area(win), g_pad, g_pad);
+    gui_rect_t    client = gui_client_area(win);
+    gui_rect_t    area = gui_inset(client, g_pad, g_pad);
+
+    /* THE WINDOW MUST BE BIG ENOUGH FOR ITS OWN GRID.
+     *
+     * gui_inset() returns an empty rect when the padding eats the client area,
+     * and gui_grid() returns 0,0 0x0 when a cell has no room left. Both are
+     * correct as geometry and catastrophic as an outcome: every widget is added
+     * with zero area, gui_paint_widget() early-returns on each, the operator
+     * sees an EMPTY WINDOW, and the launch still answers "with 12 widget(s) ...
+     * It is live: a real mouse can click it". That is exactly the failure
+     * app.h's DECISIONS call the most confusing one a model can be left to
+     * debug, and it is the only bound in this file that was not checked. Every
+     * other one comes back with its number, so this one does too - and the
+     * numbers are the ones the model has to change. The explicit-rect path has
+     * refused w<=0/h<=0 by name since it was written; this is the grid path
+     * catching up. */
+    {
+        int32_t needw = (int32_t)g_cols * APP_MIN_CELL +
+                        (int32_t)(g_cols - 1) * g_gap;
+        int32_t needh = (int32_t)g_rows * APP_MIN_CELL +
+                        (int32_t)(g_rows - 1) * g_gap;
+        int      grid_used = 0;
+        for (uint16_t i = 0; i < in->nwidget; i++)
+            if (!descs[i].use_rect) { grid_used = 1; break; }
+        if (grid_used && (area.w < needw || area.h < needh)) {
+            (void)gui_window_close(id);
+            in->used = 0;
+            /* The width and height to SUGGEST. Grid need, plus the padding,
+             * plus this window's own chrome — and then floored at the window
+             * manager's minimum, because a suggestion the next launch would
+             * itself reject is not a repair. Attempt two has to land. */
+            int32_t sw = needw + 2 * g_pad + (w - client.w);
+            int32_t sh = needh + 2 * g_pad + (h - client.h);
+            if (sw < GUI_MIN_W) sw = GUI_MIN_W;
+            if (sh < GUI_MIN_H) sh = GUI_MIN_H;
+            /* The message must fit app_error_t.msg (224 bytes) with the numbers
+             * INTACT: a rejection whose tail is cut is a rejection the model
+             * cannot act on, and the two numbers at the end are the whole
+             * point. Everything else here is trimmed to protect them. */
+            return rej(err, APP_EINVAL, "",
+                       "too small for its own grid: every widget would be "
+                       "zero-sized and the window would look empty. A %dx%d "
+                       "grid (gap %d, pad %d) needs %dx%d pixels of client "
+                       "area; this has %dx%d. Use \"width\":%d and "
+                       "\"height\":%d, or fewer rows/cols",
+                       (int)g_rows, (int)g_cols, (int)g_gap, (int)g_pad,
+                       (int)needw, (int)needh, (int)area.w, (int)area.h,
+                       (int)sw, (int)sh);
+        }
+    }
 
     for (uint16_t i = 0; i < in->nwidget; i++) {
         const wdesc_t *d = &descs[i];
         gui_rect_t     r = place(d, area);
         gui_widget_t  *wd = (gui_widget_t *)0;
+
+        /* Belt and braces for the explicit-rect and span cases the bound above
+         * cannot see: never add a widget that has no pixels. */
+        if (r.w <= 0 || r.h <= 0) {
+            (void)gui_window_close(id);
+            in->used = 0;
+            return rej(err, APP_EINVAL, "widgets",
+                       "widget %d (\"%s\") works out %dx%d pixels, so it would "
+                       "be invisible and unclickable. Its cell has no room left "
+                       "in a %dx%d client area with pad %d and gap %d: make the "
+                       "window bigger or the grid smaller",
+                       (int)i, d->text, (int)r.w, (int)r.h,
+                       (int)client.w, (int)client.h, (int)g_pad, (int)g_gap);
+        }
 
         switch (d->kind) {
         case GUI_BUTTON: wd = gui_add_button(win, r, d->text, (uint32_t)(i + 1));
@@ -1353,3 +1906,30 @@ size_t app_describe(uint32_t id, char *dst, size_t cap) {
 /* ====================================================================== */
 
 const char *app_example_calculator(void) { return APP_CALCULATOR_JSON; }
+
+/* The rest of them, in the order a person is likeliest to ask: the window that
+ * only says hello first, because that request is what proved this table was
+ * needed. Each name is what the operator would call the app. */
+static const struct { const char *name; const char *doc; } examples[] = {
+    { "hello",      APP_HELLO_JSON     },
+    { "clock",      APP_CLOCK_JSON     },
+    { "stopwatch",  APP_STOPWATCH_JSON },
+    { "dice",       APP_DICE_JSON      },
+    { "password",   APP_PASSWORD_JSON  },
+    { "calculator", APP_CALCULATOR_JSON },
+};
+
+int app_example_count(void) {
+    return (int)(sizeof examples / sizeof examples[0]);
+}
+
+const char *app_example_name(int index) {
+    if (index < 0 || index >= app_example_count()) return (const char *)0;
+    return examples[index].name;
+}
+
+const char *app_example_doc(const char *name) {
+    for (int i = 0; i < app_example_count(); i++)
+        if (a_eq(name, examples[i].name)) return examples[i].doc;
+    return (const char *)0;
+}

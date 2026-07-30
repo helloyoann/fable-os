@@ -8,11 +8,18 @@
  *   of that "real logic" half of an app document (include/app.h, DECISION 1), and
  *   it is deliberately the smaller and more boring half.
  *
- *   Nothing here touches a window, a pixel, the console, the heap or a device.
- *   The only external type it reads is gui_widget_t's text, through a const
- *   gui_window_t — which is why every calculator behaviour this machine claims
- *   (division by zero, twelve-digit caps, overflow, formatting) is a host unit
- *   test against a struct rather than a screenshot.
+ *   Nothing here touches a window, a pixel, the console or the heap. The only
+ *   external type it reads is gui_widget_t's text, through a const gui_window_t —
+ *   which is why every calculator behaviour this machine claims (division by
+ *   zero, twelve-digit caps, overflow, formatting) is a host unit test against a
+ *   struct rather than a screenshot.
+ *
+ *   TWO THINGS ARE NOT PURE, and both are held at arm's length. `now`, `clock`
+ *   and their siblings read a snapshot that runtime.c took when the event began,
+ *   and rand() draws from the machine's entropy source, both through the two
+ *   function calls declared at the end of app_impl.h. So this file still contains
+ *   no state and touches no hardware directly, and a host test can say what time
+ *   it is and what the dice rolled — see app_set_time_source().
  *
  * ARITHMETIC WITHOUT AN FPU
  *   The kernel is built -mno-sse -mno-mmx and has no FPU state to save, so every
@@ -216,8 +223,23 @@ static const struct { const char *name; uint8_t op; uint8_t arity; } fns[] = {
     { "abs",    AO_ABS,    1 },
     { "min",    AO_MIN,    2 },
     { "max",    AO_MAX,    2 },
+    { "round",  AO_ROUND,  1 },
+    { "rand",   AO_RAND,   1 },
+    { "at",     AO_AT,     2 },
 };
 #define NFNS ((int)(sizeof fns / sizeof fns[0]))
+
+/* The time snapshot, as leaves rather than calls: `clock` reads like a value
+ * because it IS one for the whole of one event (app_env_now() in app_impl.h). */
+static const struct { const char *name; uint8_t field; } times[] = {
+    { "now",    ATF_NOW    },
+    { "clock",  ATF_CLOCK  },
+    { "today",  ATF_TODAY  },
+    { "hour",   ATF_HOUR   },
+    { "minute", ATF_MINUTE },
+    { "second", ATF_SECOND },
+};
+#define NTIMES ((int)(sizeof times / sizeof times[0]))
 
 /* ====================================================================== */
 /* the compiler                                                           */
@@ -329,6 +351,7 @@ static void put_known_names(cx_t *c, char *dst, size_t cap) {
     for (uint16_t i = 0; i < in->nwidget; i++)
         if (in->wname[i][0]) list_add(dst, cap, &o, ", ", in->wname[i]);
     list_add(dst, cap, &o, ", ", "key");
+    for (int i = 0; i < NTIMES; i++) list_add(dst, cap, &o, ", ", times[i].name);
 }
 
 static int parse_expr(cx_t *c, int prec);
@@ -445,6 +468,9 @@ static int parse_primary(cx_t *c) {
         }
 
         if (a_eq(name, "key")) return emit(c, AO_KEY, 0, +1);
+        for (int i = 0; i < NTIMES; i++)
+            if (a_eq(name, times[i].name))
+                return emit(c, AO_TIME, times[i].field, +1);
 
         for (uint16_t i = 0; i < c->in->nvar; i++)
             if (a_eq(name, c->in->vname[i])) return emit(c, AO_VAR, i, +1);
@@ -591,6 +617,72 @@ static int compare(const app_val_t *a, const app_val_t *b, int ordering) {
     }
 }
 
+/* ---- the time snapshot, rendered ---------------------------------------
+ * The wall clock arrives from a function pointer whose implementation may be a
+ * CMOS chip, so it is treated as untrusted input like everything else here: a
+ * reading outside the calendar is the ERR value, not a string with garbage in it.
+ * The formats are fixed-width on purpose — "9:5:3" is not a clock, and the app
+ * language has no padding operator, which is exactly why `clock` and `today` are
+ * pre-rendered rather than left to the document to assemble. */
+static void put2(char *d, int v) {
+    d[0] = (char)('0' + (v / 10) % 10);
+    d[1] = (char)('0' + v % 10);
+}
+
+static int wall_sane(const app_wall_t *w) {
+    return w->year >= 1970 && w->year <= 9999 &&
+           w->month >= 1 && w->month <= 12 && w->day >= 1 && w->day <= 31 &&
+           w->hour <= 23 && w->minute <= 59 && w->second <= 59;
+}
+
+static app_val_t time_value(uint16_t field) {
+    uint64_t   ms = 0;
+    app_wall_t w;
+    int        have;
+
+    w.year = 0; w.month = w.day = 1; w.hour = w.minute = w.second = 0;
+    /* `now` is monotonic and needs nothing from the wall clock, so do not ask
+     * for one: passing NULL is what keeps app_env_now()'s documented "a document
+     * that never says clock never touches the CMOS" true for the stopwatch idiom
+     * as well as for documents with no time leaf at all. */
+    have = app_env_now(&ms, field == ATF_NOW ? (app_wall_t *)0 : &w);
+
+    if (field == ATF_NOW) {
+        /* Monotonic ms to fixed-point SECONDS: one scale unit is 1e-6 s, so a
+         * millisecond is 1000 of them. Saturates rather than wrapping, which
+         * takes 285 years of uptime to reach. */
+        if (ms > (uint64_t)(APP_NUM_MAX / 1000)) return app_val_num(APP_NUM_MAX);
+        return app_val_num((int64_t)ms * 1000);
+    }
+    if (!have || !wall_sane(&w)) return app_val_err();
+
+    switch (field) {
+    case ATF_CLOCK: {
+        char b[9];
+        put2(b, w.hour); b[2] = ':';
+        put2(b + 3, w.minute); b[5] = ':';
+        put2(b + 6, w.second); b[8] = '\0';
+        return app_val_str(b);
+    }
+    case ATF_TODAY: {
+        char b[11];
+        int  y = w.year;
+        b[0] = (char)('0' + (y / 1000) % 10);
+        b[1] = (char)('0' + (y / 100) % 10);
+        b[2] = (char)('0' + (y / 10) % 10);
+        b[3] = (char)('0' + y % 10);
+        b[4] = '-';
+        put2(b + 5, w.month); b[7] = '-';
+        put2(b + 8, w.day);   b[10] = '\0';
+        return app_val_str(b);
+    }
+    case ATF_HOUR:   return app_val_num((int64_t)w.hour   * APP_NUM_SCALE);
+    case ATF_MINUTE: return app_val_num((int64_t)w.minute * APP_NUM_SCALE);
+    case ATF_SECOND: return app_val_num((int64_t)w.second * APP_NUM_SCALE);
+    default:         return app_val_err();
+    }
+}
+
 static app_val_t call_fn(uint8_t op, const app_val_t *a, const app_val_t *b) {
     char ta[APP_TEXT_MAX], tb[APP_TEXT_MAX];
 
@@ -651,6 +743,56 @@ static app_val_t call_fn(uint8_t op, const app_val_t *a, const app_val_t *b) {
         if (op == AO_MIN) return app_val_num(lo ? a->num : b->num);
         return app_val_num(lo ? b->num : a->num);
     }
+    /* round(x): to the nearest whole number, halves away from zero — the rule a
+     * person means by "to the nearest penny" (round(x*100)/100). Negation is done
+     * on the magnitude so -INT64_MIN is never formed, and the result goes through
+     * the same range check as arithmetic, so 9e9 rounds to ERR rather than to a
+     * wrapped number. */
+    case AO_ROUND: {
+        if (a->kind != AV_NUM) return app_val_err();
+        int      neg = a->num < 0;
+        __int128 mag = neg ? -(__int128)a->num : (__int128)a->num;
+        int      ok  = 0;
+        mag = ((mag + APP_NUM_SCALE / 2) / APP_NUM_SCALE) * APP_NUM_SCALE;
+        int64_t r = clamp_ok(neg ? -mag : mag, &ok);
+        return ok ? app_val_num(r) : app_val_err();
+    }
+    /* rand(n): a whole number in 0..n-1. n is truncated toward zero, so
+     * rand(6.9) is rand(6); n outside 1..APP_RAND_MAX is ERR, which is how a
+     * document learns it asked for something impossible instead of silently
+     * getting zero every time.
+     *
+     * WHY THERE IS NO REJECTION LOOP. The usual uniform draw retries when the
+     * raw value lands in the biased tail, and "retries" on a single-threaded
+     * kernel means a document could in principle choose n to make it spin. The
+     * multiply-high form below is branch-free and its bias is at most n/2^64 —
+     * for a six-sided die, one part in 3e18. Bounded beats perfect here. */
+    case AO_RAND: {
+        if (a->kind != AV_NUM) return app_val_err();
+        int64_t n = a->num / APP_NUM_SCALE;
+        if (n < 1 || n > APP_RAND_MAX) return app_val_err();
+        uint64_t r = app_env_random();
+        uint64_t v = (uint64_t)(((unsigned __int128)r *
+                                 (unsigned __int128)(uint64_t)n) >> 64);
+        if (v >= (uint64_t)n) v = (uint64_t)n - 1;   /* unreachable; cheap */
+        return app_val_num((int64_t)v * APP_NUM_SCALE);
+    }
+    /* at(s,i): the i'th BYTE of s, counting from 0, as a one-character string.
+     * Bytes, not characters: text here is UTF-8 and a multi-byte character would
+     * be cut in half, so this is for picking out of an ASCII set (a password
+     * alphabet, a list of answers). Out of range is ERR rather than "" so that a
+     * document walking off the end of its own alphabet says so on the screen. */
+    case AO_AT: {
+        if (a->kind == AV_ERR || b->kind != AV_NUM) return app_val_err();
+        if (b->num < 0) return app_val_err();
+        app_val_text(a, ta, sizeof ta);
+        int64_t i = b->num / APP_NUM_SCALE;
+        if ((uint64_t)i >= (uint64_t)a_len(ta)) return app_val_err();
+        char one[2];
+        one[0] = ta[i];
+        one[1] = '\0';
+        return app_val_str(one);
+    }
     default:
         return app_val_err();
     }
@@ -671,7 +813,7 @@ app_val_t app_expr_eval(const app_inst_t *in, uint16_t index,
 
         /* Leaves. The compiler proved there is room, but the check stays: a
          * corrupted instance must refuse, not write past the array. */
-        if (k <= AO_KEY) {
+        if (k <= AO_TIME) {
             if (sp >= APP_STACK) return app_val_err();
             switch (k) {
             case AO_CONST:
@@ -690,8 +832,11 @@ app_val_t app_expr_eval(const app_inst_t *in, uint16_t index,
                 st[sp++] = w ? app_val_str(w->text) : app_val_err();
                 break;
             }
-            default:                       /* AO_KEY */
+            case AO_KEY:
                 st[sp++] = key ? *key : app_val_str("");
+                break;
+            default:                       /* AO_TIME */
+                st[sp++] = time_value(o->arg);
                 break;
             }
             continue;
@@ -713,7 +858,7 @@ app_val_t app_expr_eval(const app_inst_t *in, uint16_t index,
 
         /* Unary functions consume one and push one. */
         if (k == AO_NUM || k == AO_TEXT || k == AO_LEN || k == AO_DIGITS ||
-            k == AO_ISERR || k == AO_ABS) {
+            k == AO_ISERR || k == AO_ABS || k == AO_ROUND || k == AO_RAND) {
             if (sp < 1) return app_val_err();
             st[sp - 1] = call_fn(k, &st[sp - 1], &st[sp - 1]);
             continue;

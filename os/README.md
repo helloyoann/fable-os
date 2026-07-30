@@ -3,9 +3,11 @@
 A from-scratch x86_64 kernel, built and run on macOS via QEMU. It boots into a
 prompt with no shell and no commands: you type a sentence, the kernel sends it to
 the Anthropic Claude API **directly over HTTPS** from ring 0, and the model drives
-the machine through 45 registered tools. It has a framebuffer console, a window
-manager, clickable apps described as JSON documents, a PS/2 mouse, real audio
-through a sandboxed driver VM, and ACPI power control.
+the machine through 49 registered tools. It has a framebuffer console, a window
+manager, clickable apps described as JSON documents, a PS/2 mouse, ACPI power
+control, and a sandboxed driver VM in which the model can **write a driver for a
+sound card this kernel has never heard of and then play a tone through it** —
+which it has done, live, from one typed sentence.
 
 ## Status
 
@@ -32,8 +34,12 @@ through a sandboxed driver VM, and ACPI power control.
 | CMOS real-time clock | ✅ done |
 | ACPI — RSDP/RSDT/XSDT/FADT, `\_S5_` from the DSDT, soft-off + reboot | ✅ done |
 | Bounded driver VM (allowlisted port/MMIO, cycle limit, full trace) | ✅ done |
-| AC'97 audio, brought up entirely inside the driver VM | ✅ done |
-| The turn loop — 45 tools, 16 rounds, budget notes, retries, a journal | ✅ done |
+| DMA for driver programs — one 256 KiB guarded arena, kernel-set bus mastering | ✅ done, **not contained** (no IOMMU — see below) |
+| Audio service — PCM synthesis, one sink, device-agnostic | ✅ done |
+| A model-authored driver can *become* the audio output (`driver_install`) | ✅ done, proven live |
+| An AC'97 driver in the kernel tree | ⬜ **deliberately none** — test fixture only, `-DTALKOS_AC97_REFERENCE` |
+| Apps can call kernel capabilities (`{"call":"audio.tone"}`) | ✅ done |
+| The turn loop — 49 tools, 16 rounds, budget notes, retries, a journal | ✅ done |
 | Disk-backed filesystem (FAT32/ext2), ATA/block layer | ⬜ future (VFS ready) |
 | Certificate verification (pinned roots + hostname + expiry) | ✅ done, **off by default** — `-DTALKOS_VERIFY_CERTS` |
 | CSPRNG entropy | ⬜ future (see caveat) |
@@ -46,21 +52,44 @@ Everything below is reproducible from a clean checkout on macOS + QEMU.
 | Check | Command | Result |
 |---|---|---|
 | Build | `make clean && make -j8` | clean; the only warning is the intentional RWX one |
-| Host unit tests | `make test-host` | **28 suites, 9,143,897 assertions, all pass** |
-| The same under ASan + UBSan | `make test-host-asan` | 28 suites pass |
-| Boot tests | `make test-qemu` | **4 / 4** |
+| Host unit tests | `make test-host` | **31 suites, 9,160,031 assertions, all pass** |
+| The same under ASan + UBSan | `make test-host-asan` | 31 suites pass |
+| Boot tests | `make test-qemu` | **6 / 6** |
 | Headless boot + screenshot | `./capture.sh 20` | reaches `> `, 0 panics |
-| Real audio out of the driver VM | `vm/programs/capture_audio.sh` | 440 Hz then 660 Hz, measured from the captured WAV |
+| The kernel knows nothing about sound cards | `make test-qemu` (`audio-unclaimed`) | two cards attached, both `driver=-`, nothing played |
+| Real audio out of the driver VM | `vm/programs/capture_audio.sh` | 440 Hz then 660 Hz, measured from the captured WAV — needs `-DTALKOS_AC97_REFERENCE` |
 | The hardening build | `make EXTRA_CFLAGS=-DTALKOS_VERIFY_CERTS` | links, boots, verifies a live certificate |
+
+**The headline experiment, run once, live.** A default (audio-ignorant) kernel was
+booted with a sound card QEMU recorded to a WAV, and the operator typed one
+sentence: *"There is a sound card attached to this machine that you have no driver
+for. Write one and play me a 440 Hz tone."* The model called `driver_targets`,
+read the function's config space, wrote a bring-up program, had one rejected by
+the assembler, ran the corrected one, reasoned out a descriptor list from the
+published `audio_status` contract, checked it with the free `driver_assemble`,
+installed it with `driver_install`, and called `audio_tone`. The recording holds
+**exactly 1.000 s at 440.0 Hz** (Goertzel and zero-crossing agree; zero energy at
+220/660/880 Hz). No line of that driver exists in this repository.
+
+That is one run. It is not a benchmark, it says nothing about how often it works,
+and the same turn evicted its own oldest exchange from memory four times while
+doing it (see the schema-budget note below).
 
 **What that does and does not prove.** The host suites are the real evidence: they
 drive whole jobs through the actual turn loop against a scripted transport
 (`net/model_mock.c`), assert on kernel trace lines, on filesystem state read back
 behind the tools, and on what went out on the wire. A live model has driven tools
 on this machine — opening a window, clicking its keys, writing and re-reading a
-file — but only for a handful of turns. **Nobody has characterised this tool
-surface under a live model at scale, adversarially, or over a long session.**
-Treat that as unexplored rather than working.
+file, and authoring apps from scratch — but only for a few dozen turns. **Nobody
+has characterised this tool surface under a live model at scale, adversarially,
+or over a long session.** Treat that as unexplored rather than working.
+
+Two claims in this file are proven by screenshot rather than by assertion,
+because nothing else can prove them: that a document becomes a window a real PS/2
+mouse can operate (`apps/probe/`, `gui/gui_probe.sh`), and that a `tick` handler
+really advances — the same boot, eight seconds apart, a model-authored clock
+reading `19:47:56` and then `19:48:04` while every other pixel on screen is
+unchanged.
 
 ## ⚠️ Security caveat
 
@@ -151,6 +180,19 @@ only a byte count, the boot log said "32 bytes loaded" and then `401`, which is
 indistinguishable from a typo. Exfiltrating somebody else's credential to a third
 party is not an acceptable consequence of a misnamed variable.
 
+The same rule binds the **environment** half, and that took a second pass to get
+right. `make KEY=...` on the command line is a hard error, but the guard tests
+`$(origin KEY)` rather than `$(KEY)` — make imports the environment as make
+variables, so the plain test also fired when a zsh dotenv plugin auto-sourced
+`os/.env` on `cd`, and told the operator "KEY= is gone" for a command they never
+typed. Fixing that is correct. What briefly came *with* it was a fallback that
+read an exported shell `KEY` as the Anthropic key, which is the identical
+exfiltration one level out: `KEY` in the environment is a maximally generic name
+that a licence key or an unrelated secret may already be sitting in, and taking
+it would have sent that secret to `api.anthropic.com`. There is deliberately no
+such fallback. The two names above are read from the file; `$ANTHROPIC_API_KEY`
+is read from the environment; nothing else is.
+
 The recipe also begins with `set +x +v`, before the key is ever assigned to a
 shell variable. On macOS `/bin/sh` is bash in POSIX mode and bash honours an
 *inherited* `SHELLOPTS`, so with `export SHELLOPTS=xtrace` in the environment
@@ -199,7 +241,10 @@ gui/         wm.c (windows, z-order, focus, damage compositor), widgets.c,
              gui_demo.c (the reference apps), gui_probe.sh (drives a real mouse)
 apps/        runtime.c + expr.c — an app is a JSON document, not code;
              examples/calculator.json is the reference artifact
-vm/          dvm.c — the bounded driver VM; programs/ac97_boot.c brings up audio
+vm/          dvm.c — the bounded driver VM, and the one DMA arena on the machine
+             (the AC'97 bring-up that used to live here is now a test fixture:
+              tests/qemu/fixtures/ac97_boot.c, built only under a flag)
+core/        audio.c — the audio service: PCM synthesis and the one sink
 tools/       the model's syscall table, one family per file (wildcarded into the
              build: a new tool needs no Makefile edit)
 drivers/
@@ -245,9 +290,10 @@ Writing that now.                                    <- the model: a claim
 Done - /etc/motd now says 'talk-os was here'.        <- the model again
 ```
 
-**A kernel trace line is a `[` in column zero.** Three things hold that up, and
-all three are regression-tested (`tests/host/test_trace.c`,
-`tests/host/test_chat.c`, `tests/host/test_vfs_tools.c`):
+**A kernel trace line is a `[` in column zero.** Five things hold that up, and
+all five are regression-tested (`tests/host/test_trace.c`,
+`tests/host/test_chat.c`, `tests/host/test_vfs_tools.c`,
+`tests/host/test_screen_tools.c`, `tests/host/test_gui.c`):
 
 1. **Model-controlled data cannot forge a line.** `lib/trace.c` escapes every
    control byte, `[` and `]` as `\xNN`, in both the argument field and the
@@ -262,6 +308,25 @@ all three are regression-tested (`tests/host/test_trace.c`,
 3. **Model prose cannot reach column zero.** `net/chat.c`'s
    `print_model_prose()` gives a `[` that would land in column zero one leading
    space, and escapes every C0 control byte except `\n` and `\t`.
+4. **A tool that paints the console cannot paint one either.** `write_screen`
+   pokes the same cell grid `lib/base.c` owns, through the same font and the
+   same default attribute, so a painted `[vfs_write ... -> ok]` at column zero
+   was not *like* a trace line, it was byte-identical to one. Text beginning
+   with `[` is now refused at column 0 and only there, and the refusal names the
+   one-column fix. The same tool can still *erase* a genuine line — the console
+   is scratch space and it scrolls — but it can no longer do so quietly: the
+   audit line carries `erased-kernel-line=1` when it covers a row that began
+   with `[`.
+5. **A window title cannot open one.** Two kernel `kprintf`s embed a
+   model-chosen window title (`gui/wm.c` and `kernel/main.c`, both about the
+   keyboard grab), so a title of `a] [vfs_write /etc/x -> ok` used to close the
+   kernel's bracket early and open its own. The only thing preventing a genuine
+   column-zero forgery was arithmetic nobody had written down — and it did not
+   hold: the `gui/wm.c` message is emitted from `gui_tick()` *mid-typing*, so it
+   does not start at column zero, and with the right number of echoed characters
+   the payload wrapped onto column zero exactly. `set_title()` now folds `[` and
+   `]` to `{` and `}`, the way `tools/agent_tools.c` already folded them, which
+   depends on no width, no cap and no message length.
 
 Point 3 is written the way it is because the first version of it was wrong, in
 three ways that are worth knowing if you ever touch it. It modelled the console
@@ -279,7 +344,7 @@ read the brackets.
 
 ## The tool surface
 
-45 tools, assembled by the linker. A tool self-registers with `REGISTER_TOOL`
+49 tools, assembled by the linker. A tool self-registers with `REGISTER_TOOL`
 (`include/tool.h`) and `tools/*.c` is wildcarded into the build, so **adding a
 syscall to the model's surface means dropping in a `.c` file and editing nothing
 else at all** — no Makefile line, no central table.
@@ -291,11 +356,12 @@ memory        mem_read mem_write mem_map heap_stats heap_check
 devices       device_list device_info device_suspend device_resume driver_*
 pci           pci_config_read
 clock         time_now time_uptime
-driver VM     driver_assemble driver_run driver_trace driver_targets
+driver VM     driver_targets driver_assemble driver_run driver_install driver_trace
+audio         audio_status audio_tone audio_melody
 faults        fault_report fault_diagnose
 power         power_info power_off power_reboot
 gui           gui_list gui_open gui_window gui_click
-apps          app  (launch / state / close / list / format)
+apps          app  (launch / state / close / list / format / caps)
 agency        plan_set plan_mark plan_show action_log wait_ms
 ```
 
@@ -307,12 +373,25 @@ legible error the model can recover from on the next turn rather than a fault.
 
 `tools/mem_tools.c` is the quality bar; `include/tool.h` is the spec.
 
-**The schema budget is the thing to watch.** All tool schemas travel in every
-request and share `CHAT_TOOLS_BYTES` (40960). At 45 tools the assembled schema is
-33,213 bytes. If it ever does not fit, `net/chat.c` refuses the whole array and
-the model is offered **no tools at all** — the machine keeps booting and silently
-stops being able to act. `tests/qemu/cases/boot.case` asserts the size so that
-fails loudly instead, but anyone adding a tool family should measure first.
+**The schema budget is the thing to watch, and it is now the binding constraint on
+this machine.** All tool schemas travel in every request. Two limits apply and the
+second is the one that bites:
+
+* `CHAT_TOOLS_BYTES` (40960) — if the array does not fit, `net/chat.c` offers the
+  model **no tools at all**: the machine keeps booting and silently stops being
+  able to act. At 49 tools the schema is 39,125 bytes, so 1,835 bytes spare.
+* `CHAT_REQ_BYTES` (61440) — one request must hold that schema *plus* a full
+  history *plus* the system prompt. That sum is **61,415 of 61,440**: twenty-five
+  bytes. Past it the turn loop starts evicting the oldest exchange on every send,
+  which is the machine forgetting mid-job rather than failing loudly.
+
+This is not theoretical. The live driver-writing turn above evicted four times
+while it worked, and still finished. Adding the 49th tool cost ~900 bytes that had
+to be taken back out of nine other descriptions. **The next family cannot be paid
+for that way** — the honest fixes are to send the schema once per conversation
+instead of once per round, to page it, or to grow `net/net.c`'s framing buffer so
+`CHAT_REQ_BYTES` can move. `include/chat.h` carries the arithmetic;
+`make test-qemu` fails if the constant there and the boot banner disagree.
 
 ## The GUI
 
@@ -327,7 +406,20 @@ invalidated, and `gui_tick()` — called from the one loop this machine has, in
 `kernel/main.c` — paints only that. With no window open it does nothing at all, so
 a machine that never opens a window is the machine that existed before the GUI.
 
-Two rules keep the two interfaces from fighting:
+Three rules keep the two interfaces from fighting:
+
+* **The bottom text row belongs to the console.** A model can write
+  `{"width":4096,"height":4096}` without knowing the screen size, and clamping
+  to the surface used to give it a 1024x768 window at 0,0 — which the compositor
+  then correctly painted over every console cell, deleting the banner, the
+  prompt and every trace line the operator would have checked it against
+  (measured: 0 of 1024 pixels differing from an untouched window row). Windows
+  are now clamped to leave the last 16-pixel row clear, so `> ` and the
+  `[typing into ...]` warning survive whatever a document asks for, and the
+  launch reports the frame it actually got (`size=1024x752`). **This is a floor,
+  not a fix:** the banner and the scrollback above that row are still coverable,
+  so a full-screen app still costs the operator their transcript on screen. The
+  serial log is untouched.
 
 * **The keyboard belongs to the prompt.** A click on a text field borrows it for
   exactly one line, then hands it back. Because `gui_click` is a tool, the *model*
@@ -347,7 +439,27 @@ and clicks through the QEMU monitor, real sentences down a serial socket, and
 screenshots. That is how the click path is proven against hardware rather than
 asserted.
 
-## Apps are documents, not code
+## Apps are documents, not code — and the model writes them
+
+There is **no catalogue of applications on this machine.** `gui_open` has two
+demos a human compiled in (a calculator and a notes field); everything else you
+see on screen was written, in JSON, by the model, in the turn you asked for it.
+"I want a window that says hello" is not looked up, it is authored:
+
+```
+> I want a window that says hello only
+[app action=launch title=Hello widgets=1 vars=0 bytes=128 at=40,48 size=200x90 -> 1]
+The window is up and showing "hello".
+```
+
+That is a real transcript, first attempt, one tool call. It is worth being blunt
+about why it is worth calling out at all: for a while it did **not** work, and
+the reason was not a missing feature. `gui_open`'s description read like a closed
+list of two apps, `app`'s read like a format reference, and both claimed the same
+headline sentence — so the model believed the list and told the operator, quite
+honestly, that this kernel had no such app. The capability was built, tested and
+invisible. The wording is now asserted by `tests/host/test_app.c`, because on
+this machine a tool description **is** an interface and it regresses silently.
 
 An app is a JSON document: a widget tree plus handlers written in a tiny total
 expression language. It arrives through the same hardened `net/json.c` that reads
@@ -375,11 +487,160 @@ expression, and what *would* have been accepted.
 
 `apps/examples/calculator.json` is the reference artifact — 4 KB, hand-written,
 and the thing the live transcript in the top-level README is clicking.
+`hello`, `clock`, `stopwatch`, `dice` and `password` are smaller ones.
 
-It is deliberately not a general language: no loops, no user functions, no arrays,
-no timers, no way for an app to call a tool, read the clock, touch memory or
-print. Keeping the console unreachable from an app is also what stops
-model-authored text from ever putting a `[` in column zero.
+### What the format can express
+
+Widgets `label` `button` `field` `panel`, placed in a grid (`row`/`col`, with
+spans) or at an explicit `rect`. Handlers fire on `click`, on `submit` (a line
+typed into a field), and on `tick` — a period in milliseconds, 50 ms to an hour,
+at most four per app. Statements are `{set,to}`, `{if,then,else}` and
+`{stop:true}`; there are no loops. Expressions are strings over fixed-point
+numbers, text, declared vars, another widget's text, and `+ - * / % == != < <= >
+>= && || !` plus `num text cat len digits has iserr abs min max round rand at`
+and the time leaves `now clock today hour minute second`.
+
+`tick` is genuinely periodic, not a promise: `kernel/main.c`'s
+`wait_for_sentence()` calls `app_tick()` beside `gui_tick()`, and so does
+`wait_ms`, so a clock keeps time between turns *and* while the model is checking
+its own work. That second call is not a nicety — the system prompt tells the
+model to read every change back with a tool, and before it existed a model that
+launched a working clock, waited, and read it back was shown a frozen window and
+started rebuilding an app that was fine.
+
+### What it cannot express, and will not pretend to
+
+No loops, no user functions, no arrays, no way for an app to call a tool, touch
+memory, write a file, or print to the console. No colour an app can set, so no
+colour picker, no progress bar, no traffic light. No list widget, so a to-do list
+has to be a fixed number of rows. No image of any kind — asked for a photo, the
+model correctly refuses rather than drawing something. No binding syntax either:
+a label showing a var is not `"text":"{t}"`, it is a handler that does
+`{"set":"<the label's name>","to":"clock"}`, and that is the mistake a first
+attempt most often makes.
+
+Keeping the console unreachable from an app is also part of what stops
+model-authored text from putting a `[` in column zero — but only part, and the
+gaps are enumerated in **The trust model** above rather than assumed away.
+
+### What a rejection has to do
+
+Every bound comes back with its number, because attempt two has to land without a
+second round-trip. A window too small for its own grid used to launch clean with
+twelve zero-area widgets, report "12 widget(s) ... a real mouse can click it",
+and show an empty window; it is now refused with the width and height that would
+work — and `tests/host/test_app_format.c` parses those two numbers back out of
+the message and launches them, so it is a promise rather than a paraphrase. A
+selector that names a button's *visible text* (the single most repeated live
+mistake) is told so by name, and the list of what does exist now includes tags,
+which are otherwise invisible everywhere.
+
+## Writing a driver at run time, and hearing it
+
+This is the part of the machine that is hardest to believe, so here is exactly
+what is in the kernel and exactly what is not.
+
+**The kernel knows nothing about any sound card.** There is no AC'97 driver, no
+HD Audio driver, no register map, no chip name, and no `if the class is 04:01`
+anywhere in a shipped build. `nm kernel.elf` and `strings kernel.bin` both return
+zero hits for `ac97|hda|azalia|codec`. The one audio-shaped thing PCI enumeration
+does is map base class `0x04` to the device class `audio` — the PCI spec's own
+table, no subclass branch — so the kernel can say *"there is a sound card here and
+nobody drives it"* without knowing which one it is. Attach two cards to a default
+build and both sit at `driver=-` forever; `tests/qemu/cases/audio-unclaimed.case`
+asserts precisely that. The reference AC'97 bring-up still exists, but as a test
+fixture behind `-DTALKOS_AC97_REFERENCE`, and it will not compile into a normal
+kernel.
+
+Everything else is a generic OS primitive, which is the line this design draws:
+**a DMA buffer, bus mastering, PCM synthesis and a service to register into are
+what any real OS gives a driver author; what a particular chip's registers do has
+to come from the model.**
+
+### The three steps
+
+```
+driver_targets    "here is an unclaimed PCI function, its BARs, and the exact
+                   sandbox a program would get"
+driver_run        bring the device up.  On entry:
+                     r0-r5  this function's BAR bases
+                     r6     its bdf (for the read-only pcicfg opcode)
+                     r7     the physical address of a 256 KiB DMA arena
+                     r8     its size
+driver_install    keep a SECOND, shorter program as the machine's audio sink.
+                   It is re-run for every sound, entered with r0-r8 above plus
+                     r9   bytes of PCM the kernel has already written at r7
+                     r10  frames      r11  milliseconds
+                     r12  a FIXED scratch address, the driver's own memory
+```
+
+Then `audio_tone` works, and so does `{"call":"audio.tone"}` in an app.
+
+`audio_status` prints that contract in full, paged, on request — it is not in any
+tool description, because descriptions are sent on every round and this is needed
+on one. The split is deliberate and the byte budget above is why.
+
+Two properties are worth calling out because they are what make the loop
+converge rather than flail. `driver_assemble` is free — it costs no hardware
+access and none of the five failed attempts per target — so a model burns its
+typos there. And every failure returns the trap, the source line, that
+instruction disassembled, the final register file and the tail of a real access
+log: every port, width and value, in the order the device really saw them.
+
+### DMA, and the part that is not contained
+
+A program that can only poke registers can reset a device. It cannot play a
+sound, because a DMA engine has to be handed a physical address. So two real
+privileges exist:
+
+* **One 256 KiB page-aligned arena**, owned by `vm/dvm.c`, with 64 KiB of poisoned
+  guard band on each side. It is granted by address the caller never chooses —
+  `dvm_policy_allow_dma()` refuses anything that is not a subrange of dvm.c's own
+  array — and `ld`/`st` reach it under the same bounds and alignment rules as
+  MMIO. The first 192 KiB is where the audio service writes samples; the rest is
+  the driver's, and the kernel never touches it.
+* **Bus Master Enable, set by C**, for the one named function, after the sandbox
+  is proved buildable. The ISA has no config-space write and never will.
+  `driver_run` takes the bit back if the program traps; `driver_install` leaves it
+  set, because the sink DMAs on every note from then on.
+
+**What that does not buy, stated plainly: the VM bounds what the PROGRAM touches
+and nothing bounds what the HARDWARE does.** There is no IOMMU. Once a program
+writes an address into a device's descriptor register, that transfer happens, and
+no instruction check can see it. The guard bands catch a near miss and report it
+with a byte offset; a program that computes a completely different 32-bit number
+gets that DMA for free. `test_the_vm_cannot_police_dma` proves exactly this: a
+program hands the engine an address in kernel memory, the run returns `OK`, and
+nothing notices — while the same program cannot `ld32` that address itself. The
+honest description is *"a trusted driver, written this turn, whose register
+accesses are sandboxed and whose DMA is not."*
+
+### Apps can call it, and that validation IS the security boundary
+
+An app is a JSON document, and a handler may contain a fourth kind of statement:
+
+```json
+{"call":"audio.tone","with":{"hz":"num(key)","ms":"150"},"into":"status"}
+```
+
+Every `with` value is an expression string, so `"hz":"base*2"` works. `apps/cap.c`
+is the only code in `apps/` that can cause a hardware effect: the runtime compiles
+and evaluates, the broker decides what a capability is and performs it. A document
+can name a table entry and nothing else — there is no way to spell a function, a
+pointer, a handle, an address or a device. Out-of-range arguments are **refused,
+never clamped**, at most one sound starts every 500 ms machine-wide, and a handler
+only ever queues: the idle loop performs the call, so a click cannot stall the
+machine.
+
+**Read that as a security boundary, because it is the only one.** This kernel is
+single-threaded and ring-0 only. There is no userspace, no processes, no memory
+protection, no privilege separation, and every page is mapped RWX. A model-authored
+document is interpreted by code running with exactly the same authority as the
+driver it is asking for. There is no MMU, ring transition or IOMMU behind
+`apps/cap.c`'s argument checking — **that validation is the whole of the
+enforcement**, and a bug in it is a bug with kernel privilege. The same is true of
+every tool in `tools/`. This is a machine to run in a VM, and the "Security
+caveat" section above is not boilerplate.
 
 ## The driver model
 
@@ -553,7 +814,10 @@ consequence a user sees: `chat_ask()` blocks for as long as the model takes, and
 during a turn the GUI does not repaint and mouse bytes are lost to the one-byte
 i8042 buffer. Nothing is corrupted — the decoder resynchronises — but a click
 during a turn does not happen. The fix is one line (`net_service()` should call
-`gui_tick()`) and has not been made.
+`gui_tick()`) and has not been made; see the reasoning under "deliberately left
+in place" below. The same gap freezes an app's `tick` handler for the length of a
+round-trip: `wait_ms` pumps it, and the loop between sentences pumps it, but the
+transport does not, so a clock loses the seconds the model spends thinking.
 
 **`kmalloc` panics instead of returning NULL.** That makes every `ENOSPC` path in
 `fs/` and `tools/` unreachable today, and it means a large enough model-driven
@@ -570,6 +834,25 @@ fallback under a live model; long sessions and context eviction; anything about
 how a model behaves when the tool surface is exercised adversarially. The GUI's
 `gui_click` resolves widgets by visible label, so a document with two buttons
 sharing a label leaves one unreachable that way.
+
+**A model-authored app can still cover the transcript.** Windows are clamped to
+leave the prompt row clear, so `> ` and the keyboard-grab warning always survive,
+and the launch line now reports the real `at=`/`size=`. The banner and the
+scrollback above that row are not protected: a full-screen app hides every trace
+line already on screen. The window keeps its title bar and close box, so a mouse
+recovers it, and the serial log is never touched — but an operator watching only
+the framebuffer loses their evidence, and nothing warns them. Reserving more than
+one row means teaching `lib/base.c` a smaller grid, which is the blast radius
+`include/gui.h`'s DECISION 1 rejected on purpose.
+
+**App authoring needs retries for anything past a static window.** Measured
+live, not estimated: a window that says hello lands first try, in one call. A
+clock, a stopwatch or a keypad calculator typically costs two to four launches,
+because the model reaches for a template binding (`"text":"{t}"`) that does not
+exist, or names a button's visible text where a `name` or `tag` is required. Each
+rejection is precise and it does converge, but each one also costs a paid round
+and 2-4 KB of a 16 KB history. The format has no binding syntax; that is the
+single largest remaining source of retries.
 
 **Two known defects deliberately left in place, with reasons.**
 

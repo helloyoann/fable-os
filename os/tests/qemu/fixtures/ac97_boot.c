@@ -1,4 +1,36 @@
-/* ac97_boot.c — run the reference AC'97 driver program on real hardware.
+/* ac97_boot.c — TEST FIXTURE: run the reference AC'97 driver program on real
+ *               hardware. NOT PART OF ANY DEFAULT BUILD.
+ *
+ * WHY THIS FILE LIVES UNDER tests/ AND BEHIND A FLAG
+ *   talk-os must be genuinely ignorant of the sound card an operator attaches.
+ *   That is the whole experiment: hand the model an unclaimed audio device and
+ *   ask it to write the driver. A kernel that ships a hand-written AC'97 driver
+ *   cannot run that experiment and cannot honestly claim the ignorance — the
+ *   device would already be claimed and the codec already initialised before
+ *   anyone typed a sentence.
+ *
+ *   So this file is a fixture, in two independent ways:
+ *     1. it is not in vm/ or drivers/ any more, it is under tests/qemu/, so no
+ *        source list in the kernel build even mentions the path; and
+ *     2. os/Makefile adds it to KERNEL_SRCS only when EXTRA_CFLAGS contains
+ *        -DTALKOS_AC97_REFERENCE, and the #error below refuses to compile it
+ *        without that define, so it cannot arrive in an image by accident.
+ *
+ *   The default kernel therefore contains no audio driver at all: an attached
+ *   AC'97 (or HDA, or anything else of PCI class 04) is enumerated, published as
+ *   an unclaimed device with its BARs, and left completely untouched.
+ *
+ *   tests/qemu/cases/ac97.case is the only thing that builds this, via its
+ *   `build-cflags:` line; tests/qemu/cases/audio-unclaimed.case asserts the
+ *   opposite for the default build. Nothing else should ever define the flag.
+ *
+ *       make EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE
+ *       make run EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE \
+ *                QEMU_EXTRA="-device AC97,audiodev=a0 -audiodev coreaudio,id=a0"
+ *
+ *   (Both on ONE command line: EXTRA_CFLAGS is recorded in .build-flags, so
+ *   passing it to only one of the two invocations silently boots the other
+ *   kernel.)
  *
  * PURPOSE
  *   The driver VM (include/dvm.h) is a machine whose opcodes are hardware
@@ -11,8 +43,9 @@
  *   That matters for one reason. A MODEL can write and run a driver in this ISA
  *   (tools/dvm_tools.c: driver_assemble, driver_run). When one of those fails,
  *   the failure has to be attributable — a bad program, not a VM that was never
- *   able to drive hardware in the first place. This file removes the second
- *   possibility, at boot, on every machine that has the device.
+ *   able to drive hardware in the first place. This fixture removes the second
+ *   possibility: in the fixture build, on a machine that has the device, the ISA
+ *   demonstrably drives real silicon end to end.
  *
  * WHAT IS AND IS NOT THE DRIVER
  *   The driver is the .dvm program. It does the whole bring-up: the AC-link
@@ -34,10 +67,12 @@
  * WHY IT RUNS AT BOOT AND NOT FROM A PROMPT
  *   Natural language is this kernel's only interface, and reaching the model
  *   needs an API key. A bring-up that only happens when someone types a
- *   sentence cannot be asserted on by tests/qemu, so the proof would rot. This
- *   runs as an ordinary DRV_LEVEL_LATE driver init instead: present hardware
- *   gets driven, absent hardware gets one line saying so, and nothing about
- *   either path can fail the boot.
+ *   sentence cannot be asserted on by tests/qemu, so the proof would rot. In the
+ *   fixture build it therefore runs as an ordinary DRV_LEVEL_LATE driver init:
+ *   present hardware gets driven, absent hardware gets one line saying so, and
+ *   nothing about either path can fail the boot. That is exactly why the flag
+ *   exists rather than an `#if 0` — a boot-time driver is assertable, and a
+ *   boot-time driver is also the thing that must not ship.
  *
  * THE SOUND
  *   Half a second of stereo 16-bit PCM at 48 kHz: 250 ms of A4 (440 Hz) then
@@ -62,14 +97,30 @@
  *     .dvm programs against the same policy; none of them needs new C.
  *   - Nothing here is AC'97-specific except the program text and the two BAR
  *     sizes. A second device is a second .dvm file plus a match rule.
+ *   - The real successor to this file is not more C: it is the model writing
+ *     this same bring-up itself through driver_assemble/driver_run. When that
+ *     works, this fixture stays as the control — the thing that says the VM was
+ *     capable on this machine, so a model's failure is the model's.
  */
+
+/* Belt and braces with the Makefile's source-list gate. If this file is ever
+ * added to a build without the flag, the build stops here rather than quietly
+ * putting an audio driver into a kernel that is supposed to have none. */
+#ifndef TALKOS_AC97_REFERENCE
+#error "tests/qemu/fixtures/ac97_boot.c is a TEST FIXTURE: it is only built with EXTRA_CFLAGS=-DTALKOS_AC97_REFERENCE (see tests/qemu/cases/ac97.case). A default kernel must contain no audio driver."
+#endif
 
 #include "kernel.h"
 #include "driver.h"
 #include "device.h"
 #include "pci.h"
 #include "dvm.h"
-#include "ac97_bringup.h"
+/* The program itself stays in vm/programs/ beside the .dvm it is generated
+ * from, because tests/host/test_dvm_ac97.c runs it against a synthetic codec
+ * and includes it by the same relative path. A .dvm program and its generated
+ * C-string header are data for the VM: nothing links them into a kernel unless
+ * a caller like this one is compiled, and no default build compiles one. */
+#include "../../../vm/programs/ac97_bringup.h"
 
 /* ---- the tone ---------------------------------------------------------- */
 
@@ -244,6 +295,14 @@ static dvm_status_t bring_up(const pci_dev_t *d, uint16_t nam, uint16_t nabm) {
  * an AC'97 would be a lie about severity. */
 static int ac97_init(void) {
     pci_dev_t d;
+
+    /* THE ONLY WAY TO REACH THIS CODE is a build that asked for it by name.
+     * There used to be a -DTALKOS_AC97_UNCLAIMED escape hatch here that turned
+     * the bring-up OFF, which had the polarity backwards: the shipped kernel
+     * drove the card and an opt-in flag made it behave. The gate is now the
+     * other way round and lives in the Makefile, so the shipped kernel does not
+     * contain this function at all. */
+
     /* Class 04:01 is the AC'97-era "multimedia audio" code (HD Audio is 04:03),
      * which is what QEMU's -device AC97 and every ICH southbridge report. The
      * program re-reads the class itself through pcicfg before it touches a
