@@ -1,5 +1,8 @@
 # fable-os
 
+> **Workspace map:** [Tech README](https://github.com/helloyoann/tech).
+> This file contains only Fable OS product context.
+
 <img width="1101" height="867" alt="image" src="https://github.com/user-attachments/assets/7f07a3f0-a03a-456d-8269-fe00effb02d6" />
 
 A from-scratch x86_64 operating system whose **only interface is a sentence**.
