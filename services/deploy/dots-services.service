@@ -1,0 +1,21 @@
+# systemd unit for running the app directly on a host (no Docker).
+# Install:
+#   sudo cp deploy/dots-services.service /etc/systemd/system/
+#   sudo systemctl enable --now dots-services
+[Unit]
+Description=Dots Services Network (services.dotsconstruction.com)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/dots-services
+Environment=PORT=8080
+Environment=DATA_DIR=/var/lib/dots-services
+Environment=ADMIN_EMAILS=yoann@dotsbuilders.com
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+StateDirectory=dots-services
+
+[Install]
+WantedBy=multi-user.target

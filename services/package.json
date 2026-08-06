@@ -1,0 +1,14 @@
+{
+  "name": "dots-services-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Dots Builders home-service professional network: member signup, job uploads, rebate matching, supplier pricing.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  }
+}

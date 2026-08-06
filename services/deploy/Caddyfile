@@ -1,0 +1,7 @@
+# Caddy terminates TLS for services.dotsconstruction.com and proxies to the
+# app container. Certificates come from Let's Encrypt automatically — the
+# only prerequisite is DNS pointing at this machine.
+services.dotsconstruction.com {
+	reverse_proxy app:8080
+	encode gzip
+}
