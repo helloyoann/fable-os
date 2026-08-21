@@ -1,5 +1,10 @@
 # AGENTS.md
 
+**Workspace governance:** start with the canonical
+[`helloyoann/tech` AGENTS.md](https://github.com/helloyoann/tech/blob/main/AGENTS.md)
+for business truth, technical truth, tickets, and server-first operational
+routes. This file adds only Fable OS product constraints.
+
 Context for anyone — human or model — working on this codebase. Read it before
 touching anything: several of the facts below look like bugs and are load-bearing,
 and a few look harmless and will cost you a day.

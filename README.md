@@ -1,6 +1,6 @@
 # fable-os
 
-> **Workspace map:** [Tech README](https://github.com/helloyoann/tech).
+> **Workspace map:** [canonical Tech AGENTS.md](https://github.com/helloyoann/tech/blob/main/AGENTS.md).
 > This file contains only Fable OS product context.
 
 <img width="1101" height="867" alt="image" src="https://github.com/user-attachments/assets/7f07a3f0-a03a-456d-8269-fe00effb02d6" />
@@ -203,6 +203,7 @@ vendored network and TLS stacks are another 330k and are not mine.
 
 `README.os.md` has the deep detail: the trust model, the driver model, the TLS
 build, and design notes per subsystem. `AGENTS.md` has the architectural
-constraints anyone — or anything — working on this code needs to know first.
+product constraints anyone — or anything — working on this code needs after the
+workspace contract.
 
 Built and run on macOS via QEMU.
