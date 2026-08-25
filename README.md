@@ -1,7 +1,8 @@
 # fable-os
 
-> **Workspace map:** [canonical Tech AGENTS.md](https://github.com/helloyoann/tech/blob/main/AGENTS.md).
-> This file contains only Fable OS product context.
+> **Independent hobby:** Fable OS is outside Dots governance and status.
+> Product work lives in this repository's [`tickets/`](tickets/), and
+> [`AGENTS.md`](AGENTS.md) is the repository entrypoint.
 
 <img width="1101" height="867" alt="image" src="https://github.com/user-attachments/assets/7f07a3f0-a03a-456d-8269-fe00effb02d6" />
 

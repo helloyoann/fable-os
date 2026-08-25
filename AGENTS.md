@@ -1,9 +1,9 @@
 # AGENTS.md
 
-**Workspace governance:** start with the canonical
-[`helloyoann/tech` AGENTS.md](https://github.com/helloyoann/tech/blob/main/AGENTS.md)
-for business truth, technical truth, tickets, and server-first operational
-routes. This file adds only Fable OS product constraints.
+**Boundary and tickets:** Fable OS is an independent hobby, outside Dots
+governance and status. This file is its repository entrypoint. Product work is
+tracked in [`tickets/`](./tickets/), not in `helloyoann/tech` Issues. A Dots
+coordination link may be evidence, but it never moves Fable status into Tech.
 
 Context for anyone — human or model — working on this codebase. Read it before
 touching anything: several of the facts below look like bugs and are load-bearing,
